@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>BackgroundColor</key>
+	<data>
+	YnBsaXN0MDDUAQIDBAUGFRhZJGFyY2hpdmVyWCRvYmplY3RzVCR0b3BYJHZlcnNpb25f
+	EA9OU0tleWVkQXJjaGl2ZXKjBwgPVSRudWxs0wkKCwwNDlYkY2xhc3NcTlNDb2xvclNw
+	YWNlV05TV2hpdGWAAhADRTAuMDkA0hAREhNYJGNsYXNzZXNaJGNsYXNzbmFtZaITFFdO
+	U0NvbG9yWE5TT2JqZWN00RYXVHJvb3SAARIAAYagCBEbJCkyREhOVVxpcXN1e4CJlJef
+	qKuwsgAAAAAAAAEBAAAAAAAAABkAAAAAAAAAAAAAAAAAAAC3
+	</data>
+	<key>Font</key>
+	<data>
+	YnBsaXN0MDDUAQIDBAUGGBtZJGFyY2hpdmVyWCRvYmplY3RzVCR0b3BYJHZlcnNpb25f
+	EA9OU0tleWVkQXJjaGl2ZXKkBwgRElUkbnVsbNQJCgsMDQ4PEFYkY2xhc3NWTlNOYW1l
+	Vk5TU2l6ZVhOU2ZGbGFnc4ADgAIjQDQAAAAAAAAQEF1NZW5sby1SZWd1bGFy0hMUFRZY
+	JGNsYXNzZXNaJGNsYXNzbmFtZaIWF1ZOU0ZvbnRYTlNPYmplY3TRGRpUcm9vdIABEgAB
+	hqAIERskKTJESU9YX2Ztdnh6g4WTmKGsr7a/wsfJAAAAAAAAAQEAAAAAAAAAHAAAAAAA
+	AAAAAAAAAAAAAM4=
+	</data>
+	<key>FontAntialias</key>
+	<true/>
+	<key>ShowActiveProcessInTitle</key>
+	<false/>
+	<key>ShowShellCommandInTitle</key>
+	<false/>
+	<key>TextColor</key>
+	<data>
+	YnBsaXN0MDDUAQIDBAUGFRhZJGFyY2hpdmVyWCRvYmplY3RzVCR0b3BYJHZlcnNpb25f
+	EA9OU0tleWVkQXJjaGl2ZXKjBwgPVSRudWxs0wkKCwwNDlYkY2xhc3NcTlNDb2xvclNw
+	YWNlV05TV2hpdGWAAhADRTAuODYA0hAREhNYJGNsYXNzZXNaJGNsYXNzbmFtZaITFFdO
+	U0NvbG9yWE5TT2JqZWN00RYXVHJvb3SAARIAAYagCBEbJCkyREhOVVxpcXN1e4CJlJef
+	qKuwsgAAAAAAAAEBAAAAAAAAABkAAAAAAAAAAAAAAAAAAAC3
+	</data>
+	<key>WindowTitle</key>
+	<string>LixinOS</string>
+	<key>columnCount</key>
+	<integer>84</integer>
+	<key>name</key>
+	<string>LixinOS</string>
+	<key>rowCount</key>
+	<integer>26</integer>
+	<key>shellExitAction</key>
+	<integer>1</integer>
+	<key>type</key>
+	<string>Window Settings</string>
+</dict>
+</plist>
