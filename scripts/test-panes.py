@@ -37,6 +37,18 @@ def exercise(guest, control, directory):
     prompt = serial["SHELL"]
     repl = serial["PYTHON"]
     guest.until(prompt)  # The startup handshake paints both shell prompts.
+    guest.expect(b"echo 'int x = 42; // note' > color.c\r", prompt)
+    guest.expect(b"kilo color.c\r", b"Ctrl-F = find")
+    screenshot = directory / "kilo.ppm"
+    command("screendump", filename=str(screenshot))
+    pixels = screenshot.read_bytes().split(b"\n", 3)[-1]
+    assert bytes.fromhex("e69a96") in pixels, "numeric literal lacks its native red foreground"
+    switch()
+    guest.expect(b"echo newer > color.c\r", prompt)
+    switch()
+    guest.expect(b"X\x13", b"file changed in other pane")
+    guest.expect(b"\x11\x11\x11\x11", prompt)
+    guest.expect(b"cat color.c\r", prompt, b"\nnewer\n")
     guest.expect(b"python\r", repl)
     guest.expect(b"x = 42\r", repl)
     switch()
@@ -63,7 +75,7 @@ def exercise(guest, control, directory):
     assert guest.vm.wait(timeout=5) == 0
 
 
-def test():
+def test(exercise=exercise, mode="--split"):
     with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
         directory = Path(tmp)
         if not (qemu := shutil.which("qemu-system-aarch64")):
@@ -82,7 +94,7 @@ os.execv(os.environ['PANE_TEST_QEMU'], [os.environ['PANE_TEST_QEMU'], *args,
         wrapper.chmod(0o700)
         endpoint = directory / "qmp"
         launch = ["env", f"PATH={directory}:{os.environ['PATH']}", f"PANE_TEST_QEMU={qemu}",
-                  f"PANE_TEST_SOCKET={endpoint}", here / "run-kernel.sh", "--split"]
+                  f"PANE_TEST_SOCKET={endpoint}", here / "run-kernel.sh", mode]
         with serial["boot"](directory / "disk.img", launch) as guest, socket.socket(socket.AF_UNIX) as sock:
             sock.settimeout(10)
             sock.connect(str(endpoint))
@@ -92,4 +104,4 @@ os.execv(os.environ['PANE_TEST_QEMU'], [os.environ['PANE_TEST_QEMU'], *args,
 
 if __name__ == "__main__":
     test()
-    print("Passed split-pane Python isolation and native C pause/resume.")
+    print("Passed native Kilo colors, cross-pane save conflict, Python isolation and C pause/resume.")

@@ -1,5 +1,6 @@
 //! Two alternating snapshots on a dedicated virtio-blk disk. A flushed header
 //! publishes its payload only after all payload sectors have reached the disk.
+use crate::agent::Versions;
 use alloc::{
     alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error},
     collections::{BTreeMap, VecDeque},
@@ -14,19 +15,22 @@ use virtio_drivers::{
 
 pub type Files = BTreeMap<String, Option<Vec<u8>>>;
 type Result<T> = core::result::Result<T, &'static str>;
-const SLOT: usize = 8192; // 4 MiB in 512-byte sectors
-pub const ENTRY_LIMIT: usize = 128;
-pub const FILE_LIMIT: usize = 16 * 1024;
-const MAX: usize = ENTRY_LIMIT * (512 + FILE_LIMIT + 8) + 4;
+const LARGE_SLOT: usize = 64 * 1024 * 1024 / 512;
+const LARGE_MAX: usize = (LARGE_SLOT - 1) * 512;
+const SNAPSHOT_BASE: usize = 1; // Sector zero identifies the disk layout.
+// Leave room for directories and system files alongside one million user files.
+pub const ENTRY_LIMIT: usize = 1_048_576;
+pub const FILE_LIMIT: usize = 1024 * 1024;
+const MAX_VERSIONS: usize = 1024 * 1024;
 const MAGIC: &[u8; 8] = b"LIXINFS1";
-// The filesystem snapshots use only the front of each slot. Keep command
-// history at the end of the second slot, including one spare record so a
+const MAGIC_WITH_VERSIONS: &[u8; 8] = b"LIXINFS2";
+// History follows both snapshot slots, including one spare record so a
 // torn append cannot overwrite any of the 64 commands still in history.
 pub const HISTORY_LIMIT: usize = 64;
 const HISTORY_RECORD: usize = 1024;
 const HISTORY_SLOTS: usize = HISTORY_LIMIT + 1;
-const HISTORY_START: usize = 2 * SLOT - HISTORY_SLOTS * (HISTORY_RECORD / 512);
-const _: () = assert!(SLOT + 1 + MAX.div_ceil(512) <= HISTORY_START);
+const HISTORY_START: usize = SNAPSHOT_BASE + 2 * LARGE_SLOT;
+const DISK_SECTORS: usize = HISTORY_START + HISTORY_SLOTS * (HISTORY_RECORD / 512);
 const HISTORY_MAGIC: &[u8; 8] = b"LIXHIST1";
 
 pub(crate) struct Dma;
@@ -68,14 +72,54 @@ pub fn file_counts(files: &Files) -> (usize, usize, usize) {
     (file_count, files.len() - file_count, content_bytes)
 }
 
+pub fn resolve_path(files: &Files, cwd: &str, name: &str) -> Result<String> {
+    if name.is_empty() {
+        return Err("empty path");
+    }
+    let mut path = if name.starts_with('/') {
+        String::new()
+    } else {
+        cwd.into()
+    };
+    for part in name.split('/').filter(|p| !p.is_empty()) {
+        if !path.is_empty() && files.get(&path) != Some(&None) {
+            return Err("not a directory");
+        }
+        match part {
+            "." => (),
+            ".." => path.truncate(path.rfind('/').unwrap_or(0)),
+            _ => {
+                if path != "/" {
+                    path.push('/');
+                }
+                path.push_str(part);
+            }
+        }
+    }
+    if path.is_empty() {
+        path.push('/');
+    }
+    if path.len() > 512 {
+        return Err("path too long");
+    }
+    Ok(path)
+}
+
 pub fn children<'a>(files: &'a Files, path: &str) -> impl Iterator<Item = (&'a str, &'a Option<Vec<u8>>)> {
+    children_after(files, path, None)
+}
+
+pub fn children_after<'a>(files: &'a Files, path: &str, after: Option<&str>)
+    -> impl Iterator<Item = (&'a str, &'a Option<Vec<u8>>)> {
+    use core::ops::Bound::{Excluded, Included, Unbounded};
     let prefix = alloc::format!("{}/", path.trim_end_matches('/'));
-    files
-        .range(prefix.clone()..)
+    let start = after.map_or(Included(prefix.as_str()), Excluded);
+    files.range::<str, _>((start, Unbounded))
         .map_while(move |(path, value)| Some((path.strip_prefix(&prefix)?, value)))
         .filter(|(name, _)| !name.is_empty() && !name.contains('/'))
 }
-fn checksum(bytes: &[u8]) -> u32 {
+
+pub(crate) fn checksum(bytes: &[u8]) -> u32 {
     bytes.iter().fold(2166136261, |h, b| {
         (h ^ u32::from(*b)).wrapping_mul(16777619)
     })
@@ -88,7 +132,7 @@ fn take<'a>(src: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
 fn number(src: &mut &[u8]) -> Result<u32> {
     Ok(u32::from_le_bytes(take(src, 4)?.try_into().unwrap()))
 }
-fn decode(mut src: &[u8]) -> Result<Files> {
+fn decode(mut src: &[u8], has_versions: bool) -> Result<(Files, Versions)> {
     let count = number(&mut src)? as usize;
     if count > ENTRY_LIMIT {
         return Err("invalid filesystem size");
@@ -121,66 +165,100 @@ fn decode(mut src: &[u8]) -> Result<Files> {
             return Err("duplicate path");
         }
     }
-    if !src.is_empty() || files.get("/") != Some(&None) {
+    if files.get("/") != Some(&None) {
         return Err("invalid filesystem");
     }
-    Ok(files)
+    let versions = if has_versions {
+        if src.len() > MAX_VERSIONS {
+            return Err("invalid agent version data size");
+        }
+        let versions: Versions =
+            serde_json_wasm::from_slice(src).map_err(|_| "invalid agent version data")?;
+        if versions.iter().any(|(path, version)| {
+            !path.ends_with(".py") || !files.get(path).is_some_and(Option::is_some) || !version.valid()
+        }) {
+            return Err("invalid agent version record");
+        }
+        versions
+    } else {
+        if !src.is_empty() {
+            return Err("invalid filesystem");
+        }
+        Versions::new()
+    };
+    Ok((files, versions))
 }
 impl Disk {
     pub fn snapshot_status(&self) -> (u64, u64) {
         (self.dev.capacity(), self.generation)
     }
 
-    pub fn mount() -> Result<(Self, Files)> {
+    #[cfg(feature = "retina")]
+    fn report_storage(&self, files: &Files, payload_bytes: usize) {
+        let capacity = LARGE_MAX;
+        crate::graphics::set_storage_usage(files.values().flatten().count(), payload_bytes, capacity);
+    }
+
+    pub fn mount() -> Result<(Self, Files, Versions)> {
         // Launcher connects the disk to virtio-mmio-bus.0 on QEMU virt.
         let transport =
             unsafe { MmioTransport::new(NonNull::new(0x0a00_0000 as *mut _).unwrap(), 512) }
                 .map_err(|_| "no virtio disk")?;
-        let dev = VirtIOBlk::new(transport).map_err(|_| "disk initialization failed")?;
-        if dev.capacity() < 2 * SLOT as u64 {
-            return Err("disk requires 8 MiB");
+        let mut dev = VirtIOBlk::new(transport).map_err(|_| "disk initialization failed")?;
+        if dev.capacity() < DISK_SECTORS as u64 { return Err("disk too small for LIXDISK3"); }
+        let mut layout = [0u8; 512];
+        dev.read_blocks(0, &mut layout).map_err(|_| "disk read failed")?;
+        if &layout[..8] != b"LIXDISK3" || layout[8..].iter().any(|b| *b != 0) {
+            return Err("unsupported disk layout");
         }
-        let mut disk = Self {
-            dev,
-            generation: 0,
-            history_sequence: None,
-        };
+        let mut disk = Self { dev, generation: 0, history_sequence: None };
+        if let Some((files, versions)) = disk.read_pair()? {
+            return Ok((disk, files, versions));
+        }
+        let files = Files::from([("/".into(), None)]);
+        let versions = Versions::new();
+        disk.save(&files, &versions)?;
+        Ok((disk, files, versions))
+    }
+    fn read_pair(&mut self) -> Result<Option<(Files, Versions)>> {
         let mut heads = [[0u8; 512]; 2];
         for (slot, h) in heads.iter_mut().enumerate() {
-            disk.dev
-                .read_blocks(slot * SLOT, h)
+            self.dev
+                .read_blocks(SNAPSHOT_BASE + slot * LARGE_SLOT, h)
                 .map_err(|_| "disk read failed")?;
         }
         let generation = |h: &[u8; 512]| u64::from_le_bytes(h[8..16].try_into().unwrap());
         let newest = usize::from(generation(&heads[1]) > generation(&heads[0]));
         for slot in [newest, 1 - newest] {
             let h = &heads[slot];
-            if &h[..8] != MAGIC || checksum(&h[..24]).to_le_bytes() != h[24..28] {
+            let has_versions = &h[..8] == MAGIC_WITH_VERSIONS;
+            if (!has_versions && &h[..8] != MAGIC) || checksum(&h[..24]).to_le_bytes() != h[24..28] {
                 continue;
             }
             let len = u32::from_le_bytes(h[16..20].try_into().unwrap()) as usize;
-            if !(4..=MAX).contains(&len) {
+            if !(4..=LARGE_MAX).contains(&len) {
                 continue;
             }
             let mut payload = vec![0; len.next_multiple_of(512)];
-            disk.dev
-                .read_blocks(slot * SLOT + 1, &mut payload)
+            self.dev
+                .read_blocks(SNAPSHOT_BASE + slot * LARGE_SLOT + 1, &mut payload)
                 .map_err(|_| "disk read failed")?;
             if checksum(&payload[..len]).to_le_bytes() != h[20..24] {
                 continue;
             }
-            if let Ok(files) = decode(&payload[..len]) {
-                disk.generation = generation(h);
-                return Ok((disk, files));
+            if let Ok((files, versions)) = decode(&payload[..len], has_versions) {
+                self.generation = generation(h);
+                #[cfg(feature = "retina")]
+                self.report_storage(&files, len);
+                return Ok(Some((files, versions)));
             }
         }
         if heads.iter().flatten().any(|b| *b != 0) {
             return Err("no valid filesystem snapshot");
         }
-        let files = Files::from([("/".into(), None)]);
-        disk.save(&files)?;
-        Ok((disk, files))
+        Ok(None)
     }
+
     pub fn load_history(&mut self) -> Result<VecDeque<String>> {
         let mut bytes = vec![0; HISTORY_RECORD * HISTORY_SLOTS];
         self.dev
@@ -236,11 +314,23 @@ impl Disk {
         Ok(())
     }
 
-    pub fn save(&mut self, files: &Files) -> Result<()> {
-        let len = 4 + files
+    pub fn save(&mut self, files: &Files, versions: &Versions) -> Result<()> {
+        let version_data = if versions.is_empty() {
+            Vec::new()
+        } else {
+            serde_json_wasm::to_vec(versions).map_err(|_| "could not save agent versions")?
+        };
+        if version_data.len() > MAX_VERSIONS {
+            return Err("agent version storage full");
+        }
+        if files.values().flatten().any(|bytes| bytes.len() > FILE_LIMIT) {
+            return Err("file too large");
+        }
+        let len = 4 + version_data.len() + files
             .iter()
             .map(|(p, v)| 8 + p.len() + v.as_ref().map_or(0, Vec::len))
             .sum::<usize>();
+        if len > LARGE_MAX { return Err("filesystem full"); }
         let mut data = Vec::with_capacity(len.next_multiple_of(512));
         data.extend((files.len() as u32).to_le_bytes());
         for (p, v) in files {
@@ -255,19 +345,25 @@ impl Disk {
                 data.extend_from_slice(s)
             }
         }
+        data.extend_from_slice(&version_data);
         let gen_id = self
             .generation
             .checked_add(1)
             .ok_or("snapshot counter full")?;
         let mut header = [0u8; 512];
-        header[..8].copy_from_slice(MAGIC);
+        let magic = if versions.is_empty() {
+            MAGIC
+        } else {
+            MAGIC_WITH_VERSIONS
+        };
+        header[..8].copy_from_slice(magic);
         header[8..16].copy_from_slice(&gen_id.to_le_bytes());
         header[16..20].copy_from_slice(&(len as u32).to_le_bytes());
         header[20..24].copy_from_slice(&checksum(&data).to_le_bytes());
         let sum = checksum(&header[..24]);
         header[24..28].copy_from_slice(&sum.to_le_bytes());
         data.resize(len.next_multiple_of(512), 0);
-        let base = (gen_id as usize % 2) * SLOT;
+        let base = SNAPSHOT_BASE + (gen_id as usize % 2) * LARGE_SLOT;
         self.dev
             .write_blocks(base + 1, &data)
             .and_then(|_| self.dev.flush())
@@ -275,6 +371,8 @@ impl Disk {
             .and_then(|_| self.dev.flush())
             .map_err(|_| "disk commit failed")?;
         self.generation = gen_id;
+        #[cfg(feature = "retina")]
+        self.report_storage(files, len);
         Ok(())
     }
 }

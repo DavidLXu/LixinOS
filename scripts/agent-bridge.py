@@ -11,7 +11,8 @@ import time
 import urllib.error
 import urllib.request
 
-MAX_FRAME = 96 * 1024
+MAX_FRAME = 512 * 1024
+REQUEST_CHUNK = 4096
 DEFAULT_MODEL = "deepseek-flash"
 ENDPOINT = "https://api.deepseek.com/chat/completions"
 
@@ -30,11 +31,18 @@ for prompts. No traceback or error exit is expected for any case.
 Return only a JSON object of the form
 {"tests":[{"stdin":"", "stdout":"42\\n"}]}.
 Choose cases based on the user's requirements. Do not generate the script yet."""
+BASELINE_PROMPT = """Use the supplied active script as the specification. Predict its
+current output for representative successful inputs. Capture existing behavior,
+including output formatting, and omit cases that would hang or raise an exception."""
+EXAMPLES_PROMPT = """Use the task to choose examples of the requested new behavior.
+The current script is context. Honor any concrete input/output examples in the task."""
 SCRIPT_PROMPT = """Write or repair the standalone script for the task. The given tests
 are fixed. Solve the general task without hardcoding their inputs or outputs.
 Run it by executing the file directly. Use exact expected stdout formatting for
 the given cases. Keep the script within 16 KiB.
 Return only a JSON object of the form {"script":"print(42)\\n"}.
+When active_script is present, use it as the starting point, preserve behavior
+covered by the regressions, and make the requested improvement.
 When a previous attempt failed, use the provided test diagnostics to repair it."""
 
 
@@ -93,7 +101,41 @@ def test_cases(fields):
     return cases
 
 
+def request_tests(complete, data, instructions=""):
+    result = complete(PLATFORM + "\n\n" + TEST_PROMPT + "\n\n" + instructions, data)
+    cases = result.get("tests")
+    if not isinstance(cases, list) or not 1 <= len(cases) <= 3:
+        raise BridgeError("DeepSeek must return 1 to 3 test cases")
+    output = []
+    for case in cases:
+        if not isinstance(case, dict) or not all(
+            isinstance(case.get(key), str) for key in ("stdin", "stdout")
+        ):
+            raise BridgeError("each test requires stdin and stdout text")
+        output.extend((case["stdin"], case["stdout"]))
+    test_cases(output)
+    return output
+
+
 def dispatch(action, fields, complete):
+    if ((action == b"project" and 4 <= len(fields) <= 15)
+            or (action == b"project-session" and 6 <= len(fields) <= 66)):
+        instruction, task, workspace, remaining, *observations = fields
+        updates, state = (observations.pop(0), observations.pop(0)) if action == b"project-session" else ("", "")
+        result = complete(instruction, {
+            "task": task,
+            "workspace": workspace,
+            "remaining_steps": int(remaining),
+            "operator_updates": updates,
+            "workspace_state": state,
+            "observations": observations,
+        })
+        tool, args = result.get("tool"), result.get("args")
+        if result.keys() != {"tool", "args"} or not isinstance(tool, str) or not isinstance(args, list):
+            raise BridgeError("invalid model project response")
+        if len(args) > 3 or not all(isinstance(arg, str) for arg in args):
+            raise BridgeError("invalid model project arguments")
+        return [tool, *args]
     if action == b"inspect" and 4 <= len(fields) <= 10:
         instruction, question, cwd, remaining, *observations = fields
         result = complete(instruction, {
@@ -117,23 +159,17 @@ def dispatch(action, fields, complete):
             output.extend((tool, path))
         return output
     if action == b"tests" and len(fields) == 1 and 0 < len(fields[0]) <= 512:
-        result = complete(PLATFORM + "\n\n" + TEST_PROMPT, {"task": fields[0]})
-        cases = result.get("tests")
-        if not isinstance(cases, list) or not 1 <= len(cases) <= 3:
-            raise BridgeError("DeepSeek must return 1 to 3 test cases")
-        output = []
-        for case in cases:
-            if not isinstance(case, dict) or not all(
-                isinstance(case.get(key), str) for key in ("stdin", "stdout")
-            ):
-                raise BridgeError("each test requires stdin and stdout text")
-            output.extend((case["stdin"], case["stdout"]))
-        test_cases(output)
-        return output
-    if action == b"script" and len(fields) in (5, 7, 9):
-        task, previous, feedback, *tests = fields
+        return request_tests(complete, {"task": fields[0]})
+    if action == b"baseline" and len(fields) == 1:
+        return request_tests(complete, {"active_script": fields[0]}, BASELINE_PROMPT)
+    if action == b"examples" and len(fields) == 2:
+        task, source = fields
+        return request_tests(complete, {"task": task, "active_script": source}, EXAMPLES_PROMPT)
+    if action == b"script" and 6 <= len(fields) <= 28 and len(fields) % 2 == 0:
+        task, original, previous, feedback, *tests = fields
         result = complete(PLATFORM + "\n\n" + SCRIPT_PROMPT, {
             "task": task,
+            "active_script": original,
             "tests": test_cases(tests),
             "previous_script": previous,
             "failure": feedback,
@@ -150,10 +186,41 @@ def encode_response(request_id, status, fields):
 
 
 def serve(connection, complete):
+    pending = bytearray()
+    pending_id = None
+    pending_size = 0
     with connection.makefile("rb") as incoming:
         while line := incoming.readline(MAX_FRAME + 1):
             if len(line) > MAX_FRAME or not line.endswith(b"\n"):
                 return
+            if line.startswith(b"@"):
+                pieces = line[1:-1].split(b"\t", 3)
+                if len(pieces) != 4:
+                    return
+                request_id, offset, size, chunk = pieces
+                if not (0 < len(request_id) <= 20 and request_id.isdigit()):
+                    return
+                total = int(size) if 0 < len(size) <= 6 and size.isdigit() else 0
+                if offset == b"0":
+                    pending.clear()
+                    pending_id = request_id
+                    pending_size = total
+                if (request_id != pending_id or offset != str(len(pending)).encode()
+                        or total != pending_size or not len(pending) < total < MAX_FRAME
+                        or len(chunk) != min(REQUEST_CHUNK, total - len(pending))):
+                    connection.sendall(encode_response(request_id, b"error", ["invalid request chunk"]))
+                    pending.clear()
+                    pending_id = None
+                    continue
+                pending.extend(chunk)
+                if len(pending) < total:
+                    connection.sendall(encode_response(request_id, b"ack", []))
+                    continue
+                line = bytes(pending) + b"\n"
+                pending.clear()
+                pending_id = None
+                if not line.startswith(request_id + b"\t"):
+                    return
             request_id, *parts = line[:-1].split(b"\t")
             if not (0 < len(request_id) <= 20 and request_id.isdigit()):
                 return

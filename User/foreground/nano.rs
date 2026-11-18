@@ -3,7 +3,6 @@ use crate::{print, read_byte};
 use alloc::{format, string::String, vec::Vec};
 use core::fmt::Write;
 
-const WIDTH: usize = if cfg!(feature = "split") { 50 } else { 78 };
 const ROWS: usize = 18;
 
 struct Buffer {
@@ -72,18 +71,19 @@ impl Buffer {
     }
 
     fn draw(&mut self, name: &str, message: &str) {
+        let columns = ((crate::geometry() & 65535) as usize - 2).min(78);
         let visual_col = self.lines[self.row][..self.col]
             .iter()
             .fold(0, |x, c| x + cell_width(*c, x));
         self.top = self.top.clamp(self.row.saturating_sub(ROWS - 1), self.row);
         self.left = self
             .left
-            .clamp(visual_col.saturating_sub(WIDTH - 1), visual_col);
+            .clamp(visual_col.saturating_sub(columns - 1), visual_col);
         let mut frame = format!(
             "\x1b[H\x1b[7m LixinOS Editor   {}{}\x1b[0m\x1b[K",
             name.chars()
                 .filter(|c| c.is_ascii_graphic() || *c == ' ')
-                .take((WIDTH - 21).min(48))
+                .take((columns - 21).min(48))
                 .collect::<String>(),
             if self.dirty { "  *" } else { "" }
         );
@@ -94,7 +94,7 @@ impl Buffer {
                 for &c in line {
                     let width = cell_width(c, x);
                     for pos in x..x + width {
-                        if (self.left..self.left + WIDTH).contains(&pos) {
+                        if (self.left..self.left + columns).contains(&pos) {
                             frame.push(if c == '\t' {
                                 ' '
                             } else if c.is_ascii_graphic() || c == ' ' {
@@ -105,7 +105,7 @@ impl Buffer {
                         }
                     }
                     x += width;
-                    if x >= self.left + WIDTH {
+                    if x >= self.left + columns {
                         break;
                     }
                 }
@@ -129,14 +129,14 @@ pub fn edit(
 ) {
     let mut buf = Buffer::new(text);
     let mut message = "";
-    if !cfg!(feature = "window-console") {
+    if !(crate::geometry() >> 32 != 0) {
         print("\x1b[?1049h");
     }
     print("\x1b[2J");
     let mut skip_lf = false;
     loop {
         buf.draw(path, message);
-        let k = crate::keyboard::read_key();
+        let k = crate::keys::emacs_key(crate::terminal_key());
         if core::mem::take(&mut skip_lf) && k == 10 {
             continue;
         }
@@ -253,7 +253,7 @@ pub fn edit(
         }
         buf.preferred = buf.col;
     }
-    if cfg!(feature = "window-console") {
+    if crate::geometry() >> 32 != 0 {
         print("\x1b[2J\x1b[H")
     } else {
         print("\x1b[?1049l")

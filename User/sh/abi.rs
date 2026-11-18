@@ -1,0 +1,17 @@
+//! Process service operations for SVC 18. Strings use the active process mailbox.
+pub const STAT: u32 = 0;
+pub const HISTORY_GET: u32 = 1;
+pub const READ_DIRECTORY: u32 = 2;
+pub const HISTORY_APPEND: u32 = 3;
+pub const SPAWN_BEGIN: u32 = 4;
+pub const SPAWN_ARG: u32 = 5;
+pub const CHILD_STATUS: u32 = 7;
+pub const READ_STREAM: u32 = 8;
+pub const CLEAR_STREAM: u32 = 9;
+pub const APPEND_STREAM: u32 = 10;
+pub const STORE_STREAM: u32 = 11;
+pub const LAST_ERROR: u32 = 13;
+pub const CHDIR: u32 = 14;
+pub const PANE_READY: u32 = 15;
+pub const NEXT_TERMINAL: u32 = 16;
+pub const CLOSE_TERMINAL: u32 = 17;

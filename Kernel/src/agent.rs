@@ -3,8 +3,9 @@ use crate::{
     monitor::seconds_to_ticks,
     print, user,
 };
-use alloc::{format, string::String, vec::Vec};
+use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
 use core::{fmt::Write, ptr::NonNull};
+use serde::{Deserialize, Serialize};
 use virtio_drivers::{
     device::console::VirtIOConsole,
     transport::{DeviceType, Transport, mmio::MmioTransport},
@@ -16,10 +17,13 @@ use crate::monitor::ticks;
 use crate::panes::ticks;
 
 type Result<T> = core::result::Result<T, &'static str>;
-const MAX_FRAME: usize = 96 * 1024;
+// A project turn can include 60 tool results of 4 KiB each, hex encoded.
+const MAX_FRAME: usize = 512 * 1024;
+const REQUEST_CHUNK: usize = 4096;
 const MAX_ATTEMPTS: usize = 3;
 const MAX_CASES: usize = 3;
 const MAX_INPUT: usize = 1024;
+const MAX_SUITE: usize = 12;
 const MAX_INSPECT_QUERIES: usize = 6;
 const INSPECT_PROMPT: &str = "You are the LixinOS read-only system inspector. The guest, \
     not the Mac, runs the tools. Based on the question and observations, return a single JSON object. \
@@ -43,6 +47,38 @@ pub struct Bridge {
     discard_line: bool,
 }
 
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestCase {
+    #[serde(rename = "stdin")]
+    pub(crate) input: String,
+    #[serde(rename = "stdout")]
+    pub(crate) output: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Revision {
+    pub source: String,
+    pub tests: Vec<TestCase>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Version {
+    pub tests: Vec<TestCase>,
+    pub previous: Option<Revision>,
+}
+
+impl Version {
+    pub fn valid(&self) -> bool {
+        valid_tests(&self.tests)
+            && self.previous.as_ref().is_none_or(|previous| {
+                valid_tests(&previous.tests) && valid_source(&previous.source)
+            })
+    }
+}
+
+pub type Versions = BTreeMap<String, Version>;
+
 impl Bridge {
     pub fn connect() -> Result<Self> {
         // Bus 2 is reserved for the host model connection in all console modes.
@@ -64,7 +100,13 @@ impl Bridge {
 
     // One newline-terminated record per request/response. Tab-delimited UTF-8 fields
     // are hex-encoded so multiline scripts and test data stay inside the record.
-    fn request(&mut self, action: &str, fields: &[&str]) -> Result<Vec<String>> {
+    pub(crate) fn request(&mut self, action: &str, fields: &[&str]) -> Result<Vec<String>> {
+        self.request_interruptible(action, fields, || Ok(()))
+    }
+
+    pub(crate) fn request_interruptible(
+        &mut self, action: &str, fields: &[&str], mut checkpoint: impl FnMut() -> Result<()>,
+    ) -> Result<Vec<String>> {
         self.request_id += 1;
         let id = format!("{}", self.request_id);
         let mut frame = format!("{id}\t{action}");
@@ -78,13 +120,48 @@ impl Bridge {
         if frame.len() > MAX_FRAME {
             return Err("model request too large");
         }
-        for chunk in frame.as_bytes().chunks(1024) {
-            self.console.send_bytes(chunk).map_err(|_| "model request failed")?;
+        // QEMU's virtconsole can drop writes when the host socket backs up.
+        // Wait for the bridge to consume each chunk before sending the next.
+        let upload_deadline = ticks() + seconds_to_ticks(60);
+        let body = frame.trim_end_matches('\n').as_bytes();
+        for (index, chunk) in body.chunks(REQUEST_CHUNK).enumerate() {
+            let offset = index * REQUEST_CHUNK;
+            let more = offset + chunk.len() < body.len();
+            let mut packet = format!("@{id}\t{offset}\t{}\t", body.len()).into_bytes();
+            packet.extend_from_slice(chunk);
+            packet.push(b'\n');
+            self.console.send_bytes(&packet).map_err(|_| "model request failed")?;
+            if more {
+                let reply = self.read_reply(&id, upload_deadline, &mut checkpoint)?;
+                if reply.as_slice() != b"ack" {
+                    return Err("model bridge rejected a request chunk");
+                }
+            }
         }
-        let deadline = ticks() + seconds_to_ticks(60);
+        let line = self.read_reply(&id, ticks() + seconds_to_ticks(60), &mut checkpoint)?;
+        let mut parts = line.split(|&b| b == b'\t');
+        match parts.next() {
+            Some(b"ok") => parts.map(decode).collect(),
+            Some(b"error") => {
+                if let Some(Ok(detail)) = parts.next().map(decode) {
+                    print(&format!("agent: model error: {detail:?}\n"));
+                }
+                Err("model bridge returned an error")
+            }
+            _ => Err("invalid model response"),
+        }
+    }
+
+    fn read_reply(
+        &mut self,
+        id: &str,
+        deadline: u64,
+        checkpoint: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Vec<u8>> {
         while ticks() < deadline {
             #[cfg(feature = "split")]
             crate::panes::checkpoint();
+            checkpoint()?;
             let Some(byte) = self.console.recv(true).map_err(|_| "model response failed")? else {
                 core::hint::spin_loop();
                 continue;
@@ -103,22 +180,13 @@ impl Bridge {
             if core::mem::take(&mut self.discard_line) {
                 continue;
             }
-            let line = core::mem::take(&mut self.incoming);
-            let mut parts = line.split(|&b| b == b'\t');
-            if parts.next() != Some(id.as_bytes()) {
-                // A response can arrive after its caller has timed out.
-                continue;
+            let mut line = core::mem::take(&mut self.incoming);
+            let id_len = id.len();
+            if line.get(..id_len) == Some(id.as_bytes()) && line.get(id_len) == Some(&b'\t') {
+                line.drain(..id_len + 1);
+                return Ok(line);
             }
-            return match parts.next() {
-                Some(b"ok") => parts.map(decode).collect(),
-                Some(b"error") => {
-                    if let Some(Ok(detail)) = parts.next().map(decode) {
-                        print(&format!("agent: model error: {detail:?}\n"));
-                    }
-                    Err("model bridge returned an error")
-                }
-                _ => Err("invalid model response"),
-            };
+            // A response can arrive after its caller was paused or timed out.
         }
         Err("model bridge timed out")
     }
@@ -202,65 +270,158 @@ pub fn inspect(
     }
 }
 
-pub fn generate(bridge: &mut Bridge, path: &str, task: &str, file_limit: usize) -> Result<String> {
-    print("agent: requesting test cases\n");
-    let tests = bridge.request("tests", &[task])?;
-    if !(2..=MAX_CASES * 2).contains(&tests.len())
-        || tests.len() % 2 != 0
-        || tests
-            .chunks_exact(2)
-            .any(|pair| pair[0].len() > MAX_INPUT || pair[1].len() > user::TEST_OUTPUT_LIMIT)
-    {
+fn valid_source(source: &str) -> bool {
+    source.len() <= 16 * 1024 && !source.contains('\0')
+}
+
+fn valid_tests(tests: &[TestCase]) -> bool {
+    (1..=MAX_SUITE).contains(&tests.len())
+        && tests.iter().all(|case| {
+            case.input.len() <= MAX_INPUT && case.output.len() <= user::TEST_OUTPUT_LIMIT
+        })
+        && tests.iter().enumerate().all(|(index, case)| {
+            tests[..index].iter().all(|other| other.input != case.input)
+        })
+}
+
+pub fn parse_tests(text: &str) -> Result<Vec<TestCase>> {
+    let tests: Vec<TestCase> =
+        serde_json_wasm::from_str(text).map_err(|_| "invalid JSON test suite")?;
+    if !valid_tests(&tests) {
+        return Err("test suite requires 1 to 12 distinct inputs within the size limits");
+    }
+    Ok(tests)
+}
+
+fn model_tests(bridge: &mut Bridge, action: &str, fields: &[&str]) -> Result<Vec<TestCase>> {
+    let response = bridge.request(action, fields)?;
+    if response.is_empty() || response.len() % 2 != 0 || response.len() > MAX_CASES * 2 {
         return Err("invalid model test cases");
     }
+    let mut tests = Vec::new();
+    let mut fields = response.into_iter();
+    while let (Some(input), Some(output)) = (fields.next(), fields.next()) {
+        tests.push(TestCase { input, output });
+    }
+    // Models can return redundant identical examples. Keep one copy.
+    let mut unique = Vec::new();
+    merge_tests(&mut unique, tests)?;
+    if !valid_tests(&unique) {
+        return Err("invalid model test cases");
+    }
+    Ok(unique)
+}
 
+pub fn merge_tests(tests: &mut Vec<TestCase>, additional: Vec<TestCase>) -> Result<()> {
+    for case in additional {
+        if let Some(existing) = tests.iter().find(|existing| existing.input == case.input) {
+            if existing.output != case.output {
+                return Err("tests disagree on the expected output for the same input");
+            }
+        } else {
+            if tests.len() == MAX_SUITE {
+                return Err("test suite exceeds 12 distinct inputs");
+            }
+            tests.push(case);
+        }
+    }
+    Ok(())
+}
+
+fn check_tests(path: &str, script: &str, tests: &[TestCase]) -> core::result::Result<(), String> {
+    for (index, case) in tests.iter().enumerate() {
+        let (result, output) = user::test_python(path, script, &case.input);
+        let number = index + 1;
+        if let Err(reason) = result {
+            let diagnostic = String::from_utf8_lossy(&output);
+            return Err(format!("Test {number}: {reason}. Output: {diagnostic:?}"));
+        }
+        let actual = core::str::from_utf8(&output)
+            .map_err(|_| format!("Test {number}: output is not valid UTF-8"))?
+            .replace("\r\n", "\n");
+        if actual != case.output {
+            return Err(format!(
+                "Test {number}: expected {:?}, got {actual:?}", case.output
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn solve(bridge: &mut Bridge, path: &str, task: &str, original: &str, tests: &[TestCase]) -> Result<String> {
     let mut previous = String::new();
     let mut failure = String::new();
     for attempt in 1..=MAX_ATTEMPTS {
         print(&format!("agent: generating script ({attempt}/{MAX_ATTEMPTS})\n"));
-        let mut fields = alloc::vec![task, previous.as_str(), failure.as_str()];
-        fields.extend(tests.iter().map(String::as_str));
+        let mut fields = alloc::vec![task, original, previous.as_str(), failure.as_str()];
+        for case in tests {
+            fields.extend([case.input.as_str(), case.output.as_str()]);
+        }
         let [script]: [String; 1] = bridge
             .request("script", &fields)?
             .try_into()
             .map_err(|_| "invalid model script response")?;
-        if script.len() > file_limit || script.trim().is_empty() || script.contains('\0') {
+        if !valid_source(&script) || script.trim().is_empty() {
             failure = "The script must be nonempty, contain no NUL, and fit in 16 KiB.".into();
             previous.clear();
             print("agent: rejected invalid script\n");
             continue;
         }
-
-        failure.clear();
-        for (index, pair) in tests.chunks_exact(2).enumerate() {
-            let (result, output) = user::test_python(path, &script, &pair[0]);
-            let actual = core::str::from_utf8(&output).map(|text| text.replace("\r\n", "\n"));
-            if let Err(reason) = result {
-                let diagnostic = String::from_utf8_lossy(&output);
-                write!(failure, "Test {}: {reason}. Output: {diagnostic:?}", index + 1).unwrap();
-                break;
-            }
-            let Ok(actual) = actual else {
-                write!(failure, "Test {}: output is not valid UTF-8", index + 1).unwrap();
-                break;
-            };
-            if actual != pair[1] {
-                write!(
-                    failure,
-                    "Test {}: expected {:?}, got {actual:?}",
-                    index + 1,
-                    pair[1]
-                )
-                .unwrap();
-                break;
+        if script == original {
+            failure = "Return a changed script that implements the requested improvement.".into();
+            print("agent: candidate did not change the script\n");
+        } else {
+            match check_tests(path, &script, tests) {
+                Ok(()) => {
+                    print(&format!("agent: all {} tests passed\n", tests.len()));
+                    return Ok(script);
+                }
+                Err(error) => {
+                    print(&format!("agent: {error}\n"));
+                    failure = error;
+                }
             }
         }
-        if failure.is_empty() {
-            print(&format!("agent: all {} tests passed\n", tests.len() / 2));
-            return Ok(script);
-        }
-        print(&format!("agent: {failure}\n"));
         previous = script;
     }
     Err("agent exhausted its attempts without a passing script")
+}
+
+pub fn generate(bridge: &mut Bridge, path: &str, task: &str) -> Result<Revision> {
+    print("agent: requesting test cases\n");
+    let tests = model_tests(bridge, "tests", &[task])?;
+    let source = solve(bridge, path, task, "", &tests)?;
+    Ok(Revision { source, tests })
+}
+
+pub fn improve(
+    bridge: &mut Bridge,
+    path: &str,
+    task: &str,
+    mut original: Revision,
+    examples: Option<Vec<TestCase>>,
+) -> Result<(Revision, Revision)> {
+    if !valid_source(&original.source) {
+        return Err("active script is invalid");
+    }
+    if original.tests.is_empty() {
+        print("agent: no saved tests. Creating a baseline from the active script\n");
+        original.tests = model_tests(bridge, "baseline", &[&original.source])?;
+    }
+    if let Err(error) = check_tests(path, &original.source, &original.tests) {
+        print(&format!("agent: active script failed its baseline. {error}\n"));
+        return Err("baseline failed on the active script");
+    }
+    print(&format!("agent: active script passed {} baseline tests\n", original.tests.len()));
+    let examples = match examples {
+        Some(examples) => examples,
+        None => {
+            print("agent: requesting examples for the improvement\n");
+            model_tests(bridge, "examples", &[task, &original.source])?
+        }
+    };
+    let mut tests = original.tests.clone();
+    merge_tests(&mut tests, examples)?;
+    let source = solve(bridge, path, task, &original.source, &tests)?;
+    Ok((original, Revision { source, tests }))
 }

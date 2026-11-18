@@ -1,0 +1,8 @@
+#pragma once
+#define GIT_ARCH_64 1
+#define GIT_REGEX_BUILTIN 1
+#define GIT_SHA1_COLLISIONDETECT 1
+#define GIT_SHA256_BUILTIN 1
+#define GIT_COMPRESSION_ZLIB 1
+#define GIT_IO_SELECT 1
+#define NO_MMAP 1

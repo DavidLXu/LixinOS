@@ -16,6 +16,6 @@ $(CACHE)/python.bin: $(OBJ) ../user.ld
 include $(TOP)/py/mkrules.mk
 
 all: $(CACHE)/echo.bin
-$(CACHE)/echo.bin: ../echo.c ../console.h ../user.ld
-	$(CC) -Os -ffreestanding -nostdlib -T ../user.ld ../echo.c -o $(CACHE)/echo.elf
+$(CACHE)/echo.bin: ../cecho/start.c ../cecho/cecho.c ../console.h ../user.ld
+	$(CC) -Os -ffreestanding -nostdlib -T ../user.ld ../cecho/start.c ../cecho/cecho.c -o $(CACHE)/echo.elf
 	$(OBJCOPY) -O binary $(CACHE)/echo.elf $@

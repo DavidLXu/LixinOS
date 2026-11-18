@@ -1,6 +1,6 @@
 //! Read-only observations from the guest, independent of the model bridge.
 use crate::{
-    HEAP_BYTES, disk,
+    disk,
     monitor::{heap_usage, kernel_span_bytes, seconds_to_ticks, ticks},
     user,
 };
@@ -42,17 +42,21 @@ pub fn cpu(started: u64) -> String {
     )
 }
 
-pub fn memory() -> String {
-    let ram = device_tree().and_then(|tree| {
+pub(crate) fn ram_size() -> Option<usize> {
+     device_tree().and_then(|tree| {
         tree.find_node("/memory")?;
         let total = tree
             .memory()
             .regions()
             .try_fold(0usize, |sum, region| sum.checked_add(region.size?))?;
         (total != 0).then_some(total)
-    });
+    })
+}
+
+pub fn memory() -> String {
+    let ram = ram_size();
     let (used, free) = heap_usage();
-    let kernel = kernel_span_bytes() - HEAP_BYTES;
+    let kernel = kernel_span_bytes();
     let reserved = user::BANKS * user::USER_REGION_BYTES;
     format!(
         "guest_ram_bytes={} (QEMU boot device tree)\n         heap_used_bytes={used}\nheap_free_bytes={free}\n         kernel_image_and_stacks_excluding_heap_arena_bytes={kernel}\n         user_program_ram_reserved_bytes={reserved}\n         known_usage_estimate_bytes={} (kernel span excluding heap arena, plus allocated heap and reserved user regions)\n         total_guest_free_bytes=unavailable (no physical-page allocator)",

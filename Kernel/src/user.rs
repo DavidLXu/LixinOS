@@ -16,7 +16,7 @@ pub const BANKS: usize = if cfg!(feature = "split") { 2 } else { 1 };
 static mut ROOT: [Table; BANKS] = [const { Table([0; 512]) }; BANKS];
 static mut RAM: [Table; BANKS] = [const { Table([0; 512]) }; BANKS];
 const USER: usize = 0x44000000;
-const ALIAS: usize = 0x50000000;
+const ALIAS: usize = 0x70000000;
 const BLOCK: usize = 2 << 20;
 pub const USER_REGION_BYTES: usize = 2 * BLOCK;
 const AF: u64 = 1 << 10;
@@ -35,6 +35,7 @@ struct TestIo {
     output: Vec<u8>,
     deadline: u64,
     stopped: Option<&'static str>,
+    interrupt: fn() -> Option<&'static str>,
 }
 
 // The foreground EL0 slot is single-core and uses synchronous syscalls.
@@ -42,7 +43,14 @@ struct TestSlot(UnsafeCell<[Option<TestIo>; BANKS]>);
 unsafe impl Sync for TestSlot {}
 static TEST_IO: TestSlot = TestSlot(UnsafeCell::new([const { None }; BANKS]));
 
-fn bank() -> usize {
+// The utility ABI reserves the preceding page for a metadata request and result.
+pub(crate) fn utility_mailbox() -> *mut u8 {
+    (ALIAS + UTILITY_OFFSET) as *mut u8
+}
+pub(crate) fn git_mailbox() -> *mut u8 {
+    (ALIAS + SCRIPT_OFFSET) as *mut u8
+}
+pub(crate) fn bank() -> usize {
     #[cfg(feature = "split")]
     {
         crate::panes::active()
@@ -65,7 +73,10 @@ fn test_clock() -> u64 {
 
 pub fn test_console(value: u64, operation: u64) -> Option<u64> {
     let io = unsafe { (&mut *TEST_IO.0.get())[bank()].as_mut()? };
-    let stopped = if test_clock() >= io.deadline {
+    let stopped = if operation == 3 || operation == 0 { (io.interrupt)() } else { None };
+    let stopped = if stopped.is_some() {
+        stopped
+    } else if test_clock() >= io.deadline {
         Some("test timed out")
     } else if operation == 1 && io.output.len() == TEST_OUTPUT_LIMIT {
         Some("test exceeded the output limit")
@@ -96,12 +107,19 @@ pub fn test_console(value: u64, operation: u64) -> Option<u64> {
 }
 
 pub fn test_python(path: &str, source: &str, input: &str) -> (Result<(), &'static str>, Vec<u8>) {
+    test_python_interruptible(path, source, input, || None)
+}
+
+pub(crate) fn test_python_interruptible(
+    path: &str, source: &str, input: &str, interrupt: fn() -> Option<&'static str>,
+) -> (Result<(), &'static str>, Vec<u8>) {
     let io = TestIo {
         input: input.as_bytes().to_vec(),
         position: 0,
         output: Vec::with_capacity(TEST_OUTPUT_LIMIT),
         deadline: test_clock() + crate::monitor::seconds_to_ticks(2),
         stopped: None,
+        interrupt,
     };
     unsafe { (*TEST_IO.0.get())[bank()] = Some(io) };
     let result = run(PYTHON, Some((path, source)));
@@ -114,7 +132,7 @@ fn setup_bank(bank: usize) {
         // MAIR slot 0 = Normal non-cacheable, slot 1 = Device-nGnRnE.
         ROOT[bank].0[0] = 1 | AF | 4 | PXN | UXN;
         ROOT[bank].0[1] = addr_of_mut!(RAM[bank]) as u64 | 3;
-        for i in 0..64 {
+        for i in 0..crate::MAPPED_RAM / BLOCK {
             let pa = 0x40000000 + i * BLOCK;
             let permissions = match pa {
                 USER => USER_ACCESS | READ_ONLY | PXN,
@@ -158,18 +176,24 @@ pub fn init() {
 }
 // Reserved by User/user.ld immediately below the user stack.
 const SCRIPT_OFFSET: usize = 0x3d8000;
-const SCRIPT_CAPACITY: usize = 32 * 1024;
+pub(crate) const SCRIPT_CAPACITY: usize = 32 * 1024;
+
+static mut CAN_PUBLISH: [bool; BANKS] = [false; BANKS];
 
 // Publish only into the reserved EL0 RX area, through its EL1-only alias.
 pub fn publish_code(src: usize) -> u64 {
+    if !unsafe { CAN_PUBLISH[bank()] } {
+        return u64::MAX;
+    }
     const SIZE: usize = 256 * 1024;
     if !(USER + BLOCK..=USER + USER_REGION_BYTES - SIZE).contains(&src) {
         return u64::MAX;
     }
     unsafe {
+        CAN_PUBLISH[bank()] = false;
         copy_nonoverlapping(
             (ALIAS + (src - USER)) as *const u8,
-            (ALIAS + 0x180000) as *mut u8,
+            (ALIAS + LXE_CODE_OFFSET) as *mut u8,
             SIZE,
         );
         asm!("dsb sy", "ic iallu", "dsb sy", "isb");
@@ -177,11 +201,50 @@ pub fn publish_code(src: usize) -> u64 {
     0
 }
 pub fn run(image: &[u8], script: Option<(&str, &str)>) -> Result<(), &'static str> {
-    launch(image, script, false)
+    match launch(image, script, false)? {
+        0 => Ok(()),
+        _ => Err("user program exited unsuccessfully"),
+    }
 }
 
-pub const TCC: &[u8] = include_bytes!("../target/user-build/tcc.bin");
+pub static TCC: &[u8] = include_bytes!("../target/user-build/tcc.bin");
 const RUNNER: &[u8] = include_bytes!("../target/user-build/runner.bin");
+
+const LXE_CODE_OFFSET: usize = 0x180000;
+const LXE_DATA_OFFSET: usize = 0x300000;
+const UTILITY_OFFSET: usize = SCRIPT_OFFSET - 4096;
+
+// SVC 22 and the built-in compiler can return sparse file contents without
+// materializing a second contiguous copy in the EL0 heap. Descriptor layout:
+// (table address << 32) | file length. Table: count, then (offset, addr, len)
+// triples of little-endian u32. Unspecified bytes, including BSS, are zeroes.
+pub(crate) fn copy_user_file(descriptor: u64) -> Option<Vec<u8>> {
+    let size = descriptor as u32 as usize;
+    if size > crate::disk::FILE_LIMIT { return None; }
+    // Only the active bank's writable memory below its mailboxes is readable.
+    let bank = unsafe { core::slice::from_raw_parts((ALIAS + BLOCK) as *const u8, UTILITY_OFFSET - BLOCK) };
+    let buffer = |address: usize, length: usize| {
+        let start = address.checked_sub(USER + BLOCK)?;
+        bank.get(start..start.checked_add(length)?)
+    };
+    let word = |bytes: &[u8]| u32::from_le_bytes(bytes.try_into().unwrap()) as usize;
+    let address = (descriptor >> 32) as usize;
+    let count = word(buffer(address, 4)?);
+    // Nonempty parts contribute at least one byte apiece.
+    if count > size { return None; }
+    let table = buffer(address.checked_add(4)?, count.checked_mul(12)?)?;
+    let mut file = alloc::vec![0; size];
+    let mut remaining = size;
+    for part in table.chunks_exact(12) {
+        let offset = word(&part[..4]);
+        let len = word(&part[8..]);
+        if len == 0 { return None; }
+        remaining = remaining.checked_sub(len)?;
+        let src = buffer(word(&part[4..8]), len)?;
+        file.get_mut(offset..offset.checked_add(len)?)?.copy_from_slice(src);
+    }
+    Some(file)
+}
 
 struct Executable<'a> {
     entry: usize,
@@ -196,7 +259,9 @@ fn executable(bytes: &[u8]) -> Result<Executable<'_>, &'static str> {
     let field = |i: usize| u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap()) as usize;
     let (entry, code, data) = (field(4), field(8), field(12));
     let end = 16 + code + data;
-    if end > bytes.len() || end > 16384 || entry % 4 != 0 || entry + 4 > code {
+    if end > bytes.len() || end > crate::disk::FILE_LIMIT
+        || code > BLOCK - LXE_CODE_OFFSET || data > UTILITY_OFFSET - LXE_DATA_OFFSET
+        || entry % 4 != 0 || entry + 4 > code {
         return Err("invalid executable layout");
     }
     Ok(Executable {
@@ -206,43 +271,50 @@ fn executable(bytes: &[u8]) -> Result<Executable<'_>, &'static str> {
     })
 }
 
-pub fn compile(path: &str, source: &str) -> Result<Vec<u8>, &'static str> {
-    launch(TCC, Some((path, source)), true)?;
-    // The EL0 call has returned and the foreground slot is exclusively ours.
-    let result = unsafe {
-        core::slice::from_raw_parts((ALIAS + SCRIPT_OFFSET) as *const u8, SCRIPT_CAPACITY)
-    };
-    let image = executable(result)?;
-    Ok(result[..16 + image.code.len() + image.data.len()].to_vec())
+pub fn is_executable(bytes: &[u8]) -> bool {
+    executable(bytes).is_ok_and(|image| 16 + image.code.len() + image.data.len() == bytes.len())
 }
 
-pub fn run_saved(bytes: &[u8]) -> Result<(), &'static str> {
+pub fn compile(path: &str, source: &str) -> Result<Vec<u8>, &'static str> {
+    if launch(TCC, Some((path, source)), true)? != 0 { return Err("compilation failed"); }
+    // The EL0 call has returned and the foreground slot is exclusively ours.
+    let descriptor = unsafe { git_mailbox().cast::<u64>().read() };
+    let bytes = copy_user_file(descriptor).ok_or("invalid compiler result buffer")?;
+    if !is_executable(&bytes) { return Err("invalid compiler output"); }
+    Ok(bytes)
+}
+
+pub(crate) fn start_saved(bytes: &[u8], argc: usize, packed: &str, flags: usize) -> Result<u16, &'static str> {
     let image = executable(bytes)?;
     if 16 + image.code.len() + image.data.len() != bytes.len() {
         return Err("unexpected executable length");
     }
+    if packed.len() > SCRIPT_CAPACITY || argc > 512 { return Err("arguments too large"); }
     unsafe {
         write_bytes(ALIAS as *mut u8, 0, USER_REGION_BYTES);
         copy_nonoverlapping(RUNNER.as_ptr(), ALIAS as *mut u8, RUNNER.len());
         copy_nonoverlapping(
             image.code.as_ptr(),
-            (ALIAS + 0x180000) as *mut u8,
+            (ALIAS + LXE_CODE_OFFSET) as *mut u8,
             image.code.len(),
         );
         copy_nonoverlapping(
             image.data.as_ptr(),
-            (ALIAS + 0x300000) as *mut u8,
+            (ALIAS + LXE_DATA_OFFSET) as *mut u8,
             image.data.len(),
         );
         asm!("dsb sy", "ic iallu", "dsb sy", "isb");
-        if enter_user(USER + 0x180000 + image.entry, 0, 0, 0) != 0 {
-            return Err("executable fault");
-        }
+        copy_nonoverlapping(packed.as_ptr(), git_mailbox(), packed.len());
+        let status = enter_user(USER + LXE_CODE_OFFSET + image.entry, argc, USER + SCRIPT_OFFSET, flags);
+        u16::try_from(status).map_err(|_| "executable fault")
     }
-    Ok(())
 }
 
-fn launch(image: &[u8], script: Option<(&str, &str)>, save: bool) -> Result<(), &'static str> {
+pub(crate) fn launch(image: &[u8], script: Option<(&str, &str)>, save: bool) -> Result<u8, &'static str> {
+    u8::try_from(launch_status(image, script, save)?).map_err(|_| "user program fault")
+}
+
+pub(crate) fn launch_status(image: &[u8], script: Option<(&str, &str)>, save: bool) -> Result<u16, &'static str> {
     if image.len() > SCRIPT_OFFSET {
         return Err("user image too large");
     }
@@ -263,16 +335,144 @@ fn launch(image: &[u8], script: Option<(&str, &str)>, save: bool) -> Result<(), 
             (0, 0, 0)
         };
         asm!("dsb sy", "ic iallu", "dsb sy", "isb");
-        match enter_user(path_ptr, source_ptr, len, usize::from(save)) {
-            0 => (),
-            -1 => return Err("user program fault"),
-            _ => return Err("user program exited unsuccessfully"),
-        }
+        let slot = bank();
+        CAN_PUBLISH[slot] = core::ptr::eq(image, TCC) && !save;
+        let status = enter_user(path_ptr, source_ptr, len, usize::from(save));
+        CAN_PUBLISH[slot] = false;
+        u16::try_from(status)
+            .map_err(|_| "user program fault")
     }
-    Ok(())
 }
 #[unsafe(no_mangle)]
 extern "C" fn kernel_vector_fault() -> ! {
     crate::print("Fatal EL1 exception\n");
     crate::idle()
+}
+
+// A contiguous EL0 address range backed on demand by private, non-executable
+// blocks. The normal identity mapping of the kernel heap stays privileged.
+pub(crate) const ARENA_BASE: usize = 0x6800_0000;
+pub(crate) struct UserArena {
+    bank: usize,
+    blocks: Vec<core::ptr::NonNull<u8>>,
+}
+impl UserArena {
+    pub fn new() -> Self {
+        Self {
+            bank: bank(),
+            blocks: Vec::new(),
+        }
+    }
+    #[cfg(feature="retina")]
+    pub fn map_canvas(&self, visible: bool) {
+        for (i, block) in self.blocks.iter().enumerate() {
+            unsafe { RAM[self.bank].0[(ARENA_BASE-0x40000000)/BLOCK+i] =
+                if visible {block.as_ptr() as u64 | 1 | AF | SH | USER_ACCESS | PXN | UXN} else {0}; }
+        }
+        unsafe { asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb"); }
+    }
+    #[cfg(feature="retina")]
+    pub fn contains(&self, address:usize, bytes:usize)->bool {
+        address>=ARENA_BASE && address.checked_add(bytes).is_some_and(|end| end<=ARENA_BASE+self.blocks.len()*BLOCK)
+    }
+    pub fn grow(&mut self, bytes: usize) -> Result<(), &'static str> {
+        if bytes > 128 * 1024 * 1024 {
+            return Err("user heap limit");
+        }
+        let count = bytes.div_ceil(BLOCK);
+        let layout = core::alloc::Layout::from_size_align(BLOCK, BLOCK).unwrap();
+        self.blocks
+            .try_reserve(count.saturating_sub(self.blocks.len()))
+            .map_err(|_| "out of memory")?;
+        while self.blocks.len() < count {
+            let block = core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
+                .ok_or("out of memory")?;
+            let index = (ARENA_BASE - 0x40000000) / BLOCK + self.blocks.len();
+            unsafe {
+                RAM[self.bank].0[index] =
+                    block.as_ptr() as u64 | 1 | AF | SH | USER_ACCESS | PXN | UXN;
+                asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
+            }
+            self.blocks.push(block);
+        }
+        Ok(())
+    }
+}
+impl Drop for UserArena {
+    fn drop(&mut self) {
+        let layout = core::alloc::Layout::from_size_align(BLOCK, BLOCK).unwrap();
+        unsafe {
+            for i in 0..self.blocks.len() {
+                RAM[self.bank].0[(ARENA_BASE - 0x40000000) / BLOCK + i] = 0;
+            }
+            asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
+            for block in self.blocks.drain(..) {
+                alloc::alloc::dealloc(block.as_ptr(), layout);
+            }
+        }
+    }
+}
+
+// A fixed-address AArch64 ELF with one RX and one RW PT_LOAD. The kernel
+// clears each bank before loading, including BSS and unused stack space.
+pub(crate) struct ProcessImage<'a> { text:&'a [u8], data:&'a [u8] }
+pub(crate) fn process_image(file:&[u8])->Option<ProcessImage<'_>>{
+    let half=|i|Some(u16::from_le_bytes(file.get(i..i+2)?.try_into().ok()?));
+    let word=|i|Some(u32::from_le_bytes(file.get(i..i+4)?.try_into().ok()?));
+    let wide=|i|usize::try_from(u64::from_le_bytes(file.get(i..i+8)?.try_into().ok()?)).ok();
+    if file.get(..7)?!=b"\x7fELF\x02\x01\x01" || half(16)?!=2 || half(18)?!=183 || word(20)?!=1 || wide(24)?!=USER || half(54)?!=56 || half(56)?!=2 {return None;}
+    let table=wide(32)?;
+    file.get(table..table.checked_add(112)?)?;
+    let load=|i:usize,flags,base,max|{
+        if word(i)?!=1 || word(i+4)?!=flags || wide(i+16)?!=base{return None;}
+        let (start,len,mem)=(wide(i+8)?,wide(i+32)?,wide(i+40)?);
+        if len>mem||mem>max{return None;}
+        file.get(start..start.checked_add(len)?)
+    };
+    let text=load(table,5,USER,BLOCK)?;
+    if text.len()<4{return None;}
+    Some(ProcessImage{text,data:load(table+56,6,USER+BLOCK,SCRIPT_OFFSET-BLOCK)?})
+}
+pub(crate) fn start_process(file:&[u8],cwd:&str,flags:usize)->Result<u16,&'static str>{
+    let image=process_image(file).ok_or("invalid process ELF")?;
+    unsafe{
+        write_bytes(ALIAS as *mut u8,0,USER_REGION_BYTES);
+        copy_nonoverlapping(image.text.as_ptr(),ALIAS as *mut u8,image.text.len());
+        copy_nonoverlapping(image.data.as_ptr(),(ALIAS+BLOCK) as *mut u8,image.data.len());
+        copy_nonoverlapping(cwd.as_ptr(),git_mailbox(),cwd.len());
+        asm!("dsb sy","ic iallu","dsb sy","isb");
+        u16::try_from(enter_user(USER+SCRIPT_OFFSET,flags,0,0)).map_err(|_|"user program fault")
+    }
+}
+#[cfg(feature="retina")]
+pub(crate) fn saved_mailbox(memory: &mut [u8]) -> &mut [u8] { &mut memory[SCRIPT_OFFSET-BLOCK..] }
+pub(crate) fn suspend_process()->Vec<u8>{
+    unsafe{core::slice::from_raw_parts((ALIAS+BLOCK) as *const u8,BLOCK)}.to_vec()
+}
+pub(crate) fn resume_process(file:&[u8],memory:&[u8])->Result<u16,&'static str>{
+    resume_with_flags(file, memory, 0)
+}
+
+pub(crate) fn resume_agent(file: &[u8], memory: &[u8]) -> Result<u16, &'static str> {
+    resume_with_flags(file, memory, 65536)
+}
+
+fn resume_with_flags(file: &[u8], memory: &[u8], flags: usize) -> Result<u16, &'static str> {
+
+    unsafe{
+        write_bytes(ALIAS as *mut u8,0,BLOCK);
+        if let Some(image) = process_image(file) {
+            copy_nonoverlapping(image.text.as_ptr(), ALIAS as *mut u8, image.text.len());
+        } else if let Some(code) = crate::utility::segment(file) {
+            copy_nonoverlapping(code.as_ptr(), ALIAS as *mut u8, code.len());
+        } else {
+            let image = executable(file)?;
+            // Initialized data in RUNNER is already in the suspended RW bank.
+            copy_nonoverlapping(RUNNER.as_ptr(), ALIAS as *mut u8, RUNNER.len().min(BLOCK));
+            copy_nonoverlapping(image.code.as_ptr(), (ALIAS + LXE_CODE_OFFSET) as *mut u8, image.code.len());
+        }
+        copy_nonoverlapping(memory.as_ptr(),(ALIAS+BLOCK) as *mut u8,BLOCK);
+        asm!("dsb sy","ic iallu","dsb sy","isb");
+        u16::try_from(enter_user(0,0,0,flags)).map_err(|_|"user program fault")
+    }
 }

@@ -1,5 +1,4 @@
-use crate::{HEAP, print};
-use alloc::format;
+use crate::HEAP;
 use core::{arch::asm, ptr::addr_of};
 
 pub fn ticks() -> u64 {
@@ -27,56 +26,20 @@ pub fn kernel_span_bytes() -> usize {
     addr_of!(__stack_top) as usize - addr_of!(__kernel_start) as usize
 }
 
-pub fn show(start: u64, files: impl Fn() -> (usize, usize, usize)) {
-    let freq = seconds_to_ticks(1);
-    let window = cfg!(feature = "window-console");
-    if !window {
-        print("\x1b[?1049h\x1b[2J");
+/// Sample the kernel stack currently executing this code, including during a pane switch.
+#[cfg(feature = "retina")]
+pub fn kernel_stack_usage() -> Option<(usize, usize)> {
+    unsafe extern "C" {
+        static __stack_bottom: u8;
+        static __stack_top: u8;
     }
-    loop {
-        let now = ticks();
-        let (count, dirs, bytes) = files();
-        let (used, free) = heap_usage();
-        let segments = if cfg!(feature = "split") { 8 } else { 32 };
-        let bars = segments * used / (used + free);
-        if !window {
-            print("\x1b[H");
-        }
+    let sp: usize;
+    unsafe { asm!("mov {}, sp", out(reg) sp, options(nostack, nomem, preserves_flags)); }
+    let stacks = [
+        (addr_of!(__stack_bottom) as usize, addr_of!(__stack_top) as usize),
         #[cfg(feature = "split")]
-        let stack_kib = if crate::panes::active() == 1 { 32 } else { 16 };
-        #[cfg(not(feature = "split"))]
-        let stack_kib = 16;
-        let frame = format!(
-            "LixinOS   htop                         q: quit\n\nUptime  {} s          CPUs  1\x1b[K\nGuest RAM  128 MiB    Kernel stack  {stack_kib} KiB\nHeap [{}{}] {} B used / {} B free\x1b[K\nFilesystem  {} files, {} dirs, {} bytes\x1b[K\n\nCONTEXT       STATE       ACTIVITY\nKernel shell  foreground  htop (console polling)\n",
-            (now - start) / freq,
-            "#".repeat(bars),
-            "-".repeat(segments - bars),
-            used,
-            free,
-            count,
-            dirs,
-            bytes
-        );
-        print(&frame);
-        #[cfg(feature = "retina")]
-        crate::graphics::waiting(true);
-        while ticks().wrapping_sub(now) < freq {
-            if matches!(crate::poll_byte(), Some(b'q' | b'Q' | 27)) {
-                #[cfg(feature = "retina")]
-                crate::graphics::waiting(false);
-                if !window {
-                    print("\x1b[?1049l");
-                }
-                return;
-            }
-            core::hint::spin_loop();
-        }
-        #[cfg(feature = "retina")]
-        crate::graphics::waiting(false);
-        // QEMU's virtual console lacks an alternate screen. Refresh in place
-        // below the command so its existing terminal history stays visible.
-        if window {
-            print(&format!("\x1b[{}A", frame.lines().count()));
-        }
-    }
+        crate::panes::right_stack_bounds(),
+    ];
+    stacks.into_iter().find(|&(bottom, top)| (bottom..=top).contains(&sp))
+        .map(|(bottom, top)| (top - sp, top - bottom))
 }

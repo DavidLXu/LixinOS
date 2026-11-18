@@ -15,6 +15,9 @@ const W: usize = CW * SCREEN_COLS;
 const H: usize = CH * (ROWS + 1);
 const BG: u32 = 0x171b20;
 const FG: u32 = 0xdadbd5;
+const STATUS_BG: u32 = 0x273038;
+const STATUS_VALUE: u32 = 0xe8ece9;
+const STATUS_DIVIDER: u32 = 0x536471;
 const FONT: &[u8; 95 * CW * CH] = include_bytes!(concat!(env!("OUT_DIR"), "/font.gray"));
 #[repr(align(4096))]
 struct Frame([u32; W * H]);
@@ -72,6 +75,8 @@ fn configure_ramfb() {
 
 #[derive(Clone, Copy)]
 struct Terminal {
+    cols: usize,
+    rows: usize,
     x: usize,
     y: usize,
     color: u32,
@@ -83,7 +88,9 @@ struct Terminal {
     param: usize,
 }
 static mut ACTIVE: usize = 0;
-static mut TERMS: [Terminal; PANES] = [Terminal {
+static mut CANVAS_OPEN: [bool; PANES] = [false; PANES];
+const INITIAL: Terminal = Terminal {
+    cols: COLS, rows: ROWS,
     x: 0,
     y: 0,
     color: FG,
@@ -93,14 +100,16 @@ static mut TERMS: [Terminal; PANES] = [Terminal {
     csi: false,
     params: [0; 4],
     param: 0,
-}; PANES];
+};
+static mut TERMS: [Terminal; PANES] = [INITIAL; PANES];
 
-fn glyph(fb: &mut [u32], offset: usize, byte: u8, fg: u32, bg: u32) {
+#[inline]
+fn glyph(fb: &mut [u32], offset: usize, width: usize, byte: u8, fg: u32, bg: u32) {
     let glyph = &FONT[(byte - 32) as usize * CW * CH..];
     for row in 0..CH {
         let start = offset + row * W;
-        for (x, p) in fb[start..start + CW].iter_mut().enumerate() {
-            let a = glyph[row * CW + x] as u32;
+        for (x, p) in fb[start..start + width].iter_mut().enumerate() {
+            let a = glyph[row * CW + x * CW / width] as u32;
             let mix = |shift: u32| {
                 ((((fg >> shift) & 255) * a + ((bg >> shift) & 255) * (255 - a)) / 255) << shift
             };
@@ -115,24 +124,19 @@ impl Terminal {
         } else {
             (self.color, BG)
         };
-        glyph(fb, self.y * CH * W + self.x * CW, byte, fg, bg);
+        glyph(fb, self.y * CH * W + self.x * CW, CW, byte, fg, bg);
     }
     fn newline(&mut self, fb: &mut [u32]) {
-        if self.y + 1 < ROWS {
+        if self.y + 1 < self.rows {
             self.y += 1;
-        } else {
-            if PANES == 1 {
-                fb.copy_within(W * CH.., 0);
-                fb[(ROWS - 1) * W * CH..].fill(BG);
-            } else {
-                for y in 0..(ROWS - 1) * CH {
-                    let src = (y + CH) * W;
-                    fb.copy_within(src..src + PANE_WIDTH, y * W);
-                }
-                for row in fb[(ROWS - 1) * W * CH..].chunks_mut(W) {
-                    row[..PANE_WIDTH].fill(BG);
-                }
-            }
+            return;
+        }
+        for y in 0..(self.rows - 1) * CH {
+            let src = (y + CH) * W;
+            fb.copy_within(src..src + self.cols * CW, y * W);
+        }
+        for y in (self.rows-1)*CH..self.rows*CH {
+            fb[y*W..y*W+self.cols*CW].fill(BG);
         }
     }
     fn control(&mut self, fb: &mut [u32], byte: u8) {
@@ -142,21 +146,21 @@ impl Terminal {
         let n = self.params[0].max(1);
         match byte {
             b'H' | b'f' => {
-                self.y = (n - 1).min(ROWS - 1);
-                self.x = self.params[1].saturating_sub(1).min(COLS - 1);
+                self.y = (n - 1).min(self.rows - 1);
+                self.x = self.params[1].saturating_sub(1).min(self.cols - 1);
             }
             b'A' => self.y = self.y.saturating_sub(n),
-            b'B' => self.y = (self.y + n).min(ROWS - 1),
-            b'C' => self.x = (self.x + n).min(COLS - 1),
+            b'B' => self.y = (self.y + n).min(self.rows - 1),
+            b'C' => self.x = (self.x + n).min(self.cols - 1),
             b'D' => self.x = self.x.saturating_sub(n),
             b'J' if self.params[0] == 2 => {
-                for row in fb.chunks_mut(W) {
-                    row[..PANE_WIDTH].fill(BG);
+                for row in fb.chunks_mut(W).take(self.rows * CH) {
+                    row[..(self.cols * CW)].fill(BG);
                 }
             }
             b'K' => {
                 for row in self.y * CH..(self.y + 1) * CH {
-                    fb[row * W + self.x * CW..row * W + PANE_WIDTH].fill(BG);
+                    fb[row * W + self.x * CW..row * W + (self.cols * CW)].fill(BG);
                 }
             }
             b'm' => {
@@ -167,6 +171,12 @@ impl Terminal {
                             self.reverse = false;
                         }
                         7 => self.reverse = true,
+                        30 => self.color = 0x565e6b,
+                        31 => self.color = 0xe69a96,
+                        33 => self.color = 0xe7cc91,
+                        34 => self.color = 0x90b7ed,
+                        35 => self.color = 0xcdabd9,
+                        37 | 39 => self.color = FG,
                         32 => self.color = 0x9dc69e,
                         36 => self.color = 0x89c9ca,
                         _ => (),
@@ -202,7 +212,7 @@ impl Terminal {
                 self.wrap_pending = false;
             }
             match b {
-                9 => self.x = ((self.x / 8 + 1) * 8).min(COLS - 1),
+                9 => self.x = ((self.x / 8 + 1) * 8).min(self.cols - 1),
                 27 => self.escape = true,
                 8 => self.x = self.x.saturating_sub(1),
                 13 => self.x = 0,
@@ -213,8 +223,8 @@ impl Terminal {
                         self.newline(fb);
                     }
                     self.draw(fb, b);
-                    self.wrap_pending = self.x + 1 == COLS;
-                    self.x = (self.x + 1).min(COLS - 1);
+                    self.wrap_pending = self.x + 1 == self.cols;
+                    self.x = (self.x + 1).min(self.cols - 1);
                 }
                 _ => (),
             }
@@ -232,7 +242,11 @@ pub fn put(byte: u8) {
     sample();
     unsafe {
         let fb = &mut (*addr_of_mut!(FB)).0;
-        TERMS[ACTIVE].byte(&mut fb[BAR_PIXELS + ACTIVE * (PANE_WIDTH + CW)..], byte);
+        if let Some(term) = &mut POPUPS[ACTIVE] {
+            term.byte(&mut fb[popup_offset()..], byte);
+        } else {
+            TERMS[ACTIVE].byte(&mut fb[BAR_PIXELS + ACTIVE * (PANE_WIDTH + CW)..], byte);
+        }
     }
 }
 
@@ -241,13 +255,18 @@ pub fn switch_pane() {
     sample();
     unsafe {
         let fb = &mut (*addr_of_mut!(FB)).0;
-        TERMS[ACTIVE].cursor(&mut fb[BAR_PIXELS + ACTIVE * (PANE_WIDTH + CW)..]);
+        if !CANVAS_OPEN[ACTIVE] {
+            TERMS[ACTIVE].cursor(&mut fb[BAR_PIXELS + ACTIVE * (PANE_WIDTH + CW)..]);
+        }
         // Each suspended continuation may be waiting for input or doing work.
         static mut IDLE: [bool; 2] = [false; 2];
         IDLE[ACTIVE] = USAGE.waiting;
         ACTIVE ^= 1;
+        reset_pointer();
         USAGE.waiting = IDLE[ACTIVE];
-        TERMS[ACTIVE].cursor(&mut fb[BAR_PIXELS + ACTIVE * (PANE_WIDTH + CW)..]);
+        if !CANVAS_OPEN[ACTIVE] {
+            TERMS[ACTIVE].cursor(&mut fb[BAR_PIXELS + ACTIVE * (PANE_WIDTH + CW)..]);
+        }
         focus_label(&mut fb[..BAR_PIXELS]);
     }
 }
@@ -258,9 +277,7 @@ fn focus_label(bar: &mut [u32]) {
     } else {
         "Right | Ctrl+Tab"
     };
-    for (i, b) in label.bytes().enumerate() {
-        glyph(bar, (12 + i) * CW, b, 0xcbdedb, 0x273038);
-    }
+    status_text(bar, 12 * CW, CW, label, 0xcbdedb);
 }
 
 struct Keyboard {
@@ -282,6 +299,7 @@ pub fn init() {
             }
         }
         start_status();
+        init_tablet();
         let transport =
             MmioTransport::new(NonNull::new(0x0a00_0200 as *mut _).unwrap(), 512).unwrap();
         *addr_of_mut!(KEYBOARD) = Some(Keyboard {
@@ -405,6 +423,53 @@ static mut USAGE: Usage = Usage {
     busy_percent: None,
 };
 
+#[derive(Clone, Copy)]
+struct StorageUsage {
+    files: usize,
+    used_bytes: usize,
+    capacity_bytes: usize,
+}
+static mut STORAGE: Option<StorageUsage> = None;
+
+pub fn set_storage_usage(files: usize, used_bytes: usize, capacity_bytes: usize) {
+    // The disk and status sampler both run on the guest's single vCPU.
+    unsafe {
+        *addr_of_mut!(STORAGE) = Some(StorageUsage {
+            files,
+            used_bytes,
+            capacity_bytes,
+        });
+    }
+}
+
+fn memory_value(bytes: usize) -> alloc::string::String {
+    const MIB: usize = 1 << 20;
+    if bytes < MIB {
+        return alloc::format!("{}KiB", bytes.div_ceil(1024));
+    }
+    let tenths = (bytes * 10 + MIB / 2) / MIB;
+    if tenths % 10 == 0 {
+        alloc::format!("{}MiB", tenths / 10)
+    } else {
+        alloc::format!("{}.{}MiB", tenths / 10, tenths % 10)
+    }
+}
+
+fn disk_value(usage: StorageUsage) -> alloc::string::String {
+    const MIB: usize = 1024 * 1024;
+    let used_kib = usage.used_bytes.div_ceil(1024);
+    let capacity_kib = usage.capacity_bytes.div_ceil(1024);
+    let capacity_mib = usage.capacity_bytes.div_ceil(MIB);
+    if capacity_mib < 8 {
+        alloc::format!("{used_kib}/{capacity_kib}KiB")
+    } else if usage.used_bytes < MIB {
+        alloc::format!("{used_kib}KiB/{capacity_mib}MiB")
+    } else {
+        let tenths = (usage.used_bytes * 10 + MIB / 2) / MIB;
+        alloc::format!("{}.{}/{capacity_mib}MiB", tenths / 10, tenths % 10)
+    }
+}
+
 fn start_status() {
     let now = crate::monitor::ticks();
     unsafe {
@@ -444,12 +509,16 @@ pub fn cpu_busy_percent() -> Option<u64> {
 }
 
 fn draw_status(cpu: Option<u64>) {
-    const SURFACE: u32 = 0x273038;
+    let stack = crate::monitor::kernel_stack_usage().map_or_else(|| "--".into(), |(used, total)| {
+        let used = memory_value(used);
+        let total = memory_value(total);
+        let unit = if total.ends_with("MiB") { "MiB" } else { "KiB" };
+        alloc::format!("{}/{total}", used.strip_suffix(unit).unwrap_or(&used))
+    });
     let (heap, _) = crate::monitor::heap_usage();
-    // The kernel span includes its heap arena. Count only the allocated
-    // portion, plus the separate physical region reserved for EL0 programs.
+    // The heap and user banks are outside the linked kernel image.
     let kernel_span = crate::monitor::kernel_span_bytes();
-    let used = kernel_span - crate::HEAP_BYTES
+    let used = kernel_span
         + heap
         + crate::user::BANKS * crate::user::USER_REGION_BYTES;
     let tenths_mib = (used * 10 + (1 << 19)) >> 20;
@@ -457,23 +526,292 @@ fn draw_status(cpu: Option<u64>) {
         || alloc::string::String::from("--"),
         |n| alloc::format!("{n}%"),
     );
-    let metrics = alloc::format!(
-        "CPU {cpu:>4}    RAM {}.{} / 128 MiB    HEAP {} KiB",
-        tenths_mib / 10,
-        tenths_mib % 10,
-        heap.div_ceil(1024)
-    );
+    let storage = unsafe { *addr_of!(STORAGE) };
+    let files = storage.map_or_else(|| "--".into(), |usage| alloc::format!("{}", usage.files));
+    let disk = storage.map_or_else(|| "--".into(), disk_value);
+    let metrics = [
+        ("CPU", cpu, 0x8fbef4),
+        (
+            "RAM",
+            alloc::format!("{}.{}/512MiB", tenths_mib / 10, tenths_mib % 10),
+            0x77d5d2,
+        ),
+        ("HEAP", memory_value(heap), 0xc6aef2),
+        ("STACK", stack, 0xe4b4aa),
+        ("FILES", files, 0xa9d295),
+        ("DISK", disk, 0xf0c47a),
+    ];
+    let characters: usize = metrics
+        .iter()
+        .map(|(label, value, _)| label.len() + 1 + value.len())
+        .sum();
+    let separators = metrics.len() - 1;
+    let left = if cfg!(feature = "split") { 30 * CW } else { 10 * CW };
+    let right = W - CW;
+    // Fit the counters into the space after the title and pane selector.
+    let width = CW.min((right - left - 12 * separators) / characters);
+    let text_width = characters * width;
+    let gap = (right.saturating_sub(left + text_width) / separators).clamp(12, 40);
+    let mut x = right - text_width - separators * gap;
     let fb = unsafe { &mut (*addr_of_mut!(FB)).0 };
     let bar = &mut fb[..BAR_PIXELS];
-    bar.fill(SURFACE);
-    for (col, text, ink) in [
-        (2, "LixinOS", 0xa9d5cd),
-        (SCREEN_COLS - 2 - metrics.len(), metrics.as_str(), FG),
-    ] {
-        for (i, byte) in text.bytes().enumerate() {
-            glyph(bar, (col + i) * CW, byte, ink, SURFACE);
+    bar.fill(STATUS_BG);
+    let title_x = if x >= 10 * CW { 2 * CW } else { 0 };
+    status_text(bar, title_x, CW, "LixinOS", 0xa9d5cd);
+    for (index, (label, value, ink)) in metrics.iter().enumerate() {
+        status_text(bar, x, width, label, *ink);
+        x += (label.len() + 1) * width;
+        status_text(bar, x, width, value, STATUS_VALUE);
+        x += value.len() * width;
+        if index < separators {
+            let divider = x + gap / 2 - 1;
+            for row in 12..CH - 12 {
+                let start = row * W + divider;
+                bar[start..start + 2].fill(STATUS_DIVIDER);
+            }
+            x += gap;
         }
     }
     #[cfg(feature = "split")]
     focus_label(bar);
+}
+
+fn status_text(bar: &mut [u32], x: usize, width: usize, text: &str, ink: u32) {
+    for (i, byte) in text.bytes().enumerate() {
+        glyph(bar, x + i * width, width, byte, ink, STATUS_BG);
+    }
+}
+
+// QEMU virtio-tablet absolute axes range from 0 to 32767. Use a logical
+// pixel for each 2x2 Retina block. The top status row and gutter stay private.
+const CANVAS_W: usize = PANE_WIDTH / 2;
+const CANVAS_H: usize = ROWS * CH / 2;
+struct Pointer {
+    device: VirtIOInput<Dma, MmioTransport<'static>>,
+    x: u32,
+    y: u32,
+    left: bool,
+    wheel: i32,
+    suppress: bool,
+    cancel: bool,
+}
+static mut POINTER: Option<Pointer> = None;
+fn init_tablet() {
+    unsafe {
+        let Some(device) = MmioTransport::new(NonNull::new(0x0a00_0600 as *mut _).unwrap(), 512)
+            .ok()
+            .and_then(|t| VirtIOInput::new(t).ok())
+        else {
+            return;
+        };
+        *addr_of_mut!(POINTER) = Some(Pointer {
+            device,
+            x: 0,
+            y: 0,
+            left: false,
+            wheel: 0,
+            suppress: false,
+            cancel: false,
+        });
+    }
+}
+impl Pointer {
+    fn next(&mut self) -> Option<u64> {
+        while let Some(e) = self.device.pop_pending_event() {
+            match (e.event_type, e.code) {
+                (3, 0) => self.x = e.value.min(32767),
+                (3, 1) => self.y = e.value.min(32767),
+                (1, 272) => {
+                    self.left = e.value != 0;
+                    if !self.left {
+                        self.suppress = false;
+                    }
+                }
+                (2, 8) => self.wheel = (e.value as i32).signum(),
+                (0, 0) => {
+                    let x = self.x as usize * (W - 1) / 32767;
+                    let y = self.y as usize * (H - 1) / 32767;
+                    let left = unsafe { ACTIVE } * (PANE_WIDTH + CW);
+                    let inside = (left..left + PANE_WIDTH).contains(&x) && y >= CH;
+                    let local_x = x.saturating_sub(left).min(PANE_WIDTH - 1) / 2;
+                    let local_y = y.saturating_sub(CH).min(ROWS * CH - 1) / 2;
+                    let wheel = core::mem::take(&mut self.wheel);
+                    return Some(
+                        local_x as u64
+                            | ((local_y as u64) << 12)
+                            | (u64::from(self.left && !self.suppress) << 24)
+                            | (u64::from(inside) << 25)
+                            | (u64::from(wheel > 0) << 26)
+                            | (u64::from(wheel < 0) << 27),
+                    );
+                }
+                _ => (),
+            }
+        }
+        None
+    }
+}
+fn reset_pointer() {
+    if let Some(p) = unsafe { (&mut *addr_of_mut!(POINTER)).as_mut() } {
+        while p.next().is_some() {}
+        p.suppress = p.left;
+        p.cancel = true;
+    }
+}
+pub fn begin_canvas() {
+    reset_pointer();
+}
+pub fn canvas_size() -> u64 {
+    if unsafe { (&*addr_of!(POINTER)).is_none() } {
+        return 0;
+    }
+    CANVAS_W as u64 | ((CANVAS_H as u64) << 16)
+}
+pub fn pointer_event() -> u64 {
+    let Some(p) = (unsafe { (&mut *addr_of_mut!(POINTER)).as_mut() }) else {
+        return u64::MAX;
+    };
+    if core::mem::take(&mut p.cancel) {
+        return 1 << 28;
+    }
+    p.next().unwrap_or(u64::MAX)
+}
+pub fn present(arena: &crate::user::UserArena) -> u64 {
+    // The caller supplies a tightly packed XRGB rectangle in its own arena.
+    let [address, x, y, w, h] = unsafe { crate::user::git_mailbox().cast::<[usize; 5]>().read() };
+    if w == 0
+        || h == 0
+        || w > CANVAS_W
+        || h > CANVAS_H
+        || x > CANVAS_W - w
+        || y > CANVAS_H - h
+        || address % 4 != 0
+        || !arena.contains(address, w * h * 4)
+    {
+        return u64::MAX;
+    }
+    unsafe {
+        let pixels = core::slice::from_raw_parts(address as *const u32, w * h);
+        let fb = &mut (*addr_of_mut!(FB)).0;
+        let start = BAR_PIXELS + ACTIVE * (PANE_WIDTH + CW) + 2 * (y * W + x);
+        for (row, src) in pixels.chunks_exact(w).enumerate() {
+            let offset = start + 2 * row * W;
+            for (pair, color) in fb[offset..offset + 2 * w].chunks_exact_mut(2).zip(src) {
+                pair.fill(*color);
+            }
+            fb.copy_within(offset..offset + 2 * w, offset + W);
+        }
+    }
+    0
+}
+
+// A synchronous graphics utility owns only its pane. Keep the original pixels
+// so returning (including a user fault) restores the exact shell screen.
+pub struct Canvas {
+    pub arena: crate::user::UserArena,
+    original: alloc::vec::Vec<u32>,
+    pane: usize,
+}
+impl Canvas {
+    pub fn open() -> Option<Self> {
+        if canvas_size() == 0 || popup_active() { return None; }
+        let mut arena = crate::user::UserArena::new();
+        arena.grow((CANVAS_W * CANVAS_H + 20 * 24) * 4).ok()?;
+        let pane = unsafe { ACTIVE };
+        let mut original = alloc::vec::Vec::new();
+        original.try_reserve_exact(PANE_WIDTH * CH * ROWS).ok()?;
+        let fb = unsafe { &(*addr_of!(FB)).0 };
+        let x = pane * (PANE_WIDTH + CW);
+        for row in fb[BAR_PIXELS..].chunks_exact(W) {
+            original.extend_from_slice(&row[x..x + PANE_WIDTH]);
+        }
+        begin_canvas();
+        unsafe { CANVAS_OPEN[pane] = true; }
+        Some(Self { arena, original, pane })
+    }
+}
+impl Drop for Canvas {
+    fn drop(&mut self) {
+        unsafe { CANVAS_OPEN[self.pane] = false; }
+        let fb = unsafe { &mut (*addr_of_mut!(FB)).0 };
+        let x = self.pane * (PANE_WIDTH + CW);
+        for (row, saved) in fb[BAR_PIXELS..].chunks_exact_mut(W).zip(self.original.chunks_exact(PANE_WIDTH)) {
+            row[x..x + PANE_WIDTH].copy_from_slice(saved);
+        }
+    }
+}
+
+// Popup chrome is painted by the desktop. Only this character grid receives ANSI output.
+static mut POPUPS: [Option<Terminal>; PANES] = [None; PANES];
+const POP_COLS: usize = COLS - 4;
+const POP_ROWS: usize = 21;
+fn popup_offset() -> usize {
+    BAR_PIXELS + unsafe { ACTIVE } * (PANE_WIDTH + CW) + 2 * CW + 3 * CH * W
+}
+pub fn columns() -> usize { if popup_active() { POP_COLS } else { COLS } }
+pub fn rows() -> usize { if popup_active() { POP_ROWS } else { ROWS } }
+pub fn popup_active() -> bool { unsafe { POPUPS[ACTIVE].is_some() } }
+
+pub struct PopupScreen(Terminal, alloc::vec::Vec<u32>);
+pub fn show_popup(saved: Option<PopupScreen>) {
+    reset_pointer();
+    let fb = unsafe { &mut (&mut (*addr_of_mut!(FB)).0)[popup_offset()..] };
+    let (term, pixels) = match saved {
+        Some(PopupScreen(t, p)) => (t, Some(p)),
+        None => (Terminal {cols: POP_COLS, rows: POP_ROWS, ..INITIAL}, None)
+    };
+    for (y,row) in fb.chunks_mut(W).take(POP_ROWS*CH).enumerate() {
+        let width = POP_COLS*CW;
+        match &pixels {
+            Some(p) => row[..width].copy_from_slice(&p[y*width..(y+1)*width]),
+            None => row[..width].fill(BG)
+        }
+    }
+    if pixels.is_none() { term.cursor(fb); }
+    unsafe { POPUPS[ACTIVE] = Some(term); }
+}
+pub fn hide_popup(save: bool) -> Option<PopupScreen> {
+    let term = unsafe { POPUPS[ACTIVE].take()? };
+    if !save { return None; }
+    let fb = unsafe { &(&(*addr_of!(FB)).0)[popup_offset()..] };
+    let mut pixels = alloc::vec::Vec::with_capacity(POP_COLS*CW*POP_ROWS*CH);
+    for row in fb.chunks(W).take(POP_ROWS*CH) {
+        pixels.extend_from_slice(&row[..POP_COLS*CW]);
+    }
+    Some(PopupScreen(term, pixels))
+}
+
+// XOR a pointer only while the shell is waiting. Erase it before returning a
+// key so scrolling or saving the window never copies the pointer into its text.
+fn toggle_pointer(x: usize, y: usize) {
+    let fb = unsafe { &mut (*addr_of_mut!(FB)).0 };
+    let origin = BAR_PIXELS + unsafe { ACTIVE } * (PANE_WIDTH+CW);
+    for j in 0..16.min(CANVAS_H-y) {
+        for i in 0..(1+j*2/3).min(CANVAS_W-x) {
+            let p = origin + 2*((y+j)*W+x+i);
+            for offset in [0, 1, W, W+1] { fb[p+offset] ^= 0xffffff; }
+        }
+    }
+}
+pub fn popup_key() -> u64 {
+    let mut cursor = None;
+    waiting(true);
+    let key = loop {
+        if let Some(c) = crate::poll_byte() {
+            break if c==29 {257} else {u64::from(c)};
+        }
+        let event = pointer_event();
+        if event == u64::MAX {continue;}
+        if let Some((x,y)) = cursor.take() {toggle_pointer(x,y);}
+        if event & (1<<25) == 0 {continue;}
+        let (x,y) = ((event & 4095) as usize, ((event>>12)&4095) as usize);
+        if event & (1<<24) != 0 && (16..CANVAS_W-16).contains(&x) && (32..66).contains(&y) {
+            break 257;
+        }
+        toggle_pointer(x,y);
+        cursor=Some((x,y));
+    };
+    if let Some((x,y))=cursor { toggle_pointer(x,y); }
+    waiting(false);
+    key
 }

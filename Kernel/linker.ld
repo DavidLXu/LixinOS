@@ -15,7 +15,9 @@ SECTIONS
     .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) }
 
     .stack ALIGN(16) (NOLOAD) : {
-        . += 16K;
+        /* The desktop can host a shell and its foreground child on this stack. */
+        __stack_bottom = .;
+        . += 128K;
         __stack_top = .;
     }
 }

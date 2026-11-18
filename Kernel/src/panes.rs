@@ -10,15 +10,21 @@ global_asm!(include_str!("panes.S"));
 unsafe extern "C" {
     fn swap_stack(save: *mut usize, resume: usize, fresh_top: usize);
 }
+const STACK_BYTES: usize = 128 * 1024;
 #[repr(align(16))]
-struct Stack([u8; 32 * 1024]);
-static mut RIGHT_STACK: Stack = Stack([0; 32 * 1024]);
+struct Stack([u8; STACK_BYTES]);
+static mut RIGHT_STACK: Stack = Stack([0; STACK_BYTES]);
 static mut SAVED_SP: [usize; 2] = [0; 2];
 static mut START: Option<Box<dyn FnOnce()>> = None;
 static mut INPUT: [VecDeque<u8>; 2] = [const { VecDeque::new() }; 2];
 static mut ACTIVE: usize = 0;
 static mut LAST_SWITCH: u64 = 0;
 static mut RUN_TICKS: [u64; 2] = [0; 2];
+
+pub fn right_stack_bounds() -> (usize, usize) {
+    let bottom = core::ptr::addr_of!(RIGHT_STACK) as usize;
+    (bottom, bottom + STACK_BYTES)
+}
 
 pub fn active() -> usize {
     unsafe { ACTIVE }
@@ -96,7 +102,7 @@ pub fn switch() {
         ACTIVE = new;
         crate::graphics::switch_pane();
         crate::user::select_bank(new);
-        let top = addr_of_mut!(RIGHT_STACK.0).cast::<u8>().add(32 * 1024) as usize;
+        let top = addr_of_mut!(RIGHT_STACK.0).cast::<u8>().add(STACK_BYTES) as usize;
         swap_stack(addr_of_mut!(SAVED_SP[old]), SAVED_SP[new], top);
     }
 }
