@@ -93,11 +93,12 @@ pub fn disk(disk: &disk::Disk) -> String {
     )
 }
 
-pub fn filesystem(files: &disk::Files) -> String {
+pub fn filesystem(volume: &Volume) -> String {
+    let files = &volume.files;
     let (count, dirs, bytes) = disk::file_counts(files);
     format!(
         "files={count}\ndirectories={dirs} (includes root)\nfile_content_bytes={bytes}\n         entries={}\nentry_limit={}\nfile_size_limit_bytes={}\n         file_content_bytes_excludes=filesystem metadata, history and snapshot overhead",
-        files.len(), disk::ENTRY_LIMIT, disk::FILE_LIMIT
+        files.len(), disk::ENTRY_LIMIT, volume.disk.file_limit()
     )
 }
 

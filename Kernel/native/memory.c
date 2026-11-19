@@ -1,12 +1,43 @@
 #include "native.h"
 
+int normal_ram;
+typedef u64 unaligned_word __attribute__((aligned(1), may_alias));
 void *memcpy(void *out, const void *in, u64 n) {
-    u8 *dst = out;
-    const u8 *src = in;
+    u8 *d = out;
+    const u8 *s = in;
+    if (normal_ram || !(((u64)d | (u64)s) & 7)) {
+        while (n >= 32) {
+            ((unaligned_word *)d)[0] = ((const unaligned_word *)s)[0];
+            ((unaligned_word *)d)[1] = ((const unaligned_word *)s)[1];
+            ((unaligned_word *)d)[2] = ((const unaligned_word *)s)[2];
+            ((unaligned_word *)d)[3] = ((const unaligned_word *)s)[3];
+            d += 32;
+            s += 32;
+            n -= 32;
+        }
+    }
     while (n--)
-        *dst++ = *src++;
+        *d++ = *s++;
     return out;
 }
+void *memset(void *out, int c, u64 n) {
+    u8 *d = out;
+    u64 fill = (u8)c * 0x0101010101010101UL;
+    while (n && ((u64)d & 7)) {
+        *d++ = c;
+        n--;
+    }
+    while (n >= 32) {
+        u64 *w = (u64 *)d;
+        w[0] = w[1] = w[2] = w[3] = fill;
+        d += 32;
+        n -= 32;
+    }
+    while (n--)
+        *d++ = c;
+    return out;
+}
+
 void *memmove(void *out, const void *in, u64 n) {
     u8 *dst = out;
     const u8 *src = in;
@@ -16,12 +47,6 @@ void *memmove(void *out, const void *in, u64 n) {
         --n;
         dst[n] = src[n];
     }
-    return out;
-}
-void *memset(void *out, int c, u64 n) {
-    u8 *dst = out;
-    while (n--)
-        *dst++ = c;
     return out;
 }
 u64 strlen(const char *s) {

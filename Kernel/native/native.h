@@ -2,7 +2,12 @@
 #define LIXIN_NATIVE_H
 #define NATIVE_RAM_BYTES (1536UL << 20)
 #define SNAPSHOT_SLOT_BYTES (192u << 20)
-#define NATIVE_FILE_LIMIT (100u << 20)
+#define NATIVE_FILE_LIMIT (build_volume ? 512u << 20 : 100u << 20)
+extern int build_volume;
+int disk_checkpoint(void), batch_stale(int id);
+void disk_select_task(unsigned id);
+int scratch_write(const char *path, unsigned offset, const void *data, unsigned size);
+unsigned long disk_capacity(void), native_ram_bytes(void), heap_capacity_bytes(void);
 #define NATIVE_FILE_POOL (192u << 20)
 #define EDITOR_FILE_LIMIT (1u << 20)
 typedef unsigned char u8;
@@ -90,6 +95,7 @@ u64 idle_ticks(void), heap_bytes(void);
 int handles_pointer(void);
 int editor_input(void), console_key(void);
 unsigned long strlen(const char *s);
+int strncmp(const char *a, const char *b, u64 n);
 int memcmp(const void *a, const void *b, u64 n);
 char *add_text(char *out, const char *s), *add_number(char *out, u64 value);
 void file_stats(u64 *stats);

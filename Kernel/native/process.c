@@ -1,5 +1,6 @@
 #include "native.h"
 #include "version.h"
+#include "build-memory.h"
 
 #define USER 0x44000000UL
 #define BLOCK 0x200000UL
@@ -41,8 +42,10 @@ static int magic(struct file f, const char *s, u32 n) {
 
 static u64 root[512] __attribute__((aligned(4096)));
 static u64 ram[512] __attribute__((aligned(4096)));
+static u64 extended[512] __attribute__((aligned(4096)));
 static u64 ram_high[512] __attribute__((aligned(4096)));
-extern void enable_mmu(u64 *table, void (*vectors)(void)), native_vectors(void), sync_image(void);
+extern void enable_mmu(u64 *table, void (*vectors)(void), u64 high), native_vectors(void),
+    sync_image(void);
 extern long enter_el0(u64 a, u64 b, u64 c, u64 d);
 static unsigned bank;
 static u8 *physical(void) {
@@ -50,54 +53,77 @@ static u8 *physical(void) {
                     : (u8 *)(0x48000000UL + (bank - 8) * (2 * BLOCK));
 }
 #define ARENA 0x68000000UL
-#define HEAP_FRAMES 80
-static u8 heap_used[HEAP_FRAMES];
-/* Keep physical frames out of the identity-map addresses used by EL0 arenas. */
+#define BUILD_FRAME_COUNT ((BUILD_RAM + GIB - BUILD_FRAMES) / BLOCK)
+#define HEAP_FRAMES (build_volume ? BUILD_FRAME_COUNT : 144)
+static u8 heap_used[BUILD_FRAME_COUNT];
+static unsigned frame_hint;
 static u64 frame_address(unsigned frame) {
+    if (build_volume)
+        return BUILD_FRAMES + frame * BLOCK;
+    if (frame >= 80) return 0x98000000UL + (frame - 80) * BLOCK;
     return frame < 16 ? 0x66000000UL + frame * BLOCK
                       : 0x70000000UL + (frame - 16) * BLOCK;
 }
-enum { GRAPHICS_ARENA, LIBC_ARENA, ARENAS };
-static const u64 arena_base[ARENAS] = {ARENA, 0x78000000UL};
+enum { GRAPHICS_ARENA, LIBC_ARENA, EXTENDED_ARENA, PROGRAM_ARENA, WIDE_ARENA, ARENAS };
+static const u64 arena_base[ARENAS] = {ARENA, 0x78000000UL, 0xc0000000UL, 0xa0000000UL, 64 * GIB};
+static const unsigned build_blocks[ARENAS] = {64, 320, 512, 256, 2048};
+static u64 wide_tables[4][512] __attribute__((aligned(4096)));
 static struct frame_map {
-    u8 frames[64];
+    u16 frames[2048];
     unsigned count, sealed;
 } heaps[BANKS][ARENAS];
+static unsigned mapped[ARENAS];
+static void map_frame(unsigned kind, unsigned i, u64 value) {
+    u64 addr = arena_base[kind] + i * BLOCK;
+    u64 *entries = addr >= 64 * GIB  ? wide_tables[(addr - 64 * GIB) / GIB]
+                   : addr >= 3 * GIB ? extended
+                   : addr >= 2 * GIB ? ram_high
+                                     : ram;
+    entries[(addr % GIB) / BLOCK] = value;
+}
 static void map_heap(unsigned id) {
     for (unsigned kind = 0; kind < ARENAS; kind++) {
-        struct frame_map *heap = &heaps[id][kind];
-        unsigned first = (arena_base[kind] - 0x40000000UL) / BLOCK;
-        for (unsigned i = 0; i < 64; i++) {
-            ram[first + i] = i < heap->count ? frame_address(heap->frames[i]) | NORMAL |
-                                                   EL0 | PXN | (i < heap->sealed ? RO : UXN)
-                                             : 0;
-        }
+        struct frame_map *h = &heaps[id][kind];
+        for (unsigned i = 0; i < h->count; i++)
+            map_frame(kind, i,
+                      frame_address(h->frames[i]) | NORMAL | EL0 | PXN |
+                          (i < h->sealed ? RO : UXN));
+        for (unsigned i = h->count; i < mapped[kind]; i++)
+            map_frame(kind, i, 0);
+        mapped[kind] = h->count;
     }
 }
 static long grow_heap(unsigned kind, u64 size) {
-    if (size > 64 * BLOCK)
+    unsigned limit = build_volume ? build_blocks[kind] : kind <= EXTENDED_ARENA ? 64 : 0;
+    if (size > limit * BLOCK)
         return -1;
     struct frame_map *heap = &heaps[bank][kind];
     unsigned count = (size + BLOCK - 1) / BLOCK;
     if (count <= heap->count)
         return arena_base[kind];
-    unsigned free_count = 0;
-    for (unsigned i = 0; i < HEAP_FRAMES; i++)
-        free_count += !heap_used[i];
-    if (count > heap->count + free_count)
-        return -1;
-    for (unsigned i = 0; heap->count < count; i++)
+    unsigned before = heap->count;
+    for (unsigned steps = 0; heap->count < count && steps < HEAP_FRAMES; steps++) {
+        if (frame_hint >= HEAP_FRAMES)
+            frame_hint = 0;
+        unsigned i = frame_hint++;
         if (!heap_used[i]) {
-            memset((void *)frame_address(i), 0, BLOCK);
             heap_used[i] = 1;
             heap->frames[heap->count++] = i;
+            memset((void *)frame_address(i), 0, BLOCK);
         }
+    }
+    if (heap->count < count) {
+        while (heap->count > before)
+            heap_used[heap->frames[--heap->count]] = 0;
+        return -1;
+    }
     map_heap(bank);
     sync_image();
     return arena_base[kind];
 }
 void select_bank(unsigned id) {
     bank = id;
+    disk_select_task(id);
     display_select(process_pane());
     map_heap(id);
     u64 pa = (u64)physical();
@@ -113,10 +139,14 @@ struct redirected_file {
     char path[513];
 };
 static struct redirected_file redirected[2 * BANKS];
+#define HANDLE_COUNT (build_volume ? 32 : 16)
+#define FD_LIMIT (3 + HANDLE_COUNT)
 struct process {
     char cwd[513], path[513], args[32768];
     char executable[513], start_args[32768], git_meta[513];
     unsigned start_used, start_argc, pane, start_flags;
+    unsigned null_streams, env_result;
+    char environment[8192];
     int background, agent, agent_child;
     char scope[513];
     unsigned command_output;
@@ -148,7 +178,7 @@ struct process {
         struct pipe *pipe;
         int writer;
         char path[513];
-    } handles[16];
+    } handles[32];
 };
 static struct process processes[BANKS];
 static int under(const char *path, const char *root) {
@@ -163,6 +193,8 @@ int agent_path_allowed(const char *path, int writing) {
         under(path,"/libexec") || under(path,"/proc") || equal(path,"/"));
 }
 static void inherit_scope(struct process *child, struct process *parent) {
+    child->env_result = parent->env_result;
+    if (child->env_result) memcpy(child->environment,parent->environment,child->env_result-1);
     if (parent->scope[0]) {
         memcpy(child->scope,parent->scope,length(parent->scope,513)+1);
         child->command_deadline=parent->command_deadline;
@@ -344,9 +376,9 @@ static long process_request(struct process *p, unsigned op, unsigned index) {
 
 /* Snapshot-backed descriptors keep their original contents across a commit. */
 #define CHUNK 65536u
-#define CHUNKS (NATIVE_FILE_POOL / CHUNK)
-#define FILE_POOL_BASE 0x5a000000UL
-static u8 chunks_used[CHUNKS];
+#define CHUNKS (build_volume ? GIB / CHUNK : NATIVE_FILE_POOL / CHUNK)
+#define FILE_POOL_BASE (build_volume ? BUILD_BUFFERS : 0x5a000000UL)
+static u8 chunks_used[GIB / CHUNK];
 u8 *file_buffer(u32 size) {
     unsigned need = (size + CHUNK - 1) / CHUNK, run = 0;
     if (!need)
@@ -398,16 +430,18 @@ u64 heap_bytes(void) {
             used += CHUNK;
     return used;
 }
+u64 native_ram_bytes(void) { return build_volume ? BUILD_RAM : NATIVE_RAM_BYTES; }
+u64 heap_capacity_bytes(void) { return HEAP_FRAMES * BLOCK + (u64)CHUNKS * CHUNK; }
 static void metrics(u64 *s) {
     s[0] = clock_ticks() / clock_hz();
     s[1] = heap_bytes();
-    s[2] = HEAP_FRAMES * BLOCK + (u64)CHUNKS * CHUNK - s[1];
+    s[2] = heap_capacity_bytes() - s[1];
     file_stats(s + 3);
     s[6] = 128;
-    s[7] = NATIVE_RAM_BYTES;
+    s[7] = native_ram_bytes();
 }
 static long system_info(char *out, unsigned op) {
-    u64 used = disk_usage(), cap = SNAPSHOT_SLOT_BYTES - 512;
+    u64 used = disk_usage(), cap = disk_capacity();
     if (op == 6)
         return task_list(out);
     if (op == 8) {
@@ -539,6 +573,12 @@ static int readable(u64 address, u64 size) {
 static long save_output(const char *path, u64 descriptor) {
     if (proc_path(path))
         return -1;
+    if (descriptor == ~0UL) {
+        const u64 *range = (const u64 *)(UTILITY + 520);
+        if (range[1] > NATIVE_FILE_LIMIT || !readable(range[0], range[1]))
+            return -1;
+        return store_file(path, (const u8 *)range[0], range[1]) ? 0 : -1;
+    }
     unsigned size = descriptor;
     if (!(descriptor >> 32))
         return size <= 32768 && store_file(path, (const u8 *)MAIL, size) ? 0 : -1;
@@ -608,6 +648,7 @@ static long stream_read(struct process *p, u8 *dst, unsigned n) {
         return 0;
     if (p->closed & 1)
         return -1;
+    if (p->null_streams & 1) return 0;
     if (p->in)
         return pipe_read(p->in, dst, n);
     if (p->input) {
@@ -635,6 +676,7 @@ static long stream_write(struct process *p, unsigned fd, const u8 *src, unsigned
     }
     if (p->closed & (1u << fd))
         return -1;
+    if (p->null_streams & (1u << fd)) return n;
     if (fd == 2 && p->err) return pipe_write(p->err, src, n);
     if (fd == 1 && p->out)
         return pipe_write(p->out, src, n);
@@ -776,6 +818,9 @@ long native_syscall(u64 value, u64 op) {
     case 45:
         return file_operation(bank, p->cwd, value, mail);
     case 42:
+        if (value == 6)
+            return FD_LIMIT;
+        if (value == 5) return reply(mail, p->executable);
         if (!value)
             return reply(mail, p->cwd);
         if (length(mail, 513) > 512 || !resolve(p->cwd, mail, path))
@@ -787,6 +832,21 @@ long native_syscall(u64 value, u64 op) {
             return 0;
         }
         if (value >= 2 && value <= 4) {
+            if (value == 2) {
+                /* create_dir_all retries the parent specifically on ENOENT. */
+                char parent[513];
+                memcpy(parent, path, strlen(path) + 1);
+                unsigned end = strlen(parent);
+                while (end > 1 && parent[end - 1] != '/')
+                    end--;
+                parent[end > 1 ? end - 1 : 1] = 0;
+                if (!vfs_lookup(parent, &f))
+                    return -2;
+                if (f.size != 0xffffffff)
+                    return -20;
+                if (vfs_lookup(path, &f))
+                    return -17;
+            }
             if (!batch_begin(bank))
                 return -5;
             memcpy(mail, path, length(path, 513) + 1);
@@ -800,9 +860,10 @@ long native_syscall(u64 value, u64 op) {
         if (length(mail, 254) >= 254 || value > 65535 || !value)
             return -1;
         unsigned i = 0;
-        while (i < 16 && (p->handles[i].file.data || p->handles[i].pipe || p->handles[i].path[0] || p->handles[i].socket))
+        while (i < HANDLE_COUNT && (p->handles[i].file.data || p->handles[i].pipe ||
+                                    p->handles[i].path[0] || p->handles[i].socket))
             i++;
-        if (i == 16)
+        if (i == HANDLE_COUNT)
             return -1;
         int id = socket_connect(mail, value);
         if (id < 0)
@@ -812,11 +873,11 @@ long native_syscall(u64 value, u64 op) {
     }
     case 26:
     case 27:
-        if (fd < 3 || fd >= 19 || n > 4096 || !p->handles[fd - 3].socket)
+        if (fd < 3 || fd >= FD_LIMIT || n > 4096 || !p->handles[fd - 3].socket)
             return -1;
         return socket_io(p->handles[fd - 3].socket - 1, op == 27, (u8 *)mail, n);
     case 28:
-        if (fd < 3 || fd >= 19 || !p->handles[fd - 3].socket)
+        if (fd < 3 || fd >= FD_LIMIT || !p->handles[fd - 3].socket)
             return -1;
         close_handle(p, fd - 3);
         return 0;
@@ -844,9 +905,10 @@ long native_syscall(u64 value, u64 op) {
         if (length(mail, 513) > 512 || !resolve(p->cwd, mail, path) || proc_path(path))
             return -1;
         unsigned i = 0;
-        while (i < 16 && (p->handles[i].file.data || p->handles[i].pipe || p->handles[i].path[0] || p->handles[i].socket))
+        while (i < HANDLE_COUNT && (p->handles[i].file.data || p->handles[i].pipe ||
+                                    p->handles[i].path[0] || p->handles[i].socket))
             i++;
-        if (i == 16 || (vfs_lookup(path, &f) && f.size == 0xffffffff))
+        if (i == HANDLE_COUNT || (vfs_lookup(path, &f) && f.size == 0xffffffff))
             return -1;
         if ((!value || !vfs_lookup(path, &f)) && !store_file(path, 0, 0))
             return -1;
@@ -857,12 +919,13 @@ long native_syscall(u64 value, u64 op) {
     }
     case 41: {
         unsigned index = value >> 48, mask = (value >> 32) & 65535;
-        if (!mask || mask > 3 || index >= 19 || (index < 3 && (p->closed & (1u << index))))
+        if (!mask || mask > 3 || index >= FD_LIMIT || (index < 3 && (p->closed & (1u << index))))
             return -1;
         u64 start = clock_ticks(), duration = clock_hz() * (u32)value / 1000;
         for (;;) {
             unsigned ready = 0;
-            if (index == 0)
+            if (index < 3 && (p->null_streams & (1u << index))) ready = index ? 2 : 1;
+            else if (index == 0)
                 ready =
                     p->in ? pipe_ready(p->in, 0) : !!(p->input || p->background || console_ready());
             else if (index < 3)
@@ -883,13 +946,13 @@ long native_syscall(u64 value, u64 op) {
         }
     }
     case 39:
-        if (fd >= 3 && fd < 19 && n <= 4096 && p->handles[fd-3].pipe)
+        if (fd >= 3 && fd < FD_LIMIT && n <= 4096 && p->handles[fd - 3].pipe)
             return p->handles[fd-3].writer ? pipe_write(p->handles[fd-3].pipe,(u8 *)mail,n) : -1;
         if (n > 4096)
             return -1;
         if (fd == 1 || fd == 2)
             return stream_write(p, fd, (const u8 *)mail, n, 0);
-        if (fd < 3 || fd >= 19)
+        if (fd < 3 || fd >= FD_LIMIT)
             return -1;
         if (p->handles[fd - 3].socket) {
             long sent;
@@ -903,6 +966,13 @@ long native_syscall(u64 value, u64 op) {
         unsigned off = p->handles[fd].append ? f.size : p->handles[fd].pos;
         if (off > NATIVE_FILE_LIMIT - n)
             return -1;
+        int fast = scratch_write(p->handles[fd].path, off, mail, n);
+        if (fast >= 0) {
+            if (!fast)
+                return -1;
+            p->handles[fd].pos = off + n;
+            return n;
+        }
         unsigned size = f.size > off + n ? f.size : off + n;
         u8 *tmp = file_buffer(size);
         if (!tmp) return -1;
@@ -938,7 +1008,7 @@ long native_syscall(u64 value, u64 op) {
         }
         if (f.size == 0xffffffff)
             return -1;
-        for (unsigned i = 0; i < 16; i++)
+        for (unsigned i = 0; i < HANDLE_COUNT; i++)
             if (!p->handles[i].file.data && !p->handles[i].pipe && !p->handles[i].socket && !p->handles[i].path[0]) {
                 u8 *bytes = file_buffer(f.size);
                 if (!bytes)
@@ -950,19 +1020,19 @@ long native_syscall(u64 value, u64 op) {
             }
         return -1;
     case 9:
-        if (fd >= 3 && fd < 19 && n <= 4096 && p->handles[fd-3].pipe)
+        if (fd >= 3 && fd < FD_LIMIT && n <= 4096 && p->handles[fd - 3].pipe)
             return !p->handles[fd-3].writer ? pipe_read(p->handles[fd-3].pipe,(u8 *)mail,n) : -1;
         if (fd == 0 && n <= 4096) {
             long count = stream_read(p, (u8 *)mail, n);
             return count == 1 && !p->input && !p->in && mail[0] == 4 ? 0 : count;
         }
-        if (fd >= 3 && fd < 19 && n <= 4096 && p->handles[fd - 3].socket) {
+        if (fd >= 3 && fd < FD_LIMIT && n <= 4096 && p->handles[fd - 3].socket) {
             long got;
             while ((got = socket_io(p->handles[fd - 3].socket - 1, 0, (u8 *)mail, n)) == -2)
                 schedule();
             return got;
         }
-        if (n <= 4096 && fd >= 3 && fd < 19 && p->handles[fd-3].path[0]) {
+        if (n <= 4096 && fd >= 3 && fd < FD_LIMIT && p->handles[fd - 3].path[0]) {
             if (!vfs_lookup(p->handles[fd-3].path, &f) || f.size == 0xffffffff) return -1;
             unsigned pos = p->handles[fd-3].pos;
             if (pos >= f.size) return 0;
@@ -971,7 +1041,7 @@ long native_syscall(u64 value, u64 op) {
             p->handles[fd-3].pos += n;
             return n;
         }
-        if (n > 4096 || fd < 3 || fd >= 19 || !p->handles[fd - 3].file.data)
+        if (n > 4096 || fd < 3 || fd >= FD_LIMIT || !p->handles[fd - 3].file.data)
             return -1;
         fd -= 3;
         f = p->handles[fd].file;
@@ -988,9 +1058,9 @@ long native_syscall(u64 value, u64 op) {
             close_stream(p, value);
             return 0;
         }
-        if (value < 3 || value >= 19 ||
-            (!p->handles[value - 3].file.data && !p->handles[value - 3].pipe && !p->handles[value - 3].socket &&
-             !p->handles[value - 3].path[0]))
+        if (value < 3 || value >= FD_LIMIT ||
+            (!p->handles[value - 3].file.data && !p->handles[value - 3].pipe &&
+             !p->handles[value - 3].socket && !p->handles[value - 3].path[0]))
             return -1;
         close_handle(p, value - 3);
         return 0;
@@ -1047,7 +1117,7 @@ long native_syscall(u64 value, u64 op) {
         return save_output(path, value);
     case 49: {
         int r = -1, w = -1;
-        for (int i=0; i<16; ++i) {
+        for (int i = 0; i < HANDLE_COUNT; ++i) {
             if (p->handles[i].file.data || p->handles[i].path[0] || p->handles[i].socket || p->handles[i].pipe) continue;
             if (r < 0) r=i; else { w=i; break; }
         }
@@ -1068,6 +1138,14 @@ long native_syscall(u64 value, u64 op) {
         memset(child, 0, sizeof(*child));
         child->agent_child = p->agent;
         inherit_scope(child,p);
+        if (value & (1UL << 24)) {
+            unsigned len = (u8)data[0] | ((unsigned)(u8)data[1] << 8);
+            if (len > sizeof(child->environment) || len+2 >= size || (len && data[1+len])) return -1;
+            memcpy(child->environment, data+2, len);
+            child->env_result = len+1;
+            data += 2+len;
+            size -= 2+len;
+        }
         if (!resolve(p->cwd, data, child->cwd) || !vfs_lookup(child->cwd,&f) || f.size != 0xffffffff) return -1;
         unsigned offset = length(data,size)+1;
         if (offset >= size || !resolve(child->cwd, data+offset, child->executable) ||
@@ -1082,12 +1160,21 @@ long native_syscall(u64 value, u64 op) {
         }
         struct pipe *streams[3] = {p->in,p->out,p->err};
         child->closed = p->closed;
+        child->null_streams = p->null_streams;
         for (unsigned i=0;i<3;i++) {
             unsigned raw = (value >> (i*8)) & 255;
             if (raw == i) continue;
-            if (raw == 1 && i == 2) {streams[2]=streams[1]; continue;}
-            if (raw < 3 || raw >= 19 || !p->handles[raw-3].pipe ||
-                p->handles[raw-3].writer != !!i) return -1;
+            child->null_streams &= ~(1u << i);
+            if (raw == 255) {
+                child->null_streams |= 1u << i;
+                child->closed &= ~(1u << i);
+                streams[i] = 0;
+                continue;
+            }
+            if (raw == 1 && i == 2) {streams[2]=streams[1]; child->null_streams |= (child->null_streams & 2) << 1; continue;}
+            if (raw < 3 || raw >= FD_LIMIT || !p->handles[raw - 3].pipe ||
+                p->handles[raw - 3].writer != !!i)
+                return -1;
             streams[i] = p->handles[raw-3].pipe;
             child->closed &= ~(1u << i);
         }
@@ -1103,7 +1190,8 @@ long native_syscall(u64 value, u64 op) {
         return length(mail, 254) < 254 ? socket_resolve(mail) : -1;
     case 47: {
         fd &= 0x7fffffff;
-        if (fd < 3 || fd >= 19) return -1;
+        if (fd < 3 || fd >= FD_LIMIT)
+            return -1;
         if (!p->handles[fd-3].path[0] && ((value >> 63) || !p->handles[fd-3].file.data)) return -1;
         if (!(value >> 63)) { p->handles[fd-3].pos = n; return 0; }
         const char *name = p->handles[fd-3].path;
@@ -1126,7 +1214,16 @@ long native_syscall(u64 value, u64 op) {
         sync_image();
         return 0;
     }
+    case 54: return task_pid();
+    case 53:
+        if (p->env_result) memcpy((void *)MAIL,p->environment,p->env_result-1);
+        return p->env_result;
+    case 52: return grow_heap(EXTENDED_ARENA, value);
     case 37:
+        if (value == ~0UL)
+            return build_volume ? 320 * BLOCK : 64 * BLOCK;
+        if (value >> 40 == 1)
+            return grow_heap(WIDE_ARENA, value - (1UL << 40));
         return grow_heap(LIBC_ARENA, value);
     case 23:
         if (length(mail, 513) > 512 || !resolve(p->cwd, mail, path))
@@ -1134,7 +1231,7 @@ long native_syscall(u64 value, u64 op) {
         reply(mail, path);
         return 0;
     case 24:
-        if (value == 2) return !p->agent && !(p->closed & 1) && !p->in && !p->input;
+        if (value == 2) return !p->agent && !(p->null_streams & 1) && !(p->closed & 1) && !p->in && !p->input;
         return !p->out && !p->capture;
     default:
         return -1;
@@ -1159,6 +1256,27 @@ static int load_elf(struct file f, u64 code_end, u64 data_end) {
         if (!code && le32(ph + 4) != 6)
             return 0;
         u64 lo = code ? USER : USER + BLOCK, hi = code ? code_end : data_end;
+        if (build_volume && base >= arena_base[PROGRAM_ARENA] && base < 3 * GIB) {
+            u64 where = base - arena_base[PROGRAM_ARENA];
+            if (size > mem || start > f.size || size > f.size - start || where > 256 * BLOCK ||
+                mem > 256 * BLOCK - where || (where % BLOCK) || !mem ||
+                (code ? where != 0 || heaps[bank][PROGRAM_ARENA].count || !size
+                      : !heaps[bank][PROGRAM_ARENA].sealed ||
+                            where != heaps[bank][PROGRAM_ARENA].sealed * BLOCK) ||
+                grow_heap(PROGRAM_ARENA, where + mem) < 0)
+                return 0;
+            struct frame_map *h = &heaps[bank][PROGRAM_ARENA];
+            for (u64 pos = 0; pos < size;) {
+                u64 n = size - pos < BLOCK ? size - pos : BLOCK;
+                memcpy((void *)frame_address(h->frames[(where + pos) / BLOCK]),
+                       f.data + start + pos, n);
+                pos += n;
+            }
+            if (code)
+                h->sealed = h->count;
+            map_heap(bank);
+            continue;
+        }
         if (base < lo || base > hi || mem > hi - base || size > mem || start > f.size ||
             size > f.size - start)
             return 0;
@@ -1263,6 +1381,10 @@ static long launch(const char *name, const char *args, unsigned n, unsigned argc
     if (active->scope[0] && magic(f,"LXcmd1\n",7) &&
         !(magic(f,"LXcmd1\ngit",10) && f.size==10)) return 1;
     if (magic(f, "LXcmd1\nshutdown", 15) && f.size == 15 && argc == 1) {
+        if (!disk_checkpoint()) {
+            serial_text("Build disk checkpoint failed\n");
+            return 1;
+        }
         serial_text("Shutting down LixinOS...\n");
         power_off();
         return -1;
@@ -1550,7 +1672,7 @@ long run_task(unsigned slot) {
     if (!redirect_close(p->capture, 1))
         status = 1;
     redirect_close(p->input, 0);
-    for (unsigned i = 0; i < 16; i++)
+    for (unsigned i = 0; i < HANDLE_COUNT; i++)
         close_handle(p, i);
     for (unsigned kind = 0; kind < ARENAS; kind++) {
         struct frame_map *heap = &heaps[slot][kind];
@@ -1575,11 +1697,20 @@ int run_login(void) {
     root[0] = 1 | (1 << 10) | 4 | PXN | UXN;
     root[1] = (u64)ram | 3;
     root[2] = (u64)ram_high | 3;
+    root[3] = (u64)extended | 3;
     for (unsigned i = 0; i < 512; i++)
         ram[i] = (0x40000000UL + i * BLOCK) | NORMAL | UXN;
     for (unsigned i = 0; i < (NATIVE_RAM_BYTES - (1024UL << 20)) / BLOCK; i++)
         ram_high[i] = (0x80000000UL + i * BLOCK) | NORMAL | UXN;
-    enable_mmu(root, native_vectors);
+    if (build_volume) {
+        for (unsigned i = 4; i < (BUILD_RAM + GIB) / GIB; i++)
+            root[i] = i * GIB | NORMAL | PXN | UXN;
+        for (unsigned i = 0; i < 4; i++)
+            root[64 + i] = (u64)wide_tables[i] | 3;
+    }
+    enable_mmu(root, native_vectors, build_volume);
+    extern int normal_ram;
+    normal_ram = 1;
     select_bank(0);
     tasks_init();
     proc_init();

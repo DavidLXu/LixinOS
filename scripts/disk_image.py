@@ -9,8 +9,10 @@ import subprocess
 import tempfile
 
 SECTOR = 512
+BUILD_HEADER = b"LIXBLD01".ljust(SECTOR, b"\0")
+BUILD_SLOT = 4 << 30
 SLOT = 192 << 20
-FILE_LIMIT = 100 << 20
+FILE_LIMIT = 512 << 20  # maximum on a build disk
 PREVIOUS_SLOT = 64 << 20
 HISTORY_BYTES = 65 * 1024
 HEADER = b"LIXDISK4".ljust(SECTOR, b"\0")
@@ -29,12 +31,19 @@ def checksum(data):
     return value
 
 
+def build_slot(size):
+    for slot in (3 << 30, BUILD_SLOT):
+        if size == SECTOR + 2 * slot + HISTORY_BYTES:
+            return slot
+    raise ValueError("unsupported build volume size")
+
+
 def snapshot_slots(source):
     source.seek(0)
     header = source.read(SECTOR)
     size = os.fstat(source.fileno()).st_size
-    if header in (HEADER, PREVIOUS_HEADER):
-        slot = SLOT if header == HEADER else PREVIOUS_SLOT
+    if header in (HEADER, PREVIOUS_HEADER, BUILD_HEADER):
+        slot = build_slot(size) if header == BUILD_HEADER else {HEADER: SLOT, PREVIOUS_HEADER: PREVIOUS_SLOT}[header]
         if size < SECTOR + 2 * slot + HISTORY_BYTES:
             raise ValueError("truncated LixinOS disk")
         return [(offset, slot - SECTOR) for offset in (SECTOR, SECTOR + slot)]
@@ -108,6 +117,11 @@ def prepare(path, previous_layout=False):
     try:
         if source:
             header = source.read(SECTOR)
+            if header == BUILD_HEADER:
+                build_slot(os.fstat(source.fileno()).st_size)
+                if previous_layout:
+                    raise ValueError("invalid or incompatible dedicated build volume")
+                return
             if previous_layout and header == HEADER:
                 raise ValueError("this kernel needs a LIXDISK4-compatible loader")
             if header == (PREVIOUS_HEADER if previous_layout else HEADER):

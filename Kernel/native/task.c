@@ -147,7 +147,9 @@ long task_wait_mode(u64 pid, int nohang) {
 long task_wait(u64 pid) { return task_wait_mode(pid, 0); }
 void task_start(void) {
     struct task *t = &tasks[current];
-    t->status = run_task(current);
+    long status = run_task(current);
+    /* A child that could not execute still has an exit status for waitpid. */
+    t->status = status < 0 ? 126 : status;
     for (unsigned i = 0; i < NATIVE_TASKS; i++) {
         if (tasks[i].state == WAITING && tasks[i].waiting == t->pid)
             tasks[i].state = READY;

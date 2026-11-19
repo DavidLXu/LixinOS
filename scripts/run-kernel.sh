@@ -28,8 +28,19 @@ while (( $# )); do
 done
 mode=${mode:---window}
 root=$(cd "$(dirname "$0")/.." && pwd)
-tcc_loader="$root/data/tcc-os/loader.elf"
-tcc_disk=${LIXINOS_TCC_DISK:-$root/data/tcc-os/system.img}
+rust_default=$root/data/lixinos.img
+tcc_default=$root/data/tcc-os/system.img
+if [[ -f $root/data/shared.img ]]; then
+    rust_default=$root/data/shared.img
+    tcc_default=$rust_default
+fi
+tcc_disk=${LIXINOS_TCC_DISK:-${LIXINOS_DISK:-$tcc_default}}
+
+tcc_loader=$root/data/tcc-os/loader.elf
+if [[ $tcc_disk == "$root/data/shared.img" || -r ${tcc_disk%.*}.loader.elf ]]; then
+    tcc_loader=${tcc_disk%.*}.loader.elf
+fi
+tcc_loader=${LIXINOS_TCC_LOADER:-$tcc_loader}
 
 cd "$root/Kernel"
 tcc_ready=false
@@ -133,9 +144,9 @@ else
     # Bash 3.2 with nounset requires this form for an empty array.
     "$rustup_bin" run stable cargo build --locked --target-dir target --profile "$profile" ${features[@]+"${features[@]}"}
 fi
-disk=${LIXINOS_DISK:-../data/lixinos.img}
+disk=${LIXINOS_DISK:-$rust_default}
 # Keep existing standalone kernels on the layout they were built to read.
-ram=512M
+ram=640M
 if [[ -z ${LIXINOS_KERNEL:-} ]]; then
     python3 ../scripts/disk_image.py "$disk"
 elif LC_ALL=C grep -aq LIXDISK4 "$kernel_image"; then
@@ -143,6 +154,17 @@ elif LC_ALL=C grep -aq LIXDISK4 "$kernel_image"; then
     ram=1536M
 else
     python3 ../scripts/disk_image.py --previous-layout "$disk"
+fi
+if [[ $(head -c8 "$disk") == LIXBLD01 ]]; then
+    if [[ -n ${LIXINOS_KERNEL:-} ]]; then
+        if ! LC_ALL=C grep -aq LIXBLD01 "$kernel_image"; then
+            echo "This TCC image needs a loader with build-volume support." >&2
+            exit 1
+        fi
+        ram=24G
+    else
+        ram=12G
+    fi
 fi
 clock_offset=$(TZ="${LIXINOS_TIMEZONE:-Asia/Shanghai}" date +%z)
 launcher=("$(command -v qemu-system-aarch64)")

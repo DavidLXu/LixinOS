@@ -86,7 +86,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("repository", type=PurePosixPath, help="absolute path in LixinOS")
     parser.add_argument("destination", type=Path, help="new directory on the Mac")
-    parser.add_argument("--disk", type=Path, default=os.environ.get("LIXINOS_DISK", ROOT / "data/lixinos.img"))
+    disk = ROOT / "data/shared.img"
+    if not disk.is_file():
+        disk = ROOT / "data/lixinos.img"
+    parser.add_argument("--disk", type=Path, default=os.environ.get("LIXINOS_DISK", disk))
     args = parser.parse_args()
     try:
         generation = export(args.disk, args.repository, args.destination)

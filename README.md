@@ -1,10 +1,10 @@
 # LixinOS
 
-**0.1.0** · [中文系统手册](docs/README.md) · [版本说明](docs/0.1.0.md)
+**0.3.0** · [中文系统手册](docs/README.md) · [版本说明](docs/0.3.0.md)
 
 ## Choose a kernel at startup
 
-Run `./scripts/run-kernel.sh` to open the macOS kernel picker before QEMU starts. Choose the original Rust kernel (default) or the guest-built TCC kernel. Each uses its own persistent disk. Interactive `--serial` and `--ssh` sessions show a numbered menu. For unattended startup, pass `--kernel rust` or `--kernel tcc` with the desired display mode, for example `./scripts/run-kernel.sh --kernel tcc --split`.
+Run `./scripts/run-kernel.sh` to open the macOS kernel picker before QEMU starts. Choose the original Rust kernel (default) or the guest-built TCC kernel. When `data/shared.img` is installed, both kernels boot with that same persistent filesystem. Enter `q` and press Return before switching kernels. Interactive `--serial` and `--ssh` sessions show a numbered menu. For unattended startup, pass `--kernel rust` or `--kernel tcc` with the desired display mode, for example `./scripts/run-kernel.sh --kernel tcc --split`.
 
 ## CPython in the guest
 
@@ -12,7 +12,7 @@ Run `python3` for the CPython 3.14.5 REPL or `python3 script.py` to execute a gu
 
 ## Boot the guest-built C kernel
 
-LixinOS can rebuild a separate AArch64 kernel and its disk bootloader from C and assembly using its own TCC. With the prepared image, run `./scripts/run-tcc-kernel.sh --window`. The current native kernel uses 1536 MiB of QEMU RAM. The Agent service is still part of the Rust-kernel configuration. See the [native kernel build and verification guide](Kernel/native/README.md).
+LixinOS can rebuild a separate AArch64 kernel and its disk bootloader from C and assembly using its own TCC. With the prepared image, run `./scripts/run-tcc-kernel.sh --window`. The TCC kernel uses 24 GiB of QEMU RAM with the shared build-capable disk and 1536 MiB with its smaller legacy disk. The Agent service is still part of the Rust-kernel configuration. See the [native kernel build and verification guide](Kernel/native/README.md).
 
 ## Boot the Rust kernel in QEMU
 
@@ -28,7 +28,7 @@ If your shell cannot find `rustup`, use `"$HOME/.cargo/bin/rustup"` for the targ
 
 The default launcher opens a native QEMU Cocoa window at the guest display size. If macOS Accessibility access is unavailable to the launcher, enable **View → Zoom To Fit** in QEMU after launch to unlock window dragging. Drag the window edge to change the number of terminal rows and columns. LixinOS reflows visible text at the same Menlo cell size and sends the new terminal dimensions to connected SSH sessions. Split mode gives each pane half the available width. Nano in the main QEMU console updates its layout as you resize the window. The desktop, Paint and Kilo apply pending resizes when they return to the main console. Enlarge the window before opening the desktop if it has too little space. Press Control–Option–G to release captured input before resizing. Type `shutdown` at the shell prompt to power off. In MicroPython press Ctrl+D to return to the shell first.
 
-The status bar samples once per second at console and Python VM polling points. CPU is the fraction of elapsed guest time outside scheduler idle waits. RAM counts the kernel image, stack, framebuffer, allocated heap (including live process images and stacks) against the configured 512 MiB. HEAP shows allocated kernel heap memory in KiB below 1 MiB, then in MiB to one decimal place. STACK shows sampled kernel stack use and capacity for the executing pane in KiB. FILES counts files on the mounted disk, including empty files. DISK shows how much of the usable snapshot capacity the current data occupies, including filesystem metadata and saved Agent versions. The bar remains visible while scrolling, clearing the screen, or editing a file.
+The status bar samples once per second at console and Python VM polling points. CPU is the fraction of elapsed guest time outside scheduler idle waits. RAM counts the kernel image, stack, framebuffer, allocated heap (including live process images and stacks) against the available guest RAM. HEAP shows allocated kernel heap memory in KiB below 1 MiB, then in MiB to one decimal place. STACK shows sampled kernel stack use and capacity for the executing pane in KiB. FILES counts files on the mounted disk, including empty files. DISK shows how much of the usable snapshot capacity the current data occupies, including filesystem metadata and saved Agent versions. The bar remains visible while scrolling, clearing the screen, or editing a file.
 
 The clock at the right shows 24-hour local time. Narrow windows show hours
 and minutes. The launcher uses Asia/Shanghai by default. Set
@@ -281,7 +281,17 @@ access, remove its public key from the remote account.
 
 ### Shell and disk
 
-The launcher creates a sparse raw disk (384 MiB + 65 KiB + one 512-byte layout header) at `data/lixinos.img` on first use. Every successful file or directory change is committed to this disk before the next prompt. Launch again with the same image to resume. Stop the running VM before switching modes with the same disk. Set `LIXINOS_DISK` to an absolute path to select another image. Shell variables and the working directory reset on boot. For example:
+The shared daily disk is `data/shared.img`. Both kernels see the same programs, sources, build products and shell history. Use `df` in the guest to see free space. Build under `/scratch` and copy finished programs to `/artifacts`. A clean shutdown with `q` flushes pending scratch changes. Only one VM can write the disk at a time.
+
+To migrate an installation, shut down its VMs and run the following from the repository root with Python 3.11 or newer. Supply the boot disk from a paired release that supports the 4 GiB layout. The optional toolchain argument copies the stage1 binaries and their matching runtime from a completed build volume. The installer keeps both original images. It takes Rust's command history, merges files unique to either disk, prefers Rust's daily system files on conflicts, and installs the released TCC kernel with its matching loader and sources.
+
+```sh
+python3.13 scripts/prepare-shared-disk.py \
+  --boot data/kernel-releases/kernel-2026-11-20.1/data/tcc-os/system.img \
+  --toolchain data/tcc-bootstrap.img
+```
+
+Without a shared disk, Rust defaults to `data/lixinos.img` and TCC to `data/tcc-os/system.img`. Select a different disk with `LIXINOS_DISK`, or set `LIXINOS_TCC_DISK` for TCC only. Use absolute paths. Shell variables and the working directory reset on boot. For example:
 
 ```sh
 mkdir demo
@@ -368,7 +378,7 @@ and is released when the editor exits.
 
 Type `htop` at the guest prompt for a live dashboard. It refreshes once per second. Press `q` to return to the shell. In the QEMU window the last dashboard frame stays in the terminal history. Uptime comes from the ARM virtual counter. Heap usage comes from the allocator. File counts include empty files, directory counts include the root, and content bytes exclude filesystem metadata.
 
-The launcher assigns one vCPU and 512 MiB of RAM. The boot stack is 128 KiB. Up to 16 tasks, including the login shells, share the CPU. The kernel allocates a 128 KiB stack and private translation tables for each new task, and backs each EL0 image with 4 MiB of heap memory on launch. Code is executable and read-only, data is writable and non-executable. Additional user arenas grow in 2 MiB blocks. A synchronous caller waits for its child while other runnable tasks take turns. Exiting releases image memory, and the next continuation reclaims the stack and page tables. A joinable child's PID and exit status remain until collected. The filesystem tree and file contents occupy heap memory while mounted. The kernel alternates between two checksummed disk snapshots, flushing the payload before publishing its header. On boot it loads the newest valid snapshot. The current limits are 1,048,576 entries including the root and 100 MiB per file. A snapshot has 192 MiB minus its 512-byte header for all names, contents, timestamps and version history together. The two 192 MiB slots follow the layout header. A separate 65 KiB ring at the end keeps the latest 64 shell commands. On first launch with an older disk, the launcher copies valid snapshots and history to a temporary image and atomically replaces the old image after verification. Use `touch --files-from names.txt` to create a batch of files with one path per line and one snapshot commit.
+The launcher assigns one vCPU. With a shared build volume it assigns 12 GiB of RAM to Rust or 24 GiB to TCC. The smaller legacy disks use 640 MiB or 1536 MiB respectively. The boot stack is 128 KiB. Up to 16 tasks, including the login shells, share the CPU. The kernel allocates a 128 KiB stack and private translation tables for each new task, and backs each EL0 image with 4 MiB of heap memory on launch. Code is executable and read-only, data is writable and non-executable. Additional user arenas grow in 2 MiB blocks. A synchronous caller waits for its child while other runnable tasks take turns. Exiting releases image memory, and the next continuation reclaims the stack and page tables. A joinable child's PID and exit status remain until collected. The filesystem tree and file contents occupy heap memory while mounted. The kernel alternates between two checksummed disk snapshots, flushing the payload before publishing its header. On boot it loads the newest valid snapshot. The shared disk has two 4 GiB snapshot slots. One slot holds the active filesystem, including a 512-byte header, names, contents, timestamps and version history. Each file can occupy up to 512 MiB. Legacy disks have 192 MiB slots and a 100 MiB file limit. A separate 65 KiB ring at the end keeps the latest 64 shell commands. On first launch with an older disk, the launcher copies valid snapshots and history to a temporary image and atomically replaces the old image after verification. Use `touch --files-from names.txt` to create a batch of files with one path per line and one snapshot commit.
 
 ### Run a C program or MicroPython
 
@@ -412,6 +422,16 @@ The Agent's isolated test runner blocks filesystem and command calls.
 Cargo builds both C images before embedding them. The first build needs Git, Make, Python 3 and network access to fetch the pinned MicroPython source and, on Apple Silicon, Arm's checksummed bare-metal GNU toolchain. Sources, toolchain and build products are cached under `Kernel/target/user-build/`. An existing `aarch64-none-elf-gcc` with newlib on PATH can also be used. Run `python3 scripts/test-user.py` to exercise the serial interface on a temporary disk.
 
 ### Compile and run Rust inside LixinOS
+
+With the native Rust toolchain installed, either kernel can build a Cargo project from its guest shell:
+
+```sh
+cargo new --vcs none demo
+cd demo
+cargo run
+```
+
+The project prints `Hello, world!`. The upstream Rust 1.100.0 compiler uses Cranelift and the guest GNU linker. For single-file programs use `rustc hello.rs -o hello` and `./hello`. See the [Rust toolchain port](User/rust/README.md) for installation, supported dependencies and executable size limits. On the dedicated Rust-kernel build disk the seed toolchain also compiles `rustc` and Cargo from their locked sources. The resulting tools are available as `/stage1/rustc` and `/stage1/cargo`. The [guest bootstrap instructions](User/rust/README.md#native-compiler-and-cargo-build) describe the build and its seeded libraries.
 
 The user-space `/bin/lust` bundles the Lust Rust-subset frontend and the ARM64 TinyCC backend. Run these commands at the guest shell:
 
@@ -467,7 +487,7 @@ tcc hello.c -o hello
 ./hello
 ```
 
-Saved C and Rust programs use LXE1 and can fill a 1 MiB file including
+Programs saved by TinyCC and Lust use LXE1 and can fill a 1 MiB file including
 the 16-byte header. The ARM64 layout allows up to 512 KiB of code and 860 KiB
 of data, including zero-initialized storage, within that total. Rebuild
 programs saved in the experimental LXE2 format from their source.
@@ -777,8 +797,7 @@ git -C ~/Desktop/lixinos-project log --oneline
 ```
 
 The exporter copies the worktree and its standard `.git` directory, including
-the current index and untracked files. It reads the newest valid snapshot from
-`data/lixinos.img`; use `--disk /path/to/image` for a different disk.
+the current index and untracked files. It reads the newest valid snapshot from the shared daily disk (or `data/lixinos.img` before migration); use `--disk /path/to/image` for a different disk.
 Run `python3 scripts/test-git.py` for the disposable-disk interoperability test.
 The build fetches pinned libgit2 sources, including its COPYING file, into the
 user build cache.

@@ -545,7 +545,7 @@ fn draw_status(cpu: Option<u64>) {
         ("CPU", cpu, 0x8fbef4),
         (
             "RAM",
-            alloc::format!("{}.{}/512MiB", tenths_mib / 10, tenths_mib % 10),
+            alloc::format!("{}.{}/{}MiB", tenths_mib / 10, tenths_mib % 10, crate::inspect::ram_size().unwrap_or(crate::MAPPED_RAM).min(crate::MAPPED_RAM) >> 20),
             0x77d5d2,
         ),
         ("HEAP", memory_value(heap), 0xc6aef2),

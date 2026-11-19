@@ -163,4 +163,17 @@ int lx_save_parts(const char *path, unsigned long descriptor) {
     return request(path) ? -1 : console_call(22, descriptor);
 }
 
+/* Preserve the legacy descriptor on 32-bit-addressable buffers. The Rust
+ * build kernel also accepts a contiguous range in a high user heap. */
+int lx_save_buffer(const char *path, const void *data, unsigned length) {
+    unsigned parts[] = {length != 0, 0, (unsigned)(unsigned long)data, length};
+    if ((unsigned long)data < 0xa0000000UL && (unsigned long)parts < 0xa0000000UL)
+        return lx_save_parts(path, (unsigned long)parts << 32 | length);
+    if (request(path)) return -1;
+    volatile unsigned long *range = (volatile unsigned long *)(MAIL + 520);
+    range[0] = (unsigned long)data;
+    range[1] = length;
+    return console_call(22, ~0UL);
+}
+
 long lx_console_call(long op, long arg) { return console_call(op, arg); }

@@ -65,10 +65,10 @@ static int json_key(const u8 *s, unsigned n, unsigned *at, char *out) {
   return 0;
 }
 static int edit_revision(int slot, const char *old, const char *dest) {
-  unsigned n = staged.size - staged.end;
+  unsigned n = build_volume ? build_staged.versions.size : staged.size - staged.end;
   if (!n)
     return 1;
-  const u8 *s = staged.data + staged.end;
+  const u8 *s = build_volume ? build_staged.versions.data : staged.data + staged.end;
   unsigned cap = n + 1030, at = 0, used = 1, count = 0;
   u8 *out = file_buffer(cap);
   if (!out)

@@ -40,7 +40,7 @@ user_sync:
     b.eq resume_shell
     cmp x8, #32
     b.eq suspend_for_child
-    cmp x8, #51
+    cmp x8, #54
     b.hi unknown_call
     // The kernel uses the soft-float target (no SIMD registers). Preserve
     // the user integer context across the shared Rust console implementation.
@@ -85,7 +85,11 @@ unknown_call:
     mov x0, #-1
     eret
 user_fault:
-    mov x0, #-1
+    mov x0, x9
+    mrs x1, elr_el1
+    mrs x2, far_el1
+    mrs x3, sp_el0
+    bl report_user_fault
     b resume_shell
 .global agent_timeout_exit
 agent_timeout_exit:

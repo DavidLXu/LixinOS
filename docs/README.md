@@ -1,10 +1,10 @@
 # LixinOS 系统手册
 
-LixinOS 是一个提供 Rust 原版内核和 TCC 自举内核的 ARM64 操作系统，在 Apple Silicon Mac 的 QEMU 虚拟机里运行。你可以在系统里编辑 Python 和 C 源码、运行脚本、编译程序，再把程序保存在虚拟磁盘上。当前版本为 [0.1.0](0.1.0.md)。
+LixinOS 是一个提供 Rust 原版内核和 TCC 自举内核的 ARM64 操作系统，在 Apple Silicon Mac 的 QEMU 虚拟机里运行。你可以在系统里编辑 Python 和 C 源码、运行脚本、编译程序，再把程序保存在虚拟磁盘上。当前版本为 [0.3.0](0.3.0.md)。
 
 ## 从终端开始
 
-在 Mac 的项目根目录运行 `./scripts/run-kernel.sh`，在弹出的中文窗口中选择 **Rust 原版内核**（默认）或 **TCC 自举内核**，点击 **启动**。看到 `lixin:/$` 就可以输入命令。原版使用 `data/lixinos.img`，TCC 版使用 `data/tcc-os/system.img`，各自保存文件。首次构建会下载交叉编译工具和上游源码。想直接在当前 Mac 终端操作，可以用 `./scripts/run-kernel.sh --serial`，输入 `1` 或 `2` 后回车选内核。要跳过菜单，可用 `./scripts/run-kernel.sh --kernel rust` 或 `./scripts/run-kernel.sh --kernel tcc`，两者均可搭配 `--split` 等启动模式。安装步骤和其他启动模式见[项目 README](../README.md)。
+在 Mac 的项目根目录运行 `./scripts/run-kernel.sh`，在弹出的中文窗口中选择 **Rust 原版内核**（默认）或 **TCC 自举内核**，点击 **启动**。看到 `lixin:/$` 就可以输入命令。安装共享盘后，两种内核都使用 `data/shared.img`。切换前在 Bash 输入 `q` 并回车关机。首次构建会下载交叉编译工具和上游源码。想直接在当前 Mac 终端操作，可以用 `./scripts/run-kernel.sh --serial`，输入 `1` 或 `2` 后回车选内核。要跳过菜单，可用 `./scripts/run-kernel.sh --kernel rust` 或 `./scripts/run-kernel.sh --kernel tcc`，两者均可搭配 `--split` 等启动模式。安装步骤和其他启动模式见[项目 README](../README.md)。
 
 | 想做什么 | 在 LixinOS 里怎么做 |
 |---|---|
@@ -56,11 +56,11 @@ git -C ~/Desktop/lixinos-project status
 
 以 `python hello.py` 为例，shell 先按当前目录找到脚本，把文件内容交给用户态的 MicroPython。解释器在 ARM64 的 EL0 执行 Python 代码，调用内核的终端接口输出结果。脚本结束后，控制权回到 shell。内核本身运行在 EL1，负责页表、异常处理和设备访问。[用户态 shell](../User/bash/bash.c) · [用户程序加载器](../Kernel/src/user.rs) · [MicroPython 移植层](../User/python/port.c)
 
-启动器为 guest 配置一个虚拟 CPU 和 512 MiB RAM。内核使用用户态区域上方的 RAM 作为堆，每个终端窗格为前台用户程序保留 4 MiB 区域，代码页与可写数据页使用不同权限。用 `--split` 启动时，两个窗格共享磁盘，各自保存工作目录、变量和前台程序状态；Ctrl+Tab 暂停当前窗格并恢复另一个。读 `htop` 时应把堆用量看作整个 guest 内存的一部分。[内核入口](../Kernel/src/main.rs) · [分屏实现](../Kernel/src/panes.rs)
+启动器分配一个虚拟 CPU，使用共享盘时为 Rust 内核分配 12 GiB RAM，为 TCC 内核分配 24 GiB RAM。内核使用用户态区域上方的 RAM 作为堆，每个终端窗格为前台用户程序保留 4 MiB 区域，代码页与可写数据页使用不同权限。用 `--split` 启动时，两个窗格共享磁盘，各自保存工作目录、变量和前台程序状态；Ctrl+Tab 暂停当前窗格并恢复另一个。读 `htop` 时应把堆用量看作整个 guest 内存的一部分。[内核入口](../Kernel/src/main.rs) · [分屏实现](../Kernel/src/panes.rs)
 
 ## 重启后，哪些东西还在？
 
-默认磁盘是 Mac 项目目录下的 `data/lixinos.img`，镜像布局依次为 512 字节格式标识、两份 192 MiB 快照槽和 65 KiB 历史区。首次使用旧镜像时，启动器复制有效快照和历史记录，校验后原子替换原文件。内核在内存中维护目录树和文件内容。保存文件时，它先写另一份快照的数据并刷盘，再写入带校验信息的头部；启动时选择最新的有效快照。历史区用 65 个 1 KiB 槽循环保存最近 64 条命令。当前上限是 1,048,576 个条目（含根目录），单个文件 100 MiB；所有文件内容、路径和版本记录合计需放进一份 192 MiB 快照（含 512 字节头部）。Python 交互变量和正在编辑但尚未保存的文字只存在于当前会话。[磁盘格式与恢复逻辑](../Kernel/src/disk.rs)
+共享日常盘位于 `data/shared.img`。可以在 `/scratch` 下编译，再把产物复制到 `/artifacts`，换内核后仍可直接运行。正常关机会刷入 `/scratch` 的待保存数据。输入 `df` 查看剩余空间。镜像包含两个交替写入的 4 GiB 快照槽和 65 KiB 命令历史区，因此 Mac 上显示的逻辑大小约为 8 GiB。当前文件系统可使用一份快照的容量，扣除 512 字节头部后由文件内容和元数据共用，单个文件上限为 512 MiB。迁移保留原来的 `data/lixinos.img` 和 `data/tcc-os/system.img`，步骤见[项目 README](../README.md#shell-and-disk)。Python 交互变量和正在编辑但尚未保存的文字只存在于当前会话。[磁盘格式与恢复逻辑](../Kernel/src/disk.rs)
 
 ## 编译好的 C 程序是什么格式？
 

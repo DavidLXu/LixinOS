@@ -1,0 +1,22 @@
+--- a/bfd/opncls.c
++++ b/bfd/opncls.c
+@@ -790,7 +790,7 @@
+    file write commits a filesystem snapshot on LixinOS, so publish the
+    completed object with a single atomic file-service operation.  */
+ static struct bfd_iovec lixin_output_iovec;
+-extern int lx_save_parts (const char *, unsigned long);
++extern int lx_save_buffer (const char *, const void *, unsigned);
+ 
+ static bool
+ lixin_publish (bfd *abfd)
+@@ -802,9 +802,7 @@
+       bfd_set_error (bfd_error_system_call);
+       return false;
+     }
+-  uint32_t parts[] = { image->size != 0, 0, (uintptr_t) image->buffer, image->size };
+-  uint64_t descriptor = ((uint64_t) (uintptr_t) parts << 32) | image->size;
+-  if (lx_save_parts (bfd_get_filename (abfd), descriptor) < 0)
++  if (lx_save_buffer (bfd_get_filename (abfd), image->buffer, image->size) < 0)
+     {
+       errno = EIO;
+       bfd_set_error (bfd_error_system_call);

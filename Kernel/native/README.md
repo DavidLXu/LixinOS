@@ -1,10 +1,10 @@
 # 在 LixinOS 内用 TCC 重建内核
 
-此版本在 Apple Silicon Mac 上的 QEMU AArch64 `virt` 中运行，使用一个 vCPU 和 1536 MiB RAM。内核、板级驱动和磁盘引导程序均来自 C 或 AArch64 汇编源码。网络使用 lwIP 的 C 源码。两个编译清单随磁盘安装在 `/src/kernel`。
+此版本在 Apple Silicon Mac 上的 QEMU AArch64 `virt` 中运行，使用一个 vCPU，内存配置取决于磁盘布局。内核、板级驱动和磁盘引导程序均来自 C 或 AArch64 汇编源码。网络使用 lwIP 的 C 源码。两个编译清单随磁盘安装在 `/src/kernel`。
 
 ## 启动和更新
 
-在项目根目录执行以下命令。原版启动器和新启动器使用各自的磁盘。
+在项目根目录执行以下命令。安装共享日常盘后，TCC 和 Rust 都使用 `data/shared.img`。切换内核前请在 Bash 输入 `q` 并回车关机。
 
 ```sh
 ./scripts/run-tcc-kernel.sh --window
@@ -20,6 +20,18 @@ q
 ```
 
 宿主目录中的 `kernel.elf` 是制盘时导出的初始副本。QEMU 的启动参数加载固定的 `loader.elf`，后者从磁盘加载 `/boot/kernel.elf`。引导程序也可以在系统内用 `tcc --bootloader @/src/kernel/loader-sources -o /boot/loader.elf` 重建。更换 QEMU 使用的引导程序需要单独导出这个文件。
+
+### 最小裸机示例
+
+在 TCC 系统镜像副本中，从来宾 Bash 执行以下命令。新制镜像会安装示例源码。使用已有镜像时，先将 [hello-bare.c](examples/hello-bare.c) 放到来宾的 `/src/kernel/examples/`。`boot.S` 提供入口和栈，`hello-bare.c` 直接写 QEMU `virt` 的 PL011 串口寄存器。TCC 引导程序下次启动时会加载副本上的示例，串口会输出 `Hello from bare metal!`，随后关机。
+
+```sh
+tcc --kernel /src/kernel/boot.S /src/kernel/examples/hello-bare.c -o /boot/hello-bare.elf
+cp /boot/hello-bare.elf /boot/kernel.elf
+q
+```
+
+在 Mac 上用 `LIXINOS_TCC_DISK=/path/to/copy.img ./scripts/run-tcc-kernel.sh --serial` 重新启动同一份镜像副本。
 
 ## 从零制盘
 
@@ -64,4 +76,4 @@ python3 scripts/test-million-files.py
 
 在 `agent chat` 中，Bypass 默认开启，本地命令可以直接改动工作目录内的文件。输入 `/bypass` 可切换为逐次询问。暂存脚本的保存和交互终端接管都需要确认。终端接管支持 Bash、Python、Nano 和 Kilo，命令输出通过管道返回。
 
-TCC 内核目前使用针对单 vCPU、1536 MiB 的物理内存布局。启动器保留独立的 Rust 和 TCC 磁盘。
+旧版 TCC 系统盘使用 1536 MiB RAM。共享日常盘和独立自举盘都采用 `LIXBLD01` 布局，在 TCC 内核下使用 24 GiB RAM、每文件 512 MiB 上限和大程序地址空间。构建盘把 `/scratch` 的中间文件保存在内存中，正常关机或提交持久文件时才写入磁盘。制作构建盘、选择 TCC 内核以及验证 stage1 的命令见 [Rust 工具链说明](../../User/rust/README.md#native-compiler-and-cargo-build)。
