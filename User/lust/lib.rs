@@ -23,6 +23,8 @@ use core::{alloc::{GlobalAlloc, Layout}, ffi::{c_char, c_void, CStr}, panic::Pan
 unsafe extern "C" {
     fn memalign(align: usize, size: usize) -> *mut u8;
     fn free(p: *mut u8);
+    fn export_name() -> *const c_char;
+    fn save_generated_c(src: *const u8, len: usize) -> i32;
     fn lx_error(s: *const c_char);
     fn _exit(status: i32) -> !;
     fn tcc_compile_string(state: *mut c_void, unit: *const c_char) -> i32;
@@ -48,7 +50,15 @@ fn compile(path: &str, src: &str, state: *mut c_void) -> Result<(), String> {
     let ast = parser::parse(&tokens, &interner, &known).map_err(|d| errors(vec![d]))?;
     drop(tokens);
     let p = collect::collect(&ast, &interner, &known).map_err(errors)?;
-    let main = p.main.ok_or("lust: missing fn main()\n")?;
+    let name = unsafe { export_name() };
+    let export = if name.is_null() { None } else {
+        Some(unsafe { CStr::from_ptr(name) }.to_str().map_err(|_| "lust: invalid export name\n")?)
+    };
+    let entry = match export {
+        Some(name) => p.fns.iter().position(|f| f.owner.is_none() && p.name(f.name) == name)
+            .map(|i| collect::FnId(i as u32)).ok_or("lust: unknown export\n")?,
+        None => p.main.ok_or("lust: missing fn main()\n")?,
+    };
     let slots: Vec<_> = (0..p.fns.len() as u32).collect();
     let lines = diag::LineIndex::new(src);
     let mut fns = Vec::new();
@@ -63,6 +73,12 @@ fn compile(path: &str, src: &str, state: *mut c_void) -> Result<(), String> {
     }
     let mut glue = cgen::GlueSet::default();
     glue.add(&p, fns.iter().flat_map(|f| f.glue.iter()));
+    if state.is_null() {
+        let c = cgen::standalone(&p, &fns, &glue, entry.0, path, export)?;
+        return if unsafe { save_generated_c(c.as_ptr(), c.len()) } == 0 {
+            Ok(())
+        } else { Err("lust: could not save generated C source\n".into()) };
+    }
     let glue_unit = cgen::glue_unit(&p, &glue);
     let fn_unit = cgen::fn_unit(&p, &fns, 0..slots.len(), &glue, "lust_register_u0");
     // TinyCC shares this heap. Release the front-end arenas before handing
@@ -74,7 +90,7 @@ fn compile(path: &str, src: &str, state: *mut c_void) -> Result<(), String> {
         if unsafe { tcc_compile_string(state, unit.as_ptr().cast()) } < 0 { Err(String::from("lust: TinyCC compilation failed\n")) } else { Ok(()) }
     };
     emit(format!("#define LUST_IMPL 1\n{}", include_str!("runtime.c")))?;
-    emit(cgen::main_unit(main.0, path, &vec![1; slots.len()], &[]))?;
+    emit(cgen::main_unit(entry.0, path, &vec![1; slots.len()], &[]))?;
     emit(cgen::table_unit(slots.len(), &[0]))?;
     emit(glue_unit)?;
     emit(fn_unit)

@@ -433,7 +433,7 @@ pub unsafe extern "C" fn sh_main(initial: *const core::ffi::c_char, flags: u32) 
     let mut terminals = BTreeMap::from([(1u32, Terminal::new(cwd, history))]);
     let mut current = 1;
     if flags & 2 != 0 && crate::geometry() >> 32 != 0 && crate::geometry() & 65535 >= 60 {
-        print("\x1b[2J\x1b[H\x1b[36m  L I X I N O S   SYSTEM CONSOLE\x1b[0m\n");
+        print("\x1b[36m  L I X I N O S   SYSTEM CONSOLE\x1b[0m\n");
         print(
             "  ARM64 / QEMU virt   Disk mounted\n  help  Commands     htop  System monitor     shutdown  Power off\n\n",
         );

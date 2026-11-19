@@ -24,6 +24,7 @@ for name in modules:
         start = s.index("fn unit_header()")
         end = s.index("/// Unit 0:", start)
         s = s[:start] + 'fn unit_header() -> String { include_str!("runtime.c").into() }\n' + s[end:]
+        s += "\n" + (Path(__file__).parent / "standalone.rs").read_text()
     for module in ("mem", "fmt", "iter", "hash", "ops"):
         s = s.replace(f"std::{module}::", f"core::{module}::")
     (dest / (name + ".rs")).write_text("use crate::prelude::*;\n" + s)

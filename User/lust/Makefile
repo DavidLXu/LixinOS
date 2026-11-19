@@ -5,12 +5,12 @@ RUSTUP := $(or $(shell command -v rustup),$(HOME)/.cargo/bin/rustup)
 CC := aarch64-none-elf-gcc
 all: $(BUILD)/lust.elf
 
-$(PORT)/lust.a: $(UP)/cgen.rs prepare.py runtime.h lib.rs Makefile
+$(PORT)/lust.a: $(UP)/cgen.rs prepare.py standalone.rs runtime.h lib.rs Makefile
 	python3 prepare.py $(UP) $(PORT)
 	cp lib.rs $(PORT)/
 	$(RUSTUP) run stable rustc --edition=2024 --crate-name lust --crate-type staticlib --target aarch64-unknown-none-softfloat -C panic=abort -C opt-level=z -C lto=fat $(PORT)/lib.rs -o $@
 
-$(BUILD)/lust.elf: $(PORT)/lust.a driver.c link.ld ../ls/link.ld ../tcc/port.c ../tcc/platform.c ../tcc/api.c ../tcc/lixin.h ../tcc/config.h ../tcc/slots.def ../console.h $(BUILD)/lixin-header.inc $(BUILD)/tccdefs_.h Makefile
+$(BUILD)/lust.elf: $(PORT)/lust.a driver.c link.ld ../ls/link.ld ../tcc/port.c ../tcc/platform.c ../tcc/api.c ../tcc/lixin.h ../tcc/config.h ../tcc/slots.def ../console.h $(BUILD)/lixin-header.inc $(BUILD)/gui-header.inc $(BUILD)/tccdefs_.h Makefile
 	$(CC) -DLX_COMPILER -DLX_LUST -I../tcc -I$(BUILD) -I$(BUILD)/tinycc -Os -ffunction-sections -fdata-sections -nostartfiles -Wl,--gc-sections,-T,link.ld driver.c ../tcc/port.c ../tcc/platform.c ../tcc/api.c $(PORT)/lust.a -lm -lc -lnosys -lgcc -o $(PORT)/linked.elf
 	aarch64-none-elf-objcopy -O binary $(PORT)/linked.elf $(PORT)/image.bin
 	echo '.section .text.start,"ax"; .global _start; _start:; .incbin "$(PORT)/image.bin"' | $(CC) -x assembler -nostdlib -Wl,-T,../ls/link.ld,-s,-z,max-page-size=4096,--build-id=none -o $@.tmp -

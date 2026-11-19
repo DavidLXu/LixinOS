@@ -1,0 +1,4 @@
+/src/kernel/boot.S
+/src/kernel/memory.c
+/src/kernel/loader-disk.c
+/src/kernel/loader.c

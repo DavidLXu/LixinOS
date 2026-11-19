@@ -32,15 +32,17 @@ swap_stack:
     mrs x10, fpsr
     stp x9, x10, [sp, #-16]!
     mrs x9, sp_el0
-    stp x9, xzr, [sp, #-16]!
+    mrs x10, tpidr_el0
+    stp x9, x10, [sp, #-16]!
     mov x9, sp
     str x9, [x0]
     cbnz x1, 1f
     mov sp, x2
-    b start_right
+    b start_task
 1:
     mov sp, x1
-    ldp x9, xzr, [sp], #16
+    ldp x9, x10, [sp], #16
+    msr tpidr_el0, x10
     msr sp_el0, x9
     ldp x9, x10, [sp], #16
     msr fpcr, x9
@@ -91,7 +93,9 @@ user_timer_irq:
     stp x26, x27, [sp, #-16]!
     stp x28, x29, [sp, #-16]!
     stp x30, xzr, [sp, #-16]!
-    bl pane_irq
+    bl task_timer_irq
+    bl agent_command_interrupted
+    cbnz w0, 2f
     ldp x30, xzr, [sp], #16
     ldp x28, x29, [sp], #16
     ldp x26, x27, [sp], #16
@@ -109,3 +113,6 @@ user_timer_irq:
     ldp x2, x3, [sp], #16
     ldp x0, x1, [sp], #16
     eret
+2:
+    add sp, sp, #256
+    b agent_timeout_exit

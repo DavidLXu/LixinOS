@@ -44,3 +44,23 @@ int ssh_pin(const char *path, const char *fingerprint, size_t len, int create) {
     lx_close(fd);
     return n == (int)len && !memcmp(known, fingerprint, len) ? 1 : -1;
 }
+
+int ssh_file(const char *path, unsigned char *data, size_t capacity) {
+    long size = lx_stat(path);
+    if (size < 0) return (int)size;
+    if ((size_t)size > capacity) return -1;
+    int fd = lx_open(path);
+    if (fd < 0) return -1;
+    int n = lx_read(fd, data, capacity);
+    lx_close(fd);
+    explicit_bzero(MAIL, capacity);
+    return n == size ? n : -1;
+}
+
+int ssh_create_seed(const unsigned char *key) {
+    strcpy(MAIL, "/.ssh-gpu20-key");
+    memcpy(DATA, key, 32);
+    long result = console_call(31, 32);
+    explicit_bzero(DATA, 32);
+    return result;
+}

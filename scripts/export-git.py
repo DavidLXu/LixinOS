@@ -7,10 +7,10 @@ import shutil
 import struct
 
 ROOT = Path(__file__).resolve().parents[1]
-from disk_image import checksum, snapshot_headers
+from disk_image import FILE_LIMIT, checksum, snapshot_headers
 
 
-def decode(data, versioned):
+def decode(data, snapshot_format):
     cursor = 0
 
     def take(n):
@@ -29,16 +29,18 @@ def decode(data, versioned):
         length, size = struct.unpack("<II", take(8))
         if not 0 < length <= 512:
             raise ValueError("invalid path length")
+        if snapshot_format == b"LIXINFS3":
+            take(8)  # Birth and modification times.
         name = take(length).decode()
         path = PurePosixPath(name)
         if (not name.startswith("/") or name.startswith("//") or str(path) != name
                 or ".." in path.parts or "\0" in name or path in files
                 or (name != "/" and files.get(path.parent, False) is not None)):
             raise ValueError("invalid directory tree")
-        if size != 0xffffffff and size > 1024 * 1024:
+        if size != 0xffffffff and size > FILE_LIMIT:
             raise ValueError("invalid file size")
         files[path] = None if size == 0xffffffff else take(size)
-    if files.get(PurePosixPath("/"), False) is not None or (not versioned and cursor != len(data)):
+    if files.get(PurePosixPath("/"), False) is not None or (snapshot_format == b"LIXINFS1" and cursor != len(data)):
         raise ValueError("invalid filesystem")
     return files
 
@@ -48,12 +50,12 @@ def export(disk, repo, dest):
         raise ValueError("give the absolute LixinOS repository path")
     with disk.open("rb") as source:
         for generation, base, size, digest, header in snapshot_headers(source):
-            versioned = header[:8] == b"LIXINFS2"
+            snapshot_format = header[:8]
             source.seek(base + 512)
             data = source.read(size)
             if len(data) == size and checksum(data) == digest:
                 try:
-                    files = decode(data, versioned)
+                    files = decode(data, snapshot_format)
                     break
                 except ValueError:
                     continue

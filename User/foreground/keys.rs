@@ -1,4 +1,6 @@
 // CSI and SS3 decoding shared by the shell and user-mode console programs.
+include!("keycode.rs");
+
 pub fn decode(first: u8, mut next: impl FnMut() -> Option<u8>) -> i32 {
     if first != 27 {
         return first.into();
@@ -14,23 +16,7 @@ pub fn decode(first: u8, mut next: impl FnMut() -> Option<u8>) -> i32 {
                     .saturating_mul(10)
                     .saturating_add((byte - b'0') as u16)
             }
-            b'D' => return 1000,
-            b'C' => return 1001,
-            b'A' => return 1002,
-            b'B' => return 1003,
-            b'H' => return 1005,
-            b'F' => return 1006,
-            b'~' => {
-                return match parameter {
-                    3 => 1004,
-                    1 | 7 => 1005,
-                    4 | 8 => 1006,
-                    5 => 1007,
-                    6 => 1008,
-                    _ => 27,
-                };
-            }
-            _ => return 27,
+            _ => return keycode(i32::from(byte), i32::from(parameter)),
         }
     }
     27

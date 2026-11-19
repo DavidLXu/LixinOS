@@ -2,11 +2,15 @@
 #![no_main]
 
 extern crate alloc;
+mod boot_package;
 mod agent;
 mod agent_system;
 mod agent_tools;
+#[cfg(feature = "retina")]
+mod clipboard;
 mod disk;
 mod foreground;
+mod fs_batch;
 #[cfg(feature = "retina")]
 mod graphics;
 mod inspect;
@@ -16,9 +20,10 @@ mod net;
 mod entropy;
 #[cfg(feature = "ssh-mux")]
 mod serial_mux;
-#[cfg(feature = "split")]
-mod panes;
+mod scheduler;
+mod pipe;
 mod process;
+mod procfs;
 mod git;
 mod user;
 mod utility;
@@ -67,11 +72,12 @@ unsafe impl GlobalAlloc for Allocator {
 }
 #[global_allocator]
 static HEAP: Allocator = Allocator(UnsafeCell::new(Heap::empty()));
-// Leave the linked kernel and both EL0 banks below the heap.
-const HEAP_START: usize = 0x4500_0000;
+// Keep the fixed EL0 virtual image range clear of identity-mapped heap addresses.
+const HEAP_START: usize = 0x4440_0000;
 const MAPPED_RAM: usize = 512 * 1024 * 1024;
 
 fn put(byte: u8) {
+    if !process::capture_agent_output(byte) { return; }
     #[cfg(feature = "retina")]
     graphics::put(byte);
     #[cfg(feature = "ssh-mux")]
@@ -99,15 +105,31 @@ fn print(text: &str) {
 }
 
 fn poll_byte() -> Option<u8> {
+    scheduler::checkpoint();
+    if process::agent_noninteractive() { return None; }
+    if scheduler::background() { return None; }
+    #[cfg(feature="split")]
+    if scheduler::pane() != scheduler::focus() { return None; }
     #[cfg(feature = "retina")]
-    graphics::sample();
-    #[cfg(feature = "split")]
-    if let Some(byte) = panes::input() {
-        return Some(byte);
-    }
-    #[cfg(all(feature = "retina", not(feature = "split")))]
-    if let Some(byte) = graphics::key() {
-        return Some(byte);
+    {
+        graphics::sample();
+        graphics::poll_window();
+        if let Some(key) = graphics::window_input() { return Some(key); }
+        let pasted = clipboard::input();
+        graphics::apply_resize();
+        if let Some(byte) = pasted { return Some(byte); }
+        #[cfg(feature = "split")]
+        let key = scheduler::input();
+        #[cfg(not(feature = "split"))]
+        let key = graphics::key();
+        match key {
+            Some(clipboard::COPY) if graphics::editor_popup() => return Some(3),
+            Some(clipboard::COPY) => clipboard::copy(graphics::copied_text()),
+            Some(clipboard::PASTE) => clipboard::paste(),
+            Some(byte) => return Some(byte),
+            None => (),
+        }
+        if let Some(byte) = clipboard::input() { return Some(byte); }
     }
     #[cfg(feature = "ssh-mux")]
     { serial_mux::poll() }
@@ -121,29 +143,48 @@ fn uart_poll() -> Option<u8> {
 }
 
 fn read_byte() -> u8 {
-    #[cfg(feature = "retina")]
-    graphics::waiting(true);
+    if scheduler::background() || process::agent_noninteractive() {return 4;}
     loop {
         if let Some(byte) = poll_byte() {
-            #[cfg(feature = "retina")]
-            graphics::waiting(false);
             return byte;
         }
-        core::hint::spin_loop();
+        scheduler::sleep_ms(1);
+    }
+}
+
+fn read_timed_byte(milliseconds: u64) -> Option<u8> {
+    let start = monitor::ticks();
+    let duration = monitor::seconds_to_ticks(1) * milliseconds / 1000;
+    loop {
+        if let Some(byte) = poll_byte() {
+            return Some(byte);
+        }
+        if monitor::ticks().wrapping_sub(start) >= duration {
+            return None;
+        }
+        scheduler::sleep_ms(1);
     }
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn console_io(value: u64, operation: u64) -> u64 {
+    #[cfg(feature = "retina")]
+    {
+        graphics::poll_window();
+        if !scheduler::background() && graphics::terminal_closed() { return (-4096i64) as u64; }
+    }
     if let Some(result) = user::test_console(value, operation) {
         return result;
     }
     if agent_tools::active() {
         return if operation == 12 { agent_tools::exchange(value) } else { u64::MAX };
     }
+    if operation == 44 {
+        return process::python_system();
+    }
     if let Some(result) = utility::io(value, operation) { return result; }
     if operation == 18 { return process::exchange(value); }
-    if (13..=17).contains(&operation) || (19..=21).contains(&operation) { return foreground::io(value, operation); }
+    if operation == 37 || (33..=35).contains(&operation) || (13..=17).contains(&operation) || (19..=21).contains(&operation) { return foreground::io(value, operation); }
     if operation == 11 { put(value as u8); return value & 255; }
     if operation >= 7 { return u64::MAX; }
     if operation == 6 {
@@ -180,7 +221,9 @@ extern "C" fn kernel_main() -> ! {
     }
     #[cfg(feature = "retina")]
     graphics::init();
-    print(concat!("LixinOS booted\nVersion ", env!("CARGO_PKG_VERSION"), "\n"));
+    print("LixinOS booted\nKernel ");
+    print(inspect::SYSTEM_RELEASE);
+    print("\n");
     entropy::init();
     net::init();
     user::init();

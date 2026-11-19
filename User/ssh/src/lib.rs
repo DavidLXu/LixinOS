@@ -1,5 +1,5 @@
 #![no_std]
-use base64ct::{Base64Unpadded, Encoding};
+use base64ct::{Base64, Base64Unpadded, Encoding};
 use core::{
     fmt::{self, Write},
     net::Ipv4Addr,
@@ -21,6 +21,8 @@ unsafe extern "C" {
     fn ssh_output(p: *const u8, n: usize);
     fn ssh_pin(path: *const u8, fingerprint: *const u8, n: usize, create: i32) -> i32;
     fn ssh_abort() -> !;
+    fn ssh_file(path: *const u8, data: *mut u8, capacity: usize) -> i32;
+    fn ssh_create_seed(data: *const u8) -> i32;
 }
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -39,6 +41,20 @@ unsafe extern "Rust" fn __getrandom_v03_custom(
 }
 fn output(bytes: &[u8]) {
     unsafe { ssh_output(bytes.as_ptr(), bytes.len()) }
+}
+
+struct TerminalModes(bool);
+impl TerminalModes {
+    fn restore(&mut self) {
+        if core::mem::take(&mut self.0) {
+            output(b"\x1b[?1049l\x1b[?25h\x1b[?1l\x1b[?7h\x1b(B\x0f\x1b[0m");
+        }
+    }
+}
+impl Drop for TerminalModes {
+    fn drop(&mut self) {
+        self.restore();
+    }
 }
 struct Console;
 impl fmt::Write for Console {
@@ -115,6 +131,71 @@ impl<'a> Target<'a> {
         })
     }
 }
+const IDENTITY: &[u8] = b"/.ssh-gpu20-key\0";
+const PROFILE: &[u8] = b"/.ssh-gpu20\0";
+
+// Generate only on explicit enrollment. A lost key must not silently replace
+// an identity that is already authorized on a server.
+fn identity(create: bool) -> sunset::Result<sunset::SignKey> {
+    let mut seed = Zeroizing::new([0u8; 32]);
+    let read = |buf: &mut [u8]| unsafe { ssh_file(IDENTITY.as_ptr(), buf.as_mut_ptr(), buf.len()) };
+    let mut count = read(&mut seed[..]);
+    if count == -3 && create {
+        getrandom::fill(&mut seed[..]).map_err(|_| Error::msg("virtio-rng unavailable"))?;
+        unsafe {
+            ssh_create_seed(seed.as_ptr());
+        }
+        count = read(&mut seed[..]);
+    }
+    if count != 32 {
+        return Err(Error::msg("GPU20 identity missing or invalid"));
+    }
+    Ok(sunset::SignKey::Ed25519(
+        sunset::ed25519_dalek::SigningKey::from_bytes(&seed),
+    ))
+}
+
+fn public_key() -> sunset::Result<u8> {
+    let key = identity(true)?;
+    let mut wire = [0; 96];
+    let size = sunset::sshwire::write_ssh(&mut wire, &key.pubkey())?;
+    let mut encoded = [0; 128];
+    let field = Base64::encode(&wire[..size], &mut encoded)
+        .map_err(|_| Error::msg("public key encoding failed"))?;
+    write!(Console, "ssh-ed25519 {field} LixinOS-gpu20\r\n").unwrap();
+    Ok(0)
+}
+
+fn gpu20() -> sunset::Result<u8> {
+    let mut buf = [0; 160];
+    let n = unsafe { ssh_file(PROFILE.as_ptr(), buf.as_mut_ptr(), buf.len()) };
+    if n < 0 {
+        return Err(Error::msg(
+            "missing /.ssh-gpu20 profile; enroll this disk first",
+        ));
+    }
+    let mut fields = str::from_utf8(&buf[..n as usize])
+        .map_err(|_| Error::msg("invalid GPU20 profile"))?
+        .split_ascii_whitespace();
+    let (Some(user), Some(pin), None) = (fields.next(), fields.next(), fields.next()) else {
+        return Err(Error::msg(
+            "expected username and SHA256 host fingerprint in /.ssh-gpu20",
+        ));
+    };
+    let fingerprint = pin
+        .strip_prefix("SHA256:")
+        .filter(|p| p.len() == 43)
+        .ok_or(Error::msg("invalid GPU20 pin"))?;
+    session(
+        Target {
+            user,
+            ip: Ipv4Addr::new(10, 0, 2, 100),
+            port: 22,
+        },
+        Some((fingerprint, identity(false)?)),
+    )
+}
+
 struct Socket(i32);
 impl Drop for Socket {
     fn drop(&mut self) {
@@ -127,12 +208,21 @@ fn verify_host(
     event: sunset::event::CheckHostkey<'_, '_>,
     path: &str,
     t: &Target<'_>,
+    expected: Option<&str>,
 ) -> sunset::Result<()> {
     let mut wire = [0; 256];
     let n = sunset::sshwire::write_ssh(&mut wire, &event.hostkey()?)?;
     let digest = Sha256::digest(&wire[..n]);
     let mut b64 = [0; 44];
     let fingerprint = Base64Unpadded::encode(&digest, &mut b64).unwrap();
+    if let Some(expected) = expected {
+        if expected != fingerprint {
+            return Err(Error::msg(
+                "GPU20 host key differs from enrolled fingerprint",
+            ));
+        }
+        return event.accept();
+    }
     let pin = |create| unsafe {
         ssh_pin(
             path.as_ptr(),
@@ -164,7 +254,8 @@ fn verify_host(
     Ok(())
 }
 
-fn session(t: Target) -> sunset::Result<u8> {
+fn session(t: Target, profile: Option<(&str, sunset::SignKey)>) -> sunset::Result<u8> {
+    let mut terminal = TerminalModes(false);
     let mut addr = String::<16>::new();
     write!(addr, "{}\0", t.ip).unwrap();
     let fd = unsafe { lx_tcp_connect(addr.as_ptr(), t.port.into()) };
@@ -184,10 +275,12 @@ fn session(t: Target) -> sunset::Result<u8> {
     let mut end = 0;
     let mut chan = None;
     let mut opened = false;
+    let mut pty_size = (0, 0);
     let mut status = None;
     let mut idle = 0;
     let mut bol = true;
     let mut escaped = false;
+    let (expected, mut key) = profile.unzip();
     let mut attempted = false;
     loop {
         let mut moved = true;
@@ -196,10 +289,13 @@ fn session(t: Target) -> sunset::Result<u8> {
             Event::None => moved = false,
             Event::Progressed | Event::Cli(CliEvent::PollAgain) => {}
             Event::Cli(CliEvent::Hostkey(e)) => {
-                verify_host(e, &path, &t)?;
+                verify_host(e, &path, &t, expected)?;
             }
             Event::Cli(CliEvent::Username(e)) => e.username(t.user)?,
             Event::Cli(CliEvent::Password(e)) => {
+                if expected.is_some() {
+                    return Err(Error::msg("GPU20 rejected the guest key"));
+                }
                 if attempted {
                     return Err(Error::msg("authentication failed"));
                 }
@@ -208,7 +304,10 @@ fn session(t: Target) -> sunset::Result<u8> {
                 let mut secret = Zeroizing::new([0u8; 256]);
                 e.password(line(&mut secret[..], false)?)?;
             }
-            Event::Cli(CliEvent::Pubkey(e)) => e.skip()?,
+            Event::Cli(CliEvent::Pubkey(e)) => match key.take() {
+                Some(key) => e.pubkey(key)?,
+                None => e.skip()?,
+            },
             Event::Cli(CliEvent::AgentSign(e)) => e.skip()?,
             Event::Cli(CliEvent::Banner(_)) => {}
             Event::Cli(CliEvent::Authenticated) => {
@@ -216,16 +315,18 @@ fn session(t: Target) -> sunset::Result<u8> {
             }
             Event::Cli(CliEvent::SessionOpened(mut e)) => {
                 let dims = unsafe { lx_geometry() };
+                pty_size = ((dims & 65535) as u32, ((dims >> 16) & 65535) as u32);
                 e.pty(Pty {
-                    term: "vt100".try_into().unwrap(),
-                    cols: (dims & 65535) as u32,
-                    rows: ((dims >> 16) & 65535) as u32,
+                    term: "xterm".try_into().unwrap(),
+                    cols: pty_size.0,
+                    rows: pty_size.1,
                     width: 0,
                     height: 0,
                     modes: Default::default(),
                 })?;
                 e.shell()?;
                 opened = true;
+                terminal.0 = true;
             }
             Event::Cli(CliEvent::SessionExit(e)) => {
                 status = Some(match e {
@@ -271,6 +372,16 @@ fn session(t: Target) -> sunset::Result<u8> {
             }
         }
         if let Some(c) = &chan {
+            if opened {
+                let dims = unsafe { lx_geometry() };
+                let size = ((dims & 65535) as u32, ((dims >> 16) & 65535) as u32);
+                if size != pty_size && ssh.term_window_change(c, &sunset::packets::WinChange {
+                    cols: size.0, rows: size.1, width: 0, height: 0,
+                }).is_ok() {
+                    pty_size = size;
+                    moved = true;
+                }
+            }
             if ssh.read_channel_ready().is_some() {
                 let mut data = [0; 1024];
                 let (n, _) = ssh.read_channel_either(c, &mut data)?;
@@ -290,6 +401,7 @@ fn session(t: Target) -> sunset::Result<u8> {
                     if escaped {
                         escaped = false;
                         if b == b'.' {
+                            terminal.restore();
                             output(b"\r\nDisconnected.\r\n");
                             return Ok(0);
                         }
@@ -328,8 +440,13 @@ unsafe extern "C" fn ssh_main(args: *const u8, n: usize) -> i32 {
         unsafe {
             core::ptr::copy_nonoverlapping(args, saved.as_mut_ptr(), n);
         }
-        if let Some(t) = Target::parse(&saved[..n]) {
-            return match session(t) {
+        let result = match &saved[..n] {
+            b"--public-key\0gpu20\0" => Some(public_key()),
+            b"gpu20\0" => Some(gpu20()),
+            args => Target::parse(args).map(|target| session(target, None)),
+        };
+        if let Some(result) = result {
+            return match result {
                 Ok(code) => code.into(),
                 Err(e) => {
                     write!(Console, "ssh: {e}\r\n").unwrap();
@@ -338,6 +455,6 @@ unsafe extern "C" fn ssh_main(args: *const u8, n: usize) -> i32 {
             };
         }
     }
-    output(b"usage: ssh [-p PORT] user@IPv4\r\n");
+    output(b"usage: ssh [-p PORT] user@IPv4 | ssh gpu20 | ssh --public-key gpu20\r\n");
     2
 }

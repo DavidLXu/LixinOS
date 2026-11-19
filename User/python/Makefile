@@ -4,8 +4,8 @@ include $(CACHE)/micropython/py/mkenv.mk
 include $(TOP)/py/py.mk
 
 CFLAGS += -I. -I$(TOP) -I$(BUILD) -std=gnu11 -Os -DNDEBUG -ffreestanding -fno-stack-protector -fdata-sections -ffunction-sections
-SRC_C = port.c shared/readline/readline.c shared/runtime/pyexec.c shared/runtime/gchelper_generic.c shared/runtime/stdout_helpers.c shared/libc/printf.c
-SRC_QSTR += port.c shared/readline/readline.c shared/runtime/pyexec.c
+SRC_C = port.c system.c extmod/modrandom.c extmod/modselect.c extmod/modtime.c shared/readline/readline.c shared/runtime/pyexec.c shared/runtime/gchelper_generic.c shared/runtime/stdout_helpers.c shared/libc/printf.c
+SRC_QSTR += port.c system.c extmod/modrandom.c extmod/modselect.c extmod/modtime.c shared/readline/readline.c shared/runtime/pyexec.c
 OBJ = $(PY_CORE_O) $(addprefix $(BUILD)/,$(SRC_C:.c=.o))
 
 all: $(CACHE)/python.bin

@@ -280,8 +280,16 @@ int paint(const char *name, const char *text, size_t length) {
     }
     w = geometry & 65535;
     h = (geometry >> 16) - TOP;
+#ifdef __TINYC__
+    // SVC 20 reads from the file grant arena. Retain its first MiB for saves.
+    size_t pixels = (size_t)w * h;
+    if (console_call(17, 0x100010 + 2 * pixels * sizeof(unsigned))) return 1;
+    base = (unsigned *)0x68100010UL;
+    frame = base + pixels;
+#else
     base = malloc((size_t)w * h * 4);
     frame = malloc((size_t)w * h * 4);
+#endif
     if (!base || !frame) {
         out("paint: out of memory\r\n");
         return 1;

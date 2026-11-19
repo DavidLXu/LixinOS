@@ -1,7 +1,11 @@
 #define TCC_VERSION "0.9.28rc"
 #define TCC_TARGET_ARM64 1
 #define CONFIG_TCC_STATIC 1
+#ifdef LX_SELFHOST
+#define CONFIG_TCC_PREDEFS 0
+#else
 #define CONFIG_TCC_PREDEFS 1
+#endif
 #define CONFIG_TCC_SEMLOCK 0
 #define CONFIG_TCC_BCHECK 0
 #define CONFIG_TCC_BACKTRACE 0

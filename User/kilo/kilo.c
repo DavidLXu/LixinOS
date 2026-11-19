@@ -46,7 +46,13 @@ extern void _exit(int);
 #include <stdint.h>
 #include <errno.h>
 #include <string.h>
+#ifdef __TINYC__
+int isspace(int), isdigit(int), isprint(int);
+void *memchr(const void *, int, size_t);
+char *strdup(const char *), *strstr(const char *, const char *);
+#else
 #include <ctype.h>
+#endif
 #include <time.h>
 #include <sys/types.h>
 
@@ -54,7 +60,9 @@ extern void _exit(int);
 #include <unistd.h>
 #include <stdarg.h>
 #include <fcntl.h>
+#ifndef __TINYC__
 #include <signal.h>
+#endif
 
 /* Syntax highlight types */
 #define HL_NORMAL 0

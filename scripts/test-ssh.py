@@ -8,7 +8,8 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-Serial = runpy.run_path(str(ROOT / "scripts/test-user.py"))["Serial"]
+serial = runpy.run_path(str(ROOT / "scripts/test-user.py"))
+Serial = serial["Serial"]
 
 
 @contextmanager
@@ -23,6 +24,7 @@ def child(args, **opts):
 
 
 def test(directory):
+    serial["seed_test_disk"](directory / "test.img")
     keys = directory / "keys"
     env = dict(os.environ, LIXINOS_DISK=str(directory / "test.img"),
                LIXINOS_SSH_DIR=str(keys), LIXINOS_SSH_PORT="0", DEEPSEEK_API_KEY="")

@@ -9,9 +9,12 @@ import subprocess
 import tempfile
 
 SECTOR = 512
-SLOT = 64 << 20
+SLOT = 192 << 20
+FILE_LIMIT = 100 << 20
+PREVIOUS_SLOT = 64 << 20
 HISTORY_BYTES = 65 * 1024
-HEADER = b"LIXDISK3".ljust(SECTOR, b"\0")
+HEADER = b"LIXDISK4".ljust(SECTOR, b"\0")
+PREVIOUS_HEADER = b"LIXDISK3".ljust(SECTOR, b"\0")
 SLOTS = (SECTOR, SECTOR + SLOT)
 HISTORY = SECTOR + 2 * SLOT
 IMAGE_SIZE = HISTORY + HISTORY_BYTES
@@ -28,13 +31,17 @@ def checksum(data):
 
 def snapshot_slots(source):
     source.seek(0)
-    if source.read(SECTOR) == HEADER:
-        if os.fstat(source.fileno()).st_size < IMAGE_SIZE:
+    header = source.read(SECTOR)
+    size = os.fstat(source.fileno()).st_size
+    if header in (HEADER, PREVIOUS_HEADER):
+        slot = SLOT if header == HEADER else PREVIOUS_SLOT
+        if size < SECTOR + 2 * slot + HISTORY_BYTES:
             raise ValueError("truncated LixinOS disk")
-        return [(offset, SLOT - SECTOR) for offset in SLOTS]
+        return [(offset, slot - SECTOR) for offset in (SECTOR, SECTOR + slot)]
     pairs = []
-    if os.fstat(source.fileno()).st_size >= 2 * OLD_SLOT + 2 * SLOT:
-        pairs.extend((offset, SLOT - SECTOR) for offset in (2 * OLD_SLOT, 2 * OLD_SLOT + SLOT))
+    if size >= 2 * OLD_SLOT + 2 * PREVIOUS_SLOT:
+        pairs.extend((offset, PREVIOUS_SLOT - SECTOR)
+                     for offset in (2 * OLD_SLOT, 2 * OLD_SLOT + PREVIOUS_SLOT))
     pairs.extend((offset, OLD_SLOT - HISTORY_BYTES - SECTOR) for offset in (0, OLD_SLOT))
     return pairs
 
@@ -44,7 +51,7 @@ def snapshot_headers(source):
     for base, limit in snapshot_slots(source):
         source.seek(base)
         header = source.read(SECTOR)
-        if len(header) != SECTOR or header[:8] not in (b"LIXINFS1", b"LIXINFS2"):
+        if len(header) != SECTOR or header[:8] not in (b"LIXINFS1", b"LIXINFS2", b"LIXINFS3"):
             continue
         generation, size, digest, head_hash = struct.unpack_from("<QIII", header, 8)
         if checksum(header[:24]) == head_hash and 4 <= size <= limit:
@@ -73,10 +80,14 @@ def migrate(source, target):
         copied.add(slot)
     if not copied:
         source.seek(0)
+        if source.read(SECTOR) not in (PREVIOUS_HEADER, bytes(SECTOR)):
+            raise ValueError("nonempty disk has no valid snapshot")
         while chunk := source.read(1 << 20):
             if chunk.count(0) != len(chunk):
                 raise ValueError("nonempty disk has no valid snapshot")
-    source.seek(OLD_HISTORY)
+    source.seek(0)
+    previous = source.read(SECTOR) == PREVIOUS_HEADER
+    source.seek(SECTOR + 2 * PREVIOUS_SLOT if previous else OLD_HISTORY)
     history = source.read(HISTORY_BYTES)
     if len(history) != HISTORY_BYTES:
         raise ValueError("truncated legacy disk")
@@ -87,7 +98,7 @@ def migrate(source, target):
         raise OSError("history migration verification failed")
 
 
-def prepare(path):
+def prepare(path, previous_layout=False):
     path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -96,8 +107,11 @@ def prepare(path):
         source = None
     try:
         if source:
-            if source.read(SECTOR) == HEADER:
-                if os.fstat(source.fileno()).st_size < IMAGE_SIZE:
+            header = source.read(SECTOR)
+            if previous_layout and header == HEADER:
+                raise ValueError("this kernel needs a LIXDISK4-compatible loader")
+            if header == (PREVIOUS_HEADER if previous_layout else HEADER):
+                if os.fstat(source.fileno()).st_size < (SECTOR + 2 * PREVIOUS_SLOT + HISTORY_BYTES if previous_layout else IMAGE_SIZE):
                     raise ValueError("truncated LixinOS disk")
                 return
             fcntl.lockf(source, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -109,11 +123,13 @@ def prepare(path):
             if any(int(pid) != os.getpid() for pid in owners.stdout.split()):
                 raise OSError("disk is in use; shut down its VM before upgrading")
             original = os.fstat(source.fileno())
+        if previous_layout and source:
+            raise ValueError("upgrade the kernel before migrating this disk")
         with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".lixinos-", delete=False) as tmp:
             name = Path(tmp.name)
             try:
-                tmp.truncate(IMAGE_SIZE)
-                tmp.write(HEADER)
+                tmp.truncate(SECTOR + 2 * PREVIOUS_SLOT + HISTORY_BYTES if previous_layout else IMAGE_SIZE)
+                tmp.write(PREVIOUS_HEADER if previous_layout else HEADER)
                 if source:
                     migrate(source, tmp)
                     os.fchmod(tmp.fileno(), stat.S_IMODE(original.st_mode))
@@ -144,7 +160,9 @@ def prepare(path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image", type=Path)
+    parser.add_argument("--previous-layout", action="store_true")
+    args = parser.parse_args()
     try:
-        prepare(parser.parse_args().image)
+        prepare(args.image, args.previous_layout)
     except (OSError, ValueError) as exc:
         parser.exit(1, f"Cannot prepare LixinOS disk: {exc}\n")

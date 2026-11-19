@@ -1,0 +1,65 @@
+--- a/bfd/opncls.c
++++ b/bfd/opncls.c
+@@ -786,6 +786,33 @@
+ 	BFD.  It can be accessed via the bfd_get_filename() macro.
+ */
+ 
++/* Assemble and link against BFD's seekable memory stream.  Each ordinary
++   file write commits a filesystem snapshot on LixinOS, so publish the
++   completed object with a single atomic file-service operation.  */
++static struct bfd_iovec lixin_output_iovec;
++extern int lx_save_parts (const char *, unsigned long);
++
++static bool
++lixin_publish (bfd *abfd)
++{
++  struct bfd_in_memory *image = abfd->iostream;
++  if (image->size > (100UL << 20))
++    {
++      errno = EFBIG;
++      bfd_set_error (bfd_error_system_call);
++      return false;
++    }
++  uint32_t parts[] = { image->size != 0, 0, (uintptr_t) image->buffer, image->size };
++  uint64_t descriptor = ((uint64_t) (uintptr_t) parts << 32) | image->size;
++  if (lx_save_parts (bfd_get_filename (abfd), descriptor) < 0)
++    {
++      errno = EIO;
++      bfd_set_error (bfd_error_system_call);
++      return false;
++    }
++  return true;
++}
++
+ bfd *
+ bfd_openw (const char *filename, const char *target)
+ {
+@@ -812,9 +839,7 @@
+       _bfd_delete_bfd (nbfd);
+       return NULL;
+     }
+-  nbfd->direction = write_direction;
+-
+-  if (bfd_open_file (nbfd) == NULL)
++  if (!bfd_make_writable (nbfd))
+     {
+       /* File not writeable, etc.  */
+       bfd_set_error (bfd_error_system_call);
+@@ -822,6 +847,8 @@
+       return NULL;
+   }
+ 
++  lixin_output_iovec = _bfd_memory_iovec;
++  nbfd->iovec = &lixin_output_iovec;
+   return nbfd;
+ }
+ 
+@@ -923,6 +950,8 @@
+   bool ret = (!bfd_write_p (abfd)
+ 	      || BFD_SEND_FMT (abfd, _bfd_write_contents, (abfd)));
+ 
++  if (ret && abfd->iovec == &lixin_output_iovec)
++    ret = lixin_publish (abfd);
+   return bfd_close_all_done (abfd) && ret;
+ }
+ 

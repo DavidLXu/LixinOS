@@ -8,7 +8,9 @@ CORE := $(filter-out %/transport.c %/remote.c %/fetch.c %/push.c %/clone.c %/pro
 UTIL := $(filter-out %/net.c %/rand.c %/process.c ,$(wildcard $(LIB)/src/util/*.c))
 SRC := $(CORE) $(UTIL) $(LIB)/src/util/allocators/failalloc.c $(LIB)/src/util/allocators/stdalloc.c $(filter-out %/pcreposix.c,$(wildcard $(LIB)/deps/pcre/*.c)) $(LIB)/src/util/hash/collisiondetect.c $(LIB)/src/util/hash/builtin.c $(wildcard $(LIB)/src/util/hash/sha1dc/*.c) $(wildcard $(LIB)/src/util/hash/rfc6234/*.c) $(wildcard $(LIB)/deps/xdiff/*.c) $(wildcard $(LIB)/deps/zlib/*.c)
 OBJ := $(patsubst $(LIB)/%.c,$(OUT)/%.o,$(SRC))
-all: $(CACHE)/git.bin
+all: $(CACHE)/git.bin $(CACHE)/git-user.elf
+$(CACHE)/git-user.elf: $(CACHE)/git.bin
+	aarch64-none-elf-strip --strip-all -o $@ $(OUT)/git.elf
 $(OUT)/deps/pcre/%.o: FLAGS := -Ipcre -DHAVE_CONFIG_H $(FLAGS)
 $(OUT)/%.o: $(LIB)/%.c Makefile
 	@mkdir -p $(@D)

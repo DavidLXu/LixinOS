@@ -30,6 +30,8 @@ fi
 [[ $(git -C "$cache/micropython" rev-parse HEAD) == "$revision" ]] || {
     echo 'MicroPython build cache has an unexpected revision.' >&2; exit 1;
 }
+# The MicroPython lock also pins the lwIP C sources for the native kernel.
+git -C "$cache/micropython" submodule update --init --depth=1 lib/lwip
 make -s -C User/python -j6 CROSS_COMPILE=aarch64-none-elf-
 
 tcc_revision=f830a1697e159056b75de40a60464bc43ee670a3
@@ -43,6 +45,8 @@ if [[ ! -d "$cache/tinycc" ]]; then
 fi
 [[ $(git -C "$cache/tinycc" rev-parse HEAD) == "$tcc_revision" ]] || exit 1
 make -s -C User/tcc
+python3 scripts/tcc-sources.py "$cache"
+python3 scripts/python-sources.py "$cache"
 
 git_revision=0060d9cf5666f015b1067129bd874c6cc4c9c7ac
 if [[ ! -d "$cache/libgit2" ]]; then
@@ -54,7 +58,7 @@ fi
 [[ $(git -C "$cache/libgit2" rev-parse HEAD) == "$git_revision" ]] || exit 1
 make -s -C User/git -j6
 
-if [[ ! -f "$cache/ls.elf" || User/ls/ls.c -nt "$cache/ls.elf" || User/console.h -nt "$cache/ls.elf" || User/tcc/api.c -nt "$cache/ls.elf" || User/tcc/lixin.h -nt "$cache/ls.elf" || User/ls/start.c -nt "$cache/ls.elf" || User/ls/link.ld -nt "$cache/ls.elf" ]]; then
+if [[ ! -f "$cache/ls.elf" || User/ls/ls.c -nt "$cache/ls.elf" || User/file-time.h -nt "$cache/ls.elf" || User/console.h -nt "$cache/ls.elf" || User/tcc/api.c -nt "$cache/ls.elf" || User/tcc/lixin.h -nt "$cache/ls.elf" || User/ls/start.c -nt "$cache/ls.elf" || User/ls/link.ld -nt "$cache/ls.elf" ]]; then
     aarch64-none-elf-gcc -Os -ffreestanding -nostdlib -mgeneral-regs-only \
         -Wl,-T,User/ls/link.ld,-s,-z,max-page-size=4096,--build-id=none \
         -IUser/tcc -o "$cache/ls.elf" User/ls/ls.c User/ls/start.c User/tcc/api.c
@@ -68,6 +72,36 @@ fi
 make -s -C User/foreground
 make -s -C User/core
 make -s -C User/desktop
+
+links_version=2.30
+links_hash=c4631c6b5a11527cdc3cb7872fc23b7f2b25c2b021d596be410dadb40315f166
+if [[ ! -f "$cache/links-$links_version/.verified-$links_hash" ]]; then
+    stage=$(mktemp -d "$cache/links.XXXXXX")
+    archive=links-$links_version.tar.bz2
+    curl -fsSL --retry 2 "https://sources.buildroot.net/links/$archive" -o "$stage/$archive" ||
+        curl -fsSL --retry 2 "https://links.twibright.com/download/$archive" -o "$stage/$archive"
+    (cd "$stage" && echo "$links_hash  $archive" | shasum -a 256 -c -)
+    tar -xjf "$stage/$archive" -C "$stage"
+    touch "$stage/links-$links_version/.verified-$links_hash"
+    if [[ -d "$cache/links-$links_version" ]]; then
+        mv "$cache/links-$links_version" "$stage/previous-cache"
+    fi
+    mv "$stage/links-$links_version" "$cache/"
+    rm -rf "$stage"
+fi
+bear="$cache/bearssl-0.6"
+if [[ ! -f "$bear/.lixin-verified" ]]; then
+    stage=$(mktemp -d "$cache/bear.XXXXXX")
+    curl -fsSL --retry 2 https://sources.buildroot.net/bearssl/bearssl-0.6.tar.gz -o "$stage/archive"
+    (cd "$stage" && echo '6705bba1714961b41a728dfc5debbe348d2966c117649392f8c8139efc83ff14  archive' | shasum -a 256 -c -)
+    tar -xf "$stage/archive" -C "$cache"
+    touch "$bear/.lixin-verified"
+    rm -rf "$stage"
+fi
+make -s -j8 -C "$bear" build/brssl
+make -s -j8 -C "$bear" BUILD=arm CC=aarch64-none-elf-gcc AR=aarch64-none-elf-ar CFLAGS="-Os -ffunction-sections -fdata-sections" arm/libbearssl.a
+make -s -j6 -C User/links
+lockf -k "$cache/cpython-build.lock" bash User/cpython/build.sh "$cache/cpython-port"
 
 make -s -C User/ssh
 make -s -C User/sh

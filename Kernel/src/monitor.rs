@@ -13,6 +13,36 @@ pub fn seconds_to_ticks(seconds: u64) -> u64 {
     seconds * freq
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct CpuCounters {
+    pub ticks: u64,
+    pub idle_ticks: u64,
+}
+
+impl CpuCounters {
+    #[cfg(feature = "retina")]
+    pub const ZERO: Self = Self { ticks: 0, idle_ticks: 0 };
+
+    pub fn busy_percent(self, start: Self) -> Option<u64> {
+        let elapsed = self.ticks.wrapping_sub(start.ticks);
+        let idle = self.idle_ticks.wrapping_sub(start.idle_ticks);
+        let busy = elapsed.saturating_sub(idle);
+        let rounded = u128::from(busy) * 100 + u128::from(elapsed / 2);
+        (elapsed != 0).then(|| (rounded / u128::from(elapsed)) as u64)
+    }
+}
+
+// Scheduler idle waits execute with IRQs masked on the guest's single vCPU.
+static mut IDLE_TICKS: u64 = 0;
+
+pub(crate) fn record_idle_since(start: u64) {
+    unsafe { IDLE_TICKS = IDLE_TICKS.wrapping_add(ticks().wrapping_sub(start)); }
+}
+
+pub(crate) fn cpu_counters() -> CpuCounters {
+    CpuCounters { ticks: ticks(), idle_ticks: unsafe { IDLE_TICKS } }
+}
+
 pub fn heap_usage() -> (usize, usize) {
     let heap = unsafe { &*HEAP.0.get() };
     (heap.used(), heap.free())
@@ -37,8 +67,7 @@ pub fn kernel_stack_usage() -> Option<(usize, usize)> {
     unsafe { asm!("mov {}, sp", out(reg) sp, options(nostack, nomem, preserves_flags)); }
     let stacks = [
         (addr_of!(__stack_bottom) as usize, addr_of!(__stack_top) as usize),
-        #[cfg(feature = "split")]
-        crate::panes::right_stack_bounds(),
+        crate::scheduler::stack_bounds(),
     ];
     stacks.into_iter().find(|&(bottom, top)| (bottom..=top).contains(&sp))
         .map(|(bottom, top)| (top - sp, top - bottom))

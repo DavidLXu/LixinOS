@@ -1,4 +1,5 @@
 """Exercise the graphical paint application using QEMU absolute pointer events."""
+import argparse
 import json
 from pathlib import Path
 import runpy
@@ -8,7 +9,7 @@ import xml.etree.ElementTree as ET
 harness = runpy.run_path(str(Path(__file__).with_name("test-panes.py")))
 
 
-def exercise(guest, control, directory):
+def exercise(guest, control, directory, guest_build=False):
     def qmp(name, **args):
         control.write(json.dumps({"execute": name, "arguments": args}).encode() + b"\n")
         control.flush()
@@ -22,9 +23,12 @@ def exercise(guest, control, directory):
         qmp("input-send-event", events=list(events))
         time.sleep(.035)
 
+    screen_width, screen_height = 3014, 1408
+    pane_width = (screen_width-22)//2
+
     def point(x, y):
         send(*({"type": "abs", "data": {"axis": axis, "value": round(pos*32767/(limit-1))}}
-               for axis, pos, limit in (("x", x, 2310), ("y", y, 1100))))
+               for axis, pos, limit in (("x", x, screen_width), ("y", y, screen_height))))
 
     def button(down, name="left"):
         send({"type": "btn", "data": {"button": name, "down": down}})
@@ -50,6 +54,11 @@ def exercise(guest, control, directory):
     prompt = harness["serial"]["SHELL"]
     guest.until(prompt)
     time.sleep(.25)
+    if guest_build:
+        guest.expect(b"mkdir /libexec\r",prompt)
+        guest.expect(b"tcc /src/tinycc/bootstrap.c -o /tcc-new\r",prompt)
+        guest.expect(b"/tcc-new -I/src/tinycc/sdk /src/foreground/runtime.c /src/paint/main.c /src/paint/raster.c /src/paint/document.c -o /libexec/paint\r",prompt)
+        guest.expect(b"echo $?\r",prompt,b"\n0\n")
     old = screen()
     guest.expect(b"paint sketch.svg\r", b"Wheel: width")
     time.sleep(.15)
@@ -71,9 +80,9 @@ def exercise(guest, control, directory):
     guest.expect(b"\x13", b"Saved SVG")
     pixels = screen()
     assert bytes.fromhex("cb4c50") in pixels
-    stride = len(pixels)//1100  # QEMU pads each captured scanline.
-    for y in range(44,1100):
-        right = slice(y*stride+1144*3,(y+1)*stride)
+    stride = len(pixels)//screen_height  # QEMU pads each captured scanline.
+    for y in range(44,screen_height):
+        right = slice(y*stride+pane_width*3,(y+1)*stride)
         assert pixels[right] == old[right], f"neighbor changed on row {y}"
     guest.expect(b"q", prompt)
     guest.send(b"cat sketch.svg\r")
@@ -95,5 +104,8 @@ def exercise(guest, control, directory):
 
 
 if __name__ == "__main__":
-    harness["test"](exercise)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--guest-build", action="store_true")
+    guest_build = parser.parse_args().guest_build
+    harness["test"](lambda *args: exercise(*args, guest_build))
     print("Passed mouse drawing, SVG round trip, wheel width and pane clipping.")

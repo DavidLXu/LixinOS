@@ -11,11 +11,18 @@ Run ls or cecho by name. The shell's agent run command invokes /bin/agent-run
 with access to the project agent service. A successful rebuild takes effect
 on the next invocation.
 
-The python, git and tcc directories contain LixinOS port sources and build
-recipes. Their full builds use upstream MicroPython, libgit2 and TinyCC,
-respectively, and currently run on the host. Files named start.c provide
-startup code for the host-built images. Guest TinyCC supplies its own startup
-code when compiling a command's main function.
+The python and git directories contain the host build recipes for MicroPython
+and libgit2. For the guest-native MicroPython, core utilities, desktop and
+editor build, run `cat /src/build/README.md`. The tcc directory contains the distribution compiler port.
+To build TinyCC twice inside LixinOS and use it to compile Bash, run
+`cat /src/tinycc/README.md` for the commands and source layout.
+
+The native GNU C toolchain builds static ARM64 ELF programs on either kernel.
+See [GNU C on LixinOS](gcc/README.md) for shell examples and the build recipe.
+
+MicroPython supports slices such as `items[:-1]`, sets, f-strings,
+assignment expressions, and `select.poll()` on `sys.stdin`. Try
+`python /src/games/snake.py` for a keyboard-driven example.
 
 The `kilo` directory contains the LixinOS port of Salvatore Sanfilippo's Kilo
 (upstream revision 323d93b29bd89a2cb446de90c4ed4fea1764176e).
@@ -48,3 +55,17 @@ Saved LXE1 programs can include `<lixin.h>` and call
 and open descriptors. The small foreground-shell example remains in
 `/src/sh/csh.c`. Run `python3 scripts/test-sh.py` to exercise default Bash,
 nested processes, and guest rebuilds across reboot on a disposable disk.
+
+For concurrent work, a saved LXE1 program can start a child with
+`lx_spawn_async(path, argc, argv)`, keep working, then collect its exit status
+with `lx_wait(pid)`. Standard streams are inherited. `lx_pid()` identifies
+the caller. Bash runs `producer | consumer` as concurrent stages and accepts
+a trailing `&` for detached jobs.
+
+The descriptor interface includes `lx_open`, `lx_open_write`, `lx_tcp_connect`,
+`lx_read`, `lx_write`, `lx_poll` and `lx_close`. Read and write transfer up to
+4 KiB per call and can return a short count. A zero-length result from a
+nonempty read means EOF. Use descriptors 0, 1 and 2 for stdin, stdout and
+stderr. `lx_poll(fd, LX_READABLE | LX_WRITABLE, timeout_ms)` returns the ready
+bits, zero on timeout, or -1 for an invalid descriptor. A negative-one timeout
+waits indefinitely. The older TCP-specific calls retain their nonblocking ABI.

@@ -2,6 +2,18 @@
 
 **0.1.0** · [中文系统手册](docs/README.md) · [版本说明](docs/0.1.0.md)
 
+## Choose a kernel at startup
+
+Run `./scripts/run-kernel.sh` to open the macOS kernel picker before QEMU starts. Choose the original Rust kernel (default) or the guest-built TCC kernel. Each uses its own persistent disk. Interactive `--serial` and `--ssh` sessions show a numbered menu. For unattended startup, pass `--kernel rust` or `--kernel tcc` with the desired display mode, for example `./scripts/run-kernel.sh --kernel tcc --split`.
+
+## CPython in the guest
+
+Run `python3` for the CPython 3.14.5 REPL or `python3 script.py` to execute a guest file. Both kernels use the same native AArch64 interpreter. The existing `python` command runs MicroPython. See the [CPython port guide](User/cpython/README.md) for the supported modules and two-kernel regression test.
+
+## Boot the guest-built C kernel
+
+LixinOS can rebuild a separate AArch64 kernel and its disk bootloader from C and assembly using its own TCC. With the prepared image, run `./scripts/run-tcc-kernel.sh --window`. The current native kernel uses 1536 MiB of QEMU RAM. The Agent service is still part of the Rust-kernel configuration. See the [native kernel build and verification guide](Kernel/native/README.md).
+
 ## Boot the Rust kernel in QEMU
 
 The `Kernel/` crate is a bare-metal ARM64 guest for QEMU's `virt` board. On an Apple Silicon Mac with Homebrew and `rustup` installed, run the following. The launcher uses rustup's stable toolchain and also checks rustup's default install location when it is absent from `PATH`.
@@ -14,9 +26,85 @@ rustup target add --toolchain stable aarch64-unknown-none-softfloat
 
 If your shell cannot find `rustup`, use `"$HOME/.cargo/bin/rustup"` for the target setup command.
 
-The default launcher opens the native QEMU Cocoa display. LixinOS draws its 82 × 24 console and fixed top status bar directly into a 1804 × 1100 ramfb framebuffer and reads a virtio keyboard using a US ASCII layout. The build uses Swift and Core Text to rasterize the locally installed Menlo font at 36 pixels. At 2× Retina scale the text appears at 18 pt. The default view uses the native pixel size. Press Control–Option–G to release captured input. Type `shutdown` at the shell prompt to power off. In MicroPython press Ctrl+D to return to the shell first.
+The default launcher opens a native QEMU Cocoa window at the guest display size. If macOS Accessibility access is unavailable to the launcher, enable **View → Zoom To Fit** in QEMU after launch to unlock window dragging. Drag the window edge to change the number of terminal rows and columns. LixinOS reflows visible text at the same Menlo cell size and sends the new terminal dimensions to connected SSH sessions. Split mode gives each pane half the available width. Nano in the main QEMU console updates its layout as you resize the window. The desktop, Paint and Kilo apply pending resizes when they return to the main console. Enlarge the window before opening the desktop if it has too little space. Press Control–Option–G to release captured input before resizing. Type `shutdown` at the shell prompt to power off. In MicroPython press Ctrl+D to return to the shell first.
 
-The status bar samples once per second at console and Python VM polling points. CPU is the fraction of guest time spent outside input waits and the monitor's refresh delay. RAM counts the kernel image, stack, framebuffer, allocated heap and the 4 MiB user region reserved per pane against the configured 512 MiB. HEAP shows allocated kernel heap memory in KiB below 1 MiB, then in MiB to one decimal place. STACK shows sampled kernel stack use and capacity for the executing pane in KiB. FILES counts files on the mounted disk, including empty files. DISK shows how much of the usable snapshot capacity the current data occupies, including filesystem metadata and saved Agent versions. The bar remains visible while scrolling, clearing the screen, or editing a file.
+The status bar samples once per second at console and Python VM polling points. CPU is the fraction of elapsed guest time outside scheduler idle waits. RAM counts the kernel image, stack, framebuffer, allocated heap (including live process images and stacks) against the configured 512 MiB. HEAP shows allocated kernel heap memory in KiB below 1 MiB, then in MiB to one decimal place. STACK shows sampled kernel stack use and capacity for the executing pane in KiB. FILES counts files on the mounted disk, including empty files. DISK shows how much of the usable snapshot capacity the current data occupies, including filesystem metadata and saved Agent versions. The bar remains visible while scrolling, clearing the screen, or editing a file.
+
+The clock at the right shows 24-hour local time. Narrow windows show hours
+and minutes. The launcher uses Asia/Shanghai by default. Set
+`LIXINOS_TIMEZONE` to use a different time zone at startup.
+
+### Links 2 browser
+
+Run `links` in the guest shell, or open a guest file with `links hello.html`.
+Use **Tab** or the arrow keys to select a link, **Enter** to open it, **B**
+to go back, **G** to enter an address and **Q** to return to the shell.
+The command `links2` also starts the browser.
+
+To browse files served by your Mac, run the following in the Mac directory
+containing your HTML files.
+
+```sh
+python3 -m http.server 8000 --bind 127.0.0.1
+```
+
+Then run `links http://10.0.2.2:8000/` inside LixinOS. The port uses the
+Links 2.30 HTML and table renderer. Open a public site directly in the guest:
+
+```sh
+links https://example.com
+```
+
+In a QEMU window, use `links -g https://example.com` for the graphical browser,
+or click **Links** on the desktop. Click a link to follow it, the address bar
+to type a URL, **Back** to return, or **×** to close. Drag the title bar to
+move the window. The mouse wheel scrolls by a page.
+
+LixinOS resolves IPv4 hostnames through QEMU user networking's DNS server.
+The browser uses BearSSL with TLS 1.2, SNI, certificate chain and hostname
+verification, the QEMU RTC for validity dates, and virtio-rng for entropy.
+The build embeds the public roots from Homebrew's CA bundle when available,
+falling back to `/etc/ssl/cert.pem`. Rebuild after updating the bundle.
+The HTML body limit is **10 MiB** (10,485,760 bytes). The browser applies this limit to both local and network documents.
+Both interfaces lay out UTF-8 Chinese text with full-width characters and
+line wrapping. Serial mode emits UTF-8 for the terminal on the Mac. The
+graphical browser carries its own font for common simplified and traditional
+Han characters and Chinese punctuation.
+
+Graphical pages display inline PNG, JPEG and GIF images (first frame). Images
+keep their aspect ratio and fit the viewport. Each page can retain up to 32
+images with a combined limit of 4,194,304 decoded pixels. Text mode uses alt text.
+
+Classic inline and external JavaScript runs inside LixinOS using Duktape 2.7.
+Each scripted page gets a Domino 2.1.6 document and a Duktape context with a
+24 MiB allocation limit. Scripts can query, create and modify DOM nodes,
+listen for clicks, and update the page during DOMContentLoaded or load.
+The renderer redraws the resulting document after callbacks. Dynamically
+inserted classic scripts can load from the page's own HTTP origin. The foreground event loop runs `setTimeout`, `setInterval` and their
+cancellation functions. A same-origin `fetch(url)` issues a GET and returns a
+promise with `status`, `ok`, `text()` and `json()`. Responses for scripts are
+limited to 1 MiB. The transport processes one request at a time. Leaving the
+document discards pending callbacks. Search fields submit GET forms. HTTP and
+JavaScript share a host-scoped, in-memory cookie jar for the browser session.
+JavaScript modules, full CSS, POST forms and TLS 1.3 remain unsupported.
+
+Run `python3 scripts/test-links.py --online` to test local HTML, HTTP,
+public DNS and HTTPS, and rejection of an untrusted certificate on a disposable
+disk. Run `python3 scripts/test-links-window.py` to exercise the desktop
+browser with QEMU mouse events. Run `python3 scripts/test-links-pages.py` for
+the exact 10 MiB boundary and script execution tests, and
+`python3 scripts/test-links-window.py --pages` for image and Chinese glyph checks.
+Run `python3 scripts/test-links-window.py --events` to click a button with the
+QEMU mouse and check the server's JSON value in the repainted document.
+For a live Google compatibility check, run `python3 scripts/test-links.py --google`.
+The graphical guest currently displays the Google home page and accepts a query.
+Google returns its JavaScript compatibility page after submission. The live
+check requires a visible IANA result and currently fails at that step.
+
+In the QEMU console or a desktop terminal, place the pointer over the text and
+use the mouse wheel to review output. Each notch moves three rows. Each terminal
+retains up to 1,024 rows and returns to live output when it receives new text.
+In split mode the wheel acts within the focused pane.
 
 ### Desktop
 
@@ -24,23 +112,45 @@ Type `desktop` in a QEMU window. Click **文件** to browse the guest disk, a
 folder to enter it, or **上一级** to return to its parent. The arrows and mouse
 wheel page through longer listings.
 
-Click a text file to edit it in Nano. To create a file, click **文本编辑器**,
-type its path and press Enter. **Ctrl+O** saves and **Ctrl+X** returns to the desktop.
+Click a text file to edit it, or click **文本编辑器**, type a path and press Enter
+to create one. Click in the document to place the caret and use the arrow keys
+to move it. Drag across text to select, including across lines. **Ctrl+C** copies,
+**Ctrl+X** cuts, and **Ctrl+V** pastes from the guest clipboard. Typing replaces
+the selection. **Ctrl+A** selects the document, **Ctrl+S** saves and **Ctrl+Q**
+returns to the desktop. You can also click the actions along the bottom of the editor. The shell command `nano` retains its console shortcuts.
 
 Click **终端** for a new window running the guest's `/bin/bash`. At a shell
-prompt, click **[-] Desktop** or press **Ctrl+]** to put the window aside.
+prompt, click the **−** button next to **×** or press **Ctrl+]** to put the window aside.
 Use the desktop's **<** and **>** buttons to select a saved shell, then click
 **Shell** to restore its screen, working directory and unfinished command.
 Each window runs in the foreground. Type `exit` to close its shell.
 **Esc** leaves the desktop and asks for a second press if sessions are still open.
 
+#### Desktop window conventions
+
+- Every application window has a 44-logical-pixel title bar and a **×** button in the upper right. The file browser shows the directory it is displaying. The editor and terminal show the application name.
+- Hold the left mouse button on the title bar and drag to move the entire window. Releasing the button leaves it in place. Window edges stay within the desktop, including in split mode. Title-bar buttons handle clicks separately from dragging.
+- **×** closes the foreground window. The file browser returns to the desktop. The editor offers **Y** to save, **N** to discard, or **Esc** to continue editing when there are unsaved changes. The filename dialog can also be dragged or closed.
+- In a terminal, **×** ends that shell session along with its foreground command. The separate **−** button keeps the session, its position and its contents for later.
+
 Run `python3 scripts/test-desktop.py` (or add `--split`) for the QEMU test.
 
 ### Side-by-side terminals
 
-Run `./scripts/run-kernel.sh --split` for two 52-column terminals in one native QEMU window. Press **Control–Tab** to pause the focused pane and resume the other, including inside Python, nano, htop and compiled C programs. Each pane remembers its working directory, variables, command draft and history navigation. Both use the same mounted filesystem. The status bar identifies the active pane. Only the focused pane executes. Each has its own kernel stack and 4 MiB user-program region. A 50 Hz ARM virtual timer checks for switching even in user code that never calls the kernel. Kernel operations switch at safe input or wait points. Both panes share the disk and guest uptime. Run `python3 scripts/test-panes.py` to verify pause/resume on a temporary disk.
+Run `./scripts/run-kernel.sh --split` for two 68-column terminals in one 3014 × 1408 native QEMU window. Press **Control–Tab** to change keyboard focus. Both panes keep running and share the mounted filesystem. A 50 Hz virtual timer preempts EL0 code, including compute loops. Each scheduled process has its own PID, page tables and kernel stack. Bash accepts a trailing `&` to start an external command or pipeline in the background, for example `tcc hello.c -o hello &`. An external pipeline uses a 4 KiB pipe between each pair of stages. Writers wait for space and readers wait for data or EOF. `scripts/test-panes.py` exercises simultaneous editing, compilation and a TCP job that survives closing its launching shell. `scripts/test-jobs.py` exercises process isolation, memory reclamation and pipe backpressure on a disposable disk.
 
 ### Other console modes
+
+In a QEMU window, drag across visible terminal text and press
+**Ctrl+Shift+C** to copy it to the Mac clipboard. Press **Ctrl+Shift+V**
+to paste Mac clipboard text into the focused LixinOS console, including
+desktop terminal popups. The console supports up to 4 KiB of plain ASCII
+per paste. Nano and Kilo preserve tabs and newlines. At the shell, line
+breaks and tabs become spaces so pasted commands stay in the edit buffer
+until you press Return.
+
+In macOS Terminal, including SSH sessions, use the terminal app's usual
+**Command+C** and **Command+V** shortcuts.
 
 Run `./scripts/run-kernel.sh --terminal` for a macOS Terminal window with adjustable font size, or `./scripts/run-kernel.sh --serial` to use the calling terminal. These modes use the guest's PL011 serial port. All console modes use the same persistent disk.
 
@@ -143,14 +253,35 @@ The password prompt disables local echo. Type `exit` in the remote shell to
 return, or enter `~.` at the beginning of a line to disconnect locally.
 
 The disk-resident `/bin/ssh` runs Sunset 0.6.0 at EL0 using the guest TCP stack.
+It requests an `xterm` PTY with the current guest console dimensions. The
+graphical console handles cursor visibility and alternate screens for
+terminal applications such as curses dashboards.
 QEMU provides host OS randomness through a separate virtio-rng device. The port
 and its locked dependency manifest are under `/src/ssh`. Run
 `python3 scripts/test-ssh-out.py` on the Mac to exercise authentication,
 interactive terminal I/O, reboot persistence and host-key rejection in QEMU.
 
+#### GPU20 through a Mac jump host
+
+On an enrolled disk, type `ssh gpu20` at the LixinOS prompt. The guest SSH
+client verifies the final server’s pinned Ed25519 host key and signs in with
+the guest’s dedicated Ed25519 identity. The QEMU-only endpoint
+`10.0.2.100:22` starts a byte forwarder on demand. It uses the destination
+and single ProxyJump from the Mac’s `ssh -G gpu20` configuration. The jump
+host must already be trusted by OpenSSH and accessible in batch mode.
+
+For a new disk, run `ssh --public-key gpu20` inside the guest to create the
+identity and print its public key. Enroll that public key in the intended
+remote account’s `~/.ssh/authorized_keys`. Save the remote username and the
+independently verified Ed25519 host fingerprint as one space-separated line
+in the guest file `/.ssh-gpu20`. The guest refuses a mismatched host key.
+The disk contains the private seed at `/.ssh-gpu20-key`. Anyone with access
+to the disk or its guest filesystem can read it. To revoke this disk’s
+access, remove its public key from the remote account.
+
 ### Shell and disk
 
-The launcher creates a sparse raw disk (128 MiB + 65 KiB + one 512-byte layout header) at `data/lixinos.img` on first use. Every successful file or directory change is committed to this disk before the next prompt. Launch again with the same image to resume. Stop the running VM before switching modes with the same disk. Set `LIXINOS_DISK` to an absolute path to select another image. Shell variables and the working directory reset on boot. For example:
+The launcher creates a sparse raw disk (384 MiB + 65 KiB + one 512-byte layout header) at `data/lixinos.img` on first use. Every successful file or directory change is committed to this disk before the next prompt. Launch again with the same image to resume. Stop the running VM before switching modes with the same disk. Set `LIXINOS_DISK` to an absolute path to select another image. Shell variables and the working directory reset on boot. For example:
 
 ```sh
 mkdir demo
@@ -166,15 +297,65 @@ The final command prints `1`. At the shell prompt, press Up or Down to browse th
 
 Press Tab to complete a command at the start of a line or a path in an argument. Directory matches end in `/`. For ambiguous names, Tab fills the shared prefix and a second Tab lists the choices.
 
-The shell accepts ASCII input, single and double quotes, backslash escapes, simple variable assignments and `$name` expansion, buffered pipelines, and file redirection. LixinOS Bash is the default interactive shell, written in C and running at EL0 from `/bin/bash`. The stock `/bin/sh` entry follows `/bin/bash`. It owns aliases, variables, PATH lookup, redirection and pipeline sequencing. Edit `/src/bash/bash.c` and rebuild in the guest with `tcc /src/bash/bash.c -o /bin/bash`. Start another shell with `sh` and use `exit` to resume its parent. Enter `q` followed by Return to invoke the shutdown alias. External Linux programs, Bash scripts with control flow, wildcard expansion, and job control are outside this version's scope. Each command line fits 512 bytes and each file fits 1 MiB.
+The shell accepts ASCII input, single and double quotes, backslash escapes, simple variable assignments and `$name` expansion, buffered pipelines, and file redirection. LixinOS Bash is the default interactive shell, written in C and running at EL0 from `/bin/bash`. The stock `/bin/sh` entry follows `/bin/bash`. It owns aliases, variables, PATH lookup, redirection and pipeline sequencing. Edit `/src/bash/bash.c` and rebuild in the guest with `tcc /src/bash/bash.c -o /bin/bash`. Start another shell with `sh` and use `exit` to resume its parent. Enter `q` followed by Return to invoke the shutdown alias. External Linux programs, Bash scripts with control flow, wildcard expansion, and job control are outside this version's scope. Each command line fits 512 bytes and each file fits 100 MiB.
 
-`ls` defaults to the `ls -lh` layout with type, a size in B or KiB, and name. Use `ls -1` for names only, `ls -l` for sizes in bytes, and `ls -a` to include dot-prefixed names and the directory entries `.` and `..`. Directories show type `d` and a dash in the size column. Interactive listings show directories in cyan and regular files in the default text color. Pipes and redirected listings use plain text.
+`ls` displays names in columns sized to the terminal. Use `ls -1` for one name per line, `ls -l` for details with sizes in bytes, and `ls -lh` for details with sizes in B or KiB. Add `-a` to include dot-prefixed names and the directory entries `.` and `..`. Detailed listings include the UTC modification time and show directories with type `d` and a dash for size. Interactive listings show directories in cyan and regular files in the default text color. Pipes and redirected listings default to one name per line in plain text.
+
+`stat PATH` shows creation and modification times. Writes and `touch` update
+the modification time at one-second resolution. Renaming preserves both
+timestamps. Directories update their modification time when children are
+created, removed, or renamed. Python exposes the modification time as
+`os.stat(path)[8]`. Entries carried over from older snapshots display a dash
+for unknown times. The kernel reads older snapshots and writes timestamps in
+`LIXINFS3` snapshots on the same disk image.
+
+### Everyday commands
+
+| Task | Examples |
+| --- | --- |
+| Copy, move and remove | `cp notes.txt copy.txt`, `cp -r src backup`, `mv old new`, `rm -r backup`, `rmdir empty` |
+| Create files and directories | `mkdir -p work/src`, `touch a.txt b.txt` |
+| Find files and inspect directories | `find work -maxdepth 3 -name '*.txt' -type f`, `tree -L 2 work`, `stat notes.txt`, `du -sb work` |
+| Search and read text | `grep -rn word work`, `head -n 5 notes.txt`, `tail -n 5 notes.txt`, `sed -n '10,20p' notes.txt`, `nl notes.txt` |
+| Compare and transform | `cmp -s old.txt new.txt`, `diff -u old.txt new.txt`, `sed 's/before/after/g' old.txt > new.txt`, `cut -d , -f 2 table.csv`, `tr a-z A-Z < notes.txt` |
+| Combine text tools | `sort names.txt | uniq -c | tee counts.txt`, `wc -lwc counts.txt` |
+| Run a command on matching files | `find work -name '*.txt' -type f -print0 | xargs -0 -n 8 wc -l` |
+| Prepare and check arguments | `test -f notes.txt`, `printf '%s=%d\n' total 42`, `seq 1 3`, `basename work/a.txt`, `dirname work/a.txt` |
+| Inspect the guest | `cpuinfo` samples guest CPU usage, `ps` lists guest tasks, `df` reports committed filesystem bytes, and `sysinfo` reports the guest identity and memory |
+| Work in Bash | `history`, `command -v python`, `type cd`, `unset NAME`, `cd -`, `exit 0` |
+
+`cp -n` and `mv -n` preserve an existing destination. Directory copies
+require `cp -r` and a new target directory. `grep` searches for literal
+text and skips files containing NUL bytes during recursive searches.
+Use `grep -rl` for matching filenames and `grep -rc` for per-file counts.
+`find -name` supports quoted `*` and `?` patterns. Pair `-print0` with
+`xargs -0` for filenames containing spaces. Use `xargs` with commands that
+take their inputs as arguments, since its child inherits stdin. `du`
+totals file contents in bytes. `diff -u` emits one whole-file hunk per
+changed text file. `sed` supports literal substitutions and line ranges.
+Use `help` in the guest for the command list.
+
+Agent chat can invoke these commands with `exec` and separate arguments.
+For a pipeline or redirection, it can run `bash -c` with the command
+line. Commands outside Agent chat's automatic allowlist require approval.
+To rebuild a shared core command in the guest, bootstrap the command-line
+compiler with `tcc /src/tinycc/bootstrap.c -o ./tcc-new`, then run
+`./tcc-new -DAPP=grep /src/core/commands.c -o ./grep`. For `xargs`,
+use `tcc /src/core/xargs.c -o ./xargs`.
+
+The stock `cp`, `mv`, `rm`, `mkdir`, `rmdir`, and `touch` are user-space
+LXE1 programs. LixinOS compiles them with its own TCC and installs them in
+`/bin` when absent or when upgrading an old stock launcher. Rebuild any of
+them from its `/src/core` entry point, for example
+`tcc /src/core/cp.c -o /bin/cp`. The six entry points share
+`/src/core/files.c`. File operations publish a batch in one filesystem
+snapshot, including `touch --files-from` and recursive changes.
 
 ### Edit a file
 
 At the guest shell, type `nano hello.py` to open an existing file or start a new one. Type your script directly, using Return for new lines and Tab for indentation. Press **Ctrl+O** to write the named file, then **Ctrl+X** to return to the shell and run `python hello.py`. Exiting with unsaved changes offers Save (Y), Discard (N), or Cancel (Esc).
 
-Use the arrow keys to move, Home/End for line boundaries, and Backspace/Delete to remove text. **Ctrl+K** cuts the current line and **Ctrl+U** pastes it at the cursor. The editor scrolls vertically and horizontally and accepts ASCII input. Each saved file uses the persistent disk. Both editors accept files up to the 1 MiB filesystem limit.
+Use the arrow keys to move, Home/End for line boundaries, and Backspace/Delete to remove text. **Ctrl+K** cuts the current line and **Ctrl+U** pastes it at the cursor. The editor scrolls vertically and horizontally and accepts ASCII input. Each saved file uses the persistent disk. Both editors accept documents up to 1 MiB.
 
 Open `kilo main.c` for C/C++ syntax highlighting. **Ctrl+F** starts incremental
 search, the arrow keys step through matching lines, Enter accepts a match and
@@ -187,7 +368,7 @@ and is released when the editor exits.
 
 Type `htop` at the guest prompt for a live dashboard. It refreshes once per second. Press `q` to return to the shell. In the QEMU window the last dashboard frame stays in the terminal history. Uptime comes from the ARM virtual counter. Heap usage comes from the allocator. File counts include empty files, directory counts include the root, and content bytes exclude filesystem metadata.
 
-The launcher assigns one vCPU and 512 MiB of RAM. The kernel uses a 128 KiB boot stack and a first-fit heap above the kernel and user banks. Split mode reserves a separate 128 KiB kernel stack for the right pane. Its page tables reserve 4 MiB of guest RAM per terminal for its foreground user program, with separate read/execute and read/write mappings. The kernel loads validated images and suspends a calling process while its child runs. The filesystem tree and file contents occupy heap memory while mounted. The kernel alternates between two checksummed disk snapshots, flushing the payload before publishing its header. On boot it loads the newest valid snapshot. The current limits are 1,048,576 entries including the root and 1 MiB per file. A snapshot has 64 MiB minus its 512-byte header for all names, contents and version history together. The two 64 MiB slots follow the layout header. A separate 65 KiB ring at the end keeps the latest 64 shell commands. On first launch with an older disk, the launcher copies valid snapshots and history to a temporary image and atomically replaces the old image after verification. Use `touch --files-from names.txt` to create a batch of files with one path per line and one snapshot commit.
+The launcher assigns one vCPU and 512 MiB of RAM. The boot stack is 128 KiB. Up to 16 tasks, including the login shells, share the CPU. The kernel allocates a 128 KiB stack and private translation tables for each new task, and backs each EL0 image with 4 MiB of heap memory on launch. Code is executable and read-only, data is writable and non-executable. Additional user arenas grow in 2 MiB blocks. A synchronous caller waits for its child while other runnable tasks take turns. Exiting releases image memory, and the next continuation reclaims the stack and page tables. A joinable child's PID and exit status remain until collected. The filesystem tree and file contents occupy heap memory while mounted. The kernel alternates between two checksummed disk snapshots, flushing the payload before publishing its header. On boot it loads the newest valid snapshot. The current limits are 1,048,576 entries including the root and 100 MiB per file. A snapshot has 192 MiB minus its 512-byte header for all names, contents, timestamps and version history together. The two 192 MiB slots follow the layout header. A separate 65 KiB ring at the end keeps the latest 64 shell commands. On first launch with an older disk, the launcher copies valid snapshots and history to a temporary image and atomically replaces the old image after verification. Use `touch --files-from names.txt` to create a batch of files with one path per line and one snapshot commit.
 
 ### Run a C program or MicroPython
 
@@ -216,6 +397,18 @@ python hello.py
 
 This prints `Hello 0`, `Hello 1`, and `Hello 2`. Restart QEMU with the same disk and run `python hello.py` again. The shell resolves the path in the guest filesystem and copies the saved source into the foreground program’s memory. Script execution returns to the shell on completion or an uncaught exception. Bare `python` still opens the interactive prompt.
 
+Normal guest Python provides `os` (also `uos`), `sys`, `random`,
+`time`, and `io`. Use `open()` or `io.open()` for sequential text or
+binary file I/O in read, write, or append mode. Paths resolve from the
+process working directory. `os` includes `getcwd`, `chdir`, `listdir`,
+`stat`, `mkdir`, `remove`, `rmdir`, `uname`, and `urandom`.
+The guest RTC provides wall time at one-second resolution.
+
+`python -c 'print(42)'` runs inline code. `os.system(command)` runs one
+LixinOS Bash command in the guest and returns its exit code. For example,
+`os.system("echo hello | cat > hello.txt")` writes to the guest disk.
+The Agent's isolated test runner blocks filesystem and command calls.
+
 Cargo builds both C images before embedding them. The first build needs Git, Make, Python 3 and network access to fetch the pinned MicroPython source and, on Apple Silicon, Arm's checksummed bare-metal GNU toolchain. Sources, toolchain and build products are cached under `Kernel/target/user-build/`. An existing `aarch64-none-elf-gcc` with newlib on PATH can also be used. Run `python3 scripts/test-user.py` to exercise the serial interface on a temporary disk.
 
 ### Compile and run Rust inside LixinOS
@@ -228,6 +421,29 @@ lust build /src/lust/hello.rs -o hello
 ```
 
 The example prints `Hello from LixinOS Rust: 42`. For your own program, use `nano demo.rs`, save it, then run `lust build demo.rs -o demo` and `./demo`. Supported language features, executable limits and host package details are in [the port notes](User/lust/README.md).
+
+The guest-native system rebuild and its remaining host dependencies are
+described in [the system build guide](User/build/README.md). Run
+`python3 scripts/test-native-build.py --save-disk /absolute/path/native.img`
+to build in a new guest disk and check its programs across reboot. To boot
+a matching, already built kernel, set `LIXINOS_KERNEL` to its absolute path
+when invoking the launcher.
+
+### Bootstrap TinyCC inside LixinOS
+
+At the guest prompt, build two generations of TinyCC and try the shell built
+by the second generation:
+
+```sh
+tcc /src/tinycc/bootstrap.c -o tcc-new
+./tcc-new /src/tinycc/bootstrap.c -o tcc-second
+./tcc-second /src/bash/bash.c -o bash-new
+./bash-new --version
+```
+
+The [guest build notes](User/tinycc/README.md) describe the native source
+tree and multi-file builds. Run `python3 scripts/test-tcc-bootstrap.py` for
+the clean-disk bootstrap and reboot test.
 
 ### Compile and run C inside LixinOS
 
@@ -251,9 +467,10 @@ tcc hello.c -o hello
 ./hello
 ```
 
-Saved C and Rust programs use LXE1 and can fill a 1 MiB file including the
-16-byte header. The fixed ARM64 memory layout allows up to 512 KiB of code
-and 860 KiB of data (including zero-initialized storage) within that total.
+Saved C and Rust programs use LXE1 and can fill a 1 MiB file including
+the 16-byte header. The ARM64 layout allows up to 512 KiB of code and 860 KiB
+of data, including zero-initialized storage, within that total. Rebuild
+programs saved in the experimental LXE2 format from their source.
 TinyCC's in-memory `-run` mode has a separate 256 KiB code buffer. Failed builds preserve the previous executable.
 The guest supplies a small `<stdio.h>` with `getchar`, `putchar`, `puts`,
 `printf`, `fprintf`, and read-only `fopen`, `fread`, and `fclose`.
@@ -293,6 +510,33 @@ cat listing.txt
 ```
 
 Restart with the same disk to use the saved executable and source again.
+
+### Build a graphical app in LixinOS
+
+From the main shell in a QEMU window, compile both examples in the guest.
+
+```sh
+tcc /src/gui/calculator.c -o /bin/calculator
+tcc /src/gui/text-editor.c -o /bin/text-editor
+desktop
+```
+
+Click **Calculator** or **Editor** on the desktop. You can also start a
+saved LXE1 app with an `.app` filename by clicking it in the desktop file browser. Apps use
+the foreground pane and return to the desktop on close. Saved programs and
+documents persist when you restart with the same disk.
+
+Calculator accepts mouse and keyboard input. Text Editor opens
+`/notes.txt` from the desktop or a path you pass with `text-editor path`
+in the main shell. Use **Save** or **Ctrl+S** to save and **Esc** to close.
+It edits up to 32 KiB of ASCII text with LF line endings and confirms before
+discarding unsaved edits.
+
+Use `<lixin-gui.h>` for canvas drawing, text, buttons and pointer input.
+Use `<lixin.h>` for `lx_save_file` and other file operations. Run
+`python3 scripts/test-desktop-apps.py` on the Mac to exercise both apps across
+two boots on a disposable disk.
+
 The guest mirrors project-owned user program sources and build inputs under
 `/src`. Run `cat /src/README.md` for the guest rebuild commands for `ls`,
 `cecho`, and `agent-run`. Existing source files keep their edits. When migrating
@@ -322,11 +566,18 @@ python double.py
 
 The Agent gets up to three test cases before requesting code. It runs each candidate in a fresh MicroPython instance at EL0, feeds the same test inputs on every attempt, and compares captured output and exit status. It sends a failed test's diagnostic back with the next request and tries up to three candidates. Tests cap captured output at 2 KiB and check a two-second deadline at MicroPython VM polling points and console calls. A passing script is committed to the guest disk and can be run after reboot, including when the bridge is offline. The output path must be new.
 
-The Mac bridge sends the task, test cases, and any repair diagnostics to DeepSeek over HTTPS. The API key is read on the Mac. The default model is `deepseek-flash`, which you can override with `DEEPSEEK_MODEL`. The first version generates standalone MicroPython scripts using built-ins such as `input()` and `print()`. The guest's Python runtime has no filesystem or network APIs.
+The Mac bridge sends the task, test cases, and any repair diagnostics to DeepSeek over HTTPS. The API key is read on the Mac. The default model is `deepseek-flash`, which you can override with `DEEPSEEK_MODEL`. The script-generation workflow uses isolated, deterministic MicroPython tests with built-ins such as `input()` and `print()`.
 
 Run `PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-agent.py` for the QEMU integration test with deterministic DeepSeek responses and a temporary guest disk.
 
 ### Inspect LixinOS with the Agent
+
+The boot banner and `uname -r` show the running kernel release, including its
+`-rust` or `-tcc` suffix. `uname -a` and `cat /proc/version` also show the
+system name and architecture. `sysinfo`
+prints identity, memory, and disk information from the running guest.
+Agent inspection can query the same OS identity with its `system` tool.
+The Agent's platform guide is also available at `/src/agent/README.md`.
 
 With the model bridge enabled, ask a question at the LixinOS prompt.
 
@@ -335,9 +586,30 @@ agent inspect 'Report the guest CPU, RAM, disk, and filesystem usage.'
 agent inspect 'List the files in the current directory and report their sizes.'
 ```
 
-The Agent chooses up to six read-only queries. CPU count and RAM capacity come from the QEMU boot device tree. Heap usage comes from the allocator, and disk capacity and snapshot generation come from the mounted VirtIO disk. The filesystem queries report counts, limits, filenames, types and sizes. Relative paths resolve from the current directory. The busy percentage is an estimate from the graphical status bar when a sample is available. Total free physical RAM is unavailable.
+The Agent chooses up to six read-only queries. CPU count and RAM capacity come from the QEMU boot device tree. Heap usage comes from the allocator, and disk capacity and snapshot generation come from the mounted VirtIO disk. The filesystem queries report counts, limits, filenames, types and sizes. Relative paths resolve from the current directory. The CPU query samples the guest over a 250 ms interval and excludes scheduler idle waits. The `cpuinfo` shell command reports the same measurements in serial and graphical sessions. Total free physical RAM is unavailable.
 
 The Mac bridge forwards the question and requested observations to DeepSeek. Inspection sends file metadata when requested, with file contents excluded. It leaves the guest disk and command history unchanged.
+
+### Read system data from /proc
+
+LixinOS exposes a read-only subset of `/proc` through its file API. Use
+`ls /proc`, `cat /proc/stat`, or MicroPython's `open('/proc/meminfo')`.
+Every open captures a fresh snapshot. Generated files report size zero and
+read normally through EOF. The volume's filesystem counts cover persistent
+entries. If a disk already contains a real `/proc` entry, LixinOS preserves
+it and uses that entry.
+
+| File | Data |
+| --- | --- |
+| `/proc/stat` | `cpu` and `cpu0` counters in hundredths of a second. The system column aggregates busy time and the idle column counts scheduler waits. The other columns are zero. |
+| `/proc/cpuinfo` | Scheduler CPU 0 and LixinOS architecture. |
+| `/proc/meminfo` | Guest RAM and free allocator memory in KiB, printed as `kB` for parsers. |
+| `/proc/uptime` | Seconds since the scheduler started and cumulative idle seconds. |
+| `/proc/version` | LixinOS release and architecture. |
+
+Use `cpuinfo` for a sampled utilization percentage and `ps` for process
+details. The CPU counter layout follows the
+[Linux kernel proc documentation](https://docs.kernel.org/filesystems/proc.html).
 
 ### Improve and roll back a saved script
 
@@ -403,7 +675,76 @@ agent system 'Create /src/system-demo.c and use TCC to stage /bin/system-demo. I
 agent system-rollback
 ```
 
+### Chat with the Agent
+
+Start a foreground session with `agent chat /work` or run `agent chat`
+from inside a project directory. Enter a task at `agent>`. The session
+keeps context from the last eight turns until you leave with `/exit` or
+**Ctrl+D**. Type `/prompt` to display the system message sent to the model.
+Use the Up and Down arrow keys to recall recent prompts and slash commands
+from this session. Down past the newest entry returns to your draft.
+The header shows the workspace, bypass mode, and tool budget. Type `/help`
+to see controls. A temporary indicator appears while a model reply is pending.
+
+Type `/export` at `agent>` to save the current conversation in the guest
+project directory as `agent-conversation.txt`. Later exports use numbered
+filenames. Use `/export my-chat.txt` to choose a new filename. The transcript
+includes prompts, replies, tool results available to the Agent, and whether
+staged changes were saved. Older turns are included up to the 1 MiB file
+limit. You can continue chatting after exporting.
+
+The Agent can run installed guest programs such as `git`, `tcc`, and
+your own LXE1 executables. Bare names resolve in `/bin`, and a path such
+as `./demo` resolves from the project directory. The terminal shows the
+step number, working directory and command arguments on one line, followed
+by the first three lines of live output and any nonzero exit status.
+Command lines appear in cyan and Agent replies in lilac. Approval prompts
+are amber, and verified deliveries show separate checks and launch fields.
+Programs use the normal terminal color and can style their own output.
+Transcripts include all command exit statuses. Source reads, multiline
+arguments and staged changes also show up to three lines by default.
+At a confirmation prompt, use `v` to
+expand the command or review preview. The model still receives its usual
+bounded tool results.
+For pipelines and redirection, the Agent can call guest `bash -c` with
+one command line. For small one-off programs, it can call guest
+`python -c` with the source as an argument.
+
+Foreground chat starts with bypass on and announces it before the first
+prompt. Noninteractive commands use normal guest filesystem permissions
+and can write immediately. Type `/bypass` to toggle auto-approval for the
+current session. With bypass off, recognized read-only calls to stock
+commands can run directly. Other commands ask for approval. Project script
+tools stage changes, test them and ask before saving.
+For an interactive program such as an editor or an SSH session, the Agent
+asks before handing you the terminal. The chat resumes with the program's
+exit status. If an identical command already failed in the same turn, the
+Agent gets its previous error until the workspace changes or you send a
+follow-up.
+
+Tool results carry a status and an exit code when available. For example,
+`requires_terminal` asks the Agent to hand the terminal to the operator,
+and `staged` means a file is awaiting review. The `apply` tool asks for
+approval, commits passing staged scripts, and returns control to the Agent.
+
+For delivery, the Agent can run an exact-output `test` or a `smoke` check
+with scripted input and an expected output marker on a saved Python file.
+The `verify` tool reads the file back from the mounted disk. A final receipt
+shows the path, disk snapshot, check totals, and launch command when supplied.
+Interactive checks are marked pending until a scripted check passes.
+The transcript also records auto-approvals and model bridge errors.
+
+**Ctrl+P** adds a follow-up while waiting for the model or a staged test.
+**Ctrl+C** or **Ctrl+G** cancels a turn or interrupts a noninteractive
+command. Noninteractive user code has a 60-second deadline. After terminal
+handoff, use the application's own exit controls. The Mac bridge still
+relays model requests.
+
 ### Local Git repositories
+
+Run `cat /src/git/README.md` for the guest Git workflow and supported
+commands. Inspection and project sessions, including `agent system`, load
+the guest copy when they start and provide it to the model as reference data.
 
 LixinOS runs an ARM64 C client linked with libgit2 1.9.1 in the foreground user slot.
 Create a project directory and use these commands from the guest shell.

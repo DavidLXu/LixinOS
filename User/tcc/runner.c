@@ -41,7 +41,9 @@ unsigned lx_start_flags(void) { return startup_flags; }
 asm(".section .lxstdio,\"ax\"\n"
 #define BRANCH_TO(symbol) "b " #symbol "\n"
 #define SLOT(name, impl) BRANCH_TO(impl)
+#define LIBC(name) BRANCH_TO(name)
 #include "slots.def"
+#undef LIBC
 #undef SLOT
 #undef BRANCH_TO
     ".previous");

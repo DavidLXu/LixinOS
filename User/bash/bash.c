@@ -1,6 +1,7 @@
 // LixinOS Bash. Build inside LixinOS: tcc /src/bash/bash.c -o /bin/bash
 #include <stdio.h>
 #include <lixin.h>
+long lx_console_call(long operation, long value);
 
 typedef unsigned long Size;
 Size strlen(const char *);
@@ -19,8 +20,8 @@ void qsort(void *, Size, Size, int (*)(const void *, const void *));
 
 enum { STAT, HISTORY_GET, READ_DIRECTORY, HISTORY_APPEND, SPAWN_BEGIN, SPAWN_ARG,
        UNUSED, CHILD_STATUS, READ_STREAM, CLEAR_STREAM, APPEND_STREAM, STORE_STREAM,
-       RESERVED, LAST_ERROR, CHDIR, PANE_READY, NEXT_TERMINAL, CLOSE_TERMINAL };
-enum { WORD, PIPE, READ, WRITE, APPEND };
+       RESERVED, LAST_ERROR, CHDIR, PANE_READY, NEXT_TERMINAL, CLOSE_TERMINAL, START_JOB, WAIT_JOB, RESET_PIPE, JOB_OUTPUT, JOB_INPUT };
+enum { WORD, PIPE, READ, WRITE, APPEND, BACKGROUND };
 #define LINE 512
 #define WORD_MAX 4096
 #define MAIL ((char *)0x443d8000)
@@ -33,7 +34,7 @@ typedef struct { Token items[LINE+3]; int count; } Tokens;
 typedef struct { char *name, *value; } Variable;
 typedef struct Session {
     int id, status, vars, histories, position, repeated_tab, skip_lf;
-    char cwd[LINE+1], line[LINE+1], draft[LINE+1];
+    char cwd[LINE+1], previous_cwd[LINE+1], line[LINE+1], draft[LINE+1];
     Variable variables[64];
     char *history[64];
     struct Session *next;
@@ -44,6 +45,13 @@ typedef struct Terminal {
     struct Terminal *next;
 } Terminal;
 
+static const char help[]=
+    "Shell: cd command exit help history shell type unset\n"
+    "Files: basename cat cp dirname find ls mkdir mv pwd rm rmdir stat touch tree\n"
+    "Text: cmp cut diff echo grep head nl printf sed seq sort tail tee test tr uniq wc xargs\n"
+    "System: clear cpuinfo date df du false htop netinfo ps sleep sysinfo true uname\n"
+    "Apps: agent bash cecho desktop git kilo links lust nano paint python sh ssh tcc\n"
+    "Power: q shutdown\n";
 static const char shell_identity[] = "LixinOS Bash (C shell)";
 static char error[256];
 static int fail(const char *message) {
@@ -60,6 +68,10 @@ static int prefix(const char *s, const char *p) { return strncmp(s,p,strlen(p))=
 static int digit(int c) { return c>='0' && c<='9'; }
 static int namechar(int c) {
     return digit(c) || c=='_' || (c>='A' && c<='Z') || (c>='a' && c<='z');
+}
+static int shell_builtin(const char *name) {
+    return equal(name,"history") || equal(name,"type") || equal(name,"command")
+        || equal(name,"unset") || equal(name,"exit");
 }
 static int request(int op, unsigned index, const char *s) {
     Size n=strlen(s);
@@ -138,8 +150,9 @@ static int lex(Session *s,const char *line,Tokens *t,int cursor,int *open_quote)
     int n=0, started=0, quote=0;
     while (*line) {
         int c=*line++;
-        if (!quote && (c==' ' || c=='\t' || strchr("|<>",c))) {
+        if (!quote && (c==' ' || c=='\t' || strchr("|<>&",c))) {
             if (started) { word[n]=0; token(t,WORD,word); n=started=0; }
+            if (c=='&') token(t,BACKGROUND,0);
             if (c=='|') token(t,PIPE,0);
             if (c=='<') token(t,READ,0);
             if (c=='>') {
@@ -234,15 +247,116 @@ static int parse_stage(Tokens *t,int start,int end,Stage *st) {
     }
     return st->argc ? 0 : fail("missing command");
 }
+static int run_jobs(Session *s,Tokens *t,int background) {
+    Stage st;
+    int jobs[LINE+1], count=0, result=0;
+    for (int start=0;start<t->count;) {
+        int end=start;
+        while (end<t->count && t->items[end].kind!=PIPE) end++;
+        if (parse_stage(t,start,end,&st)<0) {result=-1;break;}
+        char path[LINE+1],kind[64];
+        int local=equal(st.args[0],"help") || equal(st.args[0],"cd") || strchr(st.args[0],'=')!=0;
+        if (program(s,local ? "/bin/bash" : st.args[0],path,kind)<0) {result=-1;break;}
+        if (st.in && service(JOB_INPUT,0,st.in)<0) {result=-1;break;}
+        if (st.out && service(JOB_OUTPUT,st.append,st.out)<0) {result=-1;break;}
+        if (service(SPAWN_BEGIN,st.in!=0,path)<0) {result=-1;break;}
+        if (local && (service(SPAWN_ARG,0,"bash")<0 || service(SPAWN_ARG,0,"--stage-builtin")<0)) {result=-1;break;}
+        for (int i=0;i<st.argc;i++) {
+            if (service(SPAWN_ARG,0,st.args[i])<0) {result=-1;break;}
+        }
+        if (result<0) break;
+        int id=request(START_JOB,2*(end<t->count)+4*background,"");
+        if (id<0) {
+            char *why=query(LAST_ERROR,0,"");
+            result=fail(why ? why : "could not start process");
+            break;
+        }
+        jobs[count++]=id;
+        start=end+1;
+    }
+    request(RESET_PIPE,0,"");
+    if (!background) {
+        for (int i=0;i<count;i++) {
+            s->status=request(WAIT_JOB,jobs[i],"");
+            if (s->status<0 && !result) {
+                char *why=query(LAST_ERROR,0,"");
+                result=fail(why ? why : "process failed");
+            }
+        }
+    } else if (count) printf("[pid %d]\n",jobs[count-1]);
+    return result;
+}
 static int execute(Session *s,Tokens *t) {
     if (!t->count) return 0;
+    int background=t->items[t->count-1].kind==BACKGROUND;
+    if (background) t->count--;
+    if (!t->count) return fail("missing background command");
+    int concurrent=background, pipeline=0,builtin=0;
+    for (int i=0;i<t->count;i++) {
+        if (t->items[i].kind==BACKGROUND) return fail("expected & at end of command");
+        if (t->items[i].kind==PIPE) pipeline=concurrent=1;
+    }
     Stage st;
     // Validate the entire pipeline before a stage can modify the filesystem.
     for (int start=0,i=0;i<=t->count;i++) {
         if (i<t->count && t->items[i].kind!=PIPE) continue;
         if (parse_stage(t,start,i,&st)<0) return -1;
+        if (shell_builtin(st.args[0])) {
+            if (pipeline || background || st.in || st.out)
+                return fail("this shell builtin requires a standalone command");
+            const char *name=st.args[0];
+            const char *operand=st.argc>1 ? st.args[1] : 0;
+            if (equal(name,"exit")) {
+                int status=s->status;
+                if (st.argc>2) return fail("usage: exit [STATUS]");
+                if (operand) {
+                    if (!*operand) return fail("expected a numeric exit status");
+                    status=0;
+                    for (const char *p=operand; *p; ++p) {
+                        if (!digit(*p)) return fail("expected a numeric exit status");
+                        status=(10*status+(*p-'0'))%256;
+                    }
+                }
+                s->status=status;
+                return 1;
+            }
+            s->status=0;
+            if (equal(name,"history")) {
+                if (operand) return fail("usage: history");
+                for (int j=0;j<s->histories;++j) printf("%d  %s\n",j+1,s->history[j]);
+            } else if (equal(name,"unset")) {
+                if (!operand) return fail("usage: unset NAME ...");
+                for (int j=1;j<st.argc;++j) {
+                    int at=var_index(s,st.args[j]);
+                    if (at<0) continue;
+                    free(s->variables[at].name);
+                    free(s->variables[at].value);
+                    s->variables[at]=s->variables[--s->vars];
+                }
+            } else {
+                int show_path=equal(name,"command");
+                int first=show_path ? 2 : 1;
+                if (st.argc<=first || (show_path && !equal(operand,"-v")))
+                    return fail(show_path ? "usage: command -v NAME ..." : "usage: type NAME ...");
+                for (int j=first;j<st.argc;++j) {
+                    const char *target=st.args[j];
+                    char path[LINE+1],kind[64];
+                    if (shell_builtin(target) || equal(target,"cd") || equal(target,"help") || equal(target,"shell")) {
+                        if (show_path) puts(target); else printf("%s is a shell builtin\n",target);
+                    } else if (program(s,target,path,kind)<0) {
+                        printf("%s: command not found\n",target);
+                        s->status=1;
+                    } else if (show_path) puts(path);
+                    else printf("%s is %s\n",target,path);
+                }
+            }
+            return 0;
+        }
+        if (st.in || st.out) concurrent=1;
+        if (equal(st.args[0],"cd") || equal(st.args[0],"help") || strchr(st.args[0],'=')) builtin=1;
         start=i+1;
     }
+    if (pipeline || background || (concurrent && !builtin)) return run_jobs(s,t,background);
     if (service(CLEAR_STREAM,0,"")<0) return -1;
     for (int start=0;start<t->count;) {
         int end=start;
@@ -252,7 +366,6 @@ static int execute(Session *s,Tokens *t) {
         if (st.in && service(READ_STREAM,0,st.in)<0) return -1;
         if (st.out) { char *k=query(STAT,0,st.out); if (k && equal(k,"d")) return fail("is a directory"); }
         char *name=st.args[0];
-        if (equal(name,"exit") && st.argc==1 && !start && end==t->count) return 1;
         s->status=0;
         char *eq=strchr(name,'='), *slash=strchr(name,'/');
         if (eq && (!slash || slash>eq)) {
@@ -265,17 +378,27 @@ static int execute(Session *s,Tokens *t) {
             if (program(s,name,path,kind)<0) return -1;
             if (equal(kind,"@cd")) {
                 if (st.argc>2) return fail("expected one argument");
-                char *cwd=query(CHDIR,0,st.argc==2 ? st.args[1] : "/");
+                int previous=st.argc==2 && equal(st.args[1],"-");
+                if (previous && !*s->previous_cwd) return fail("no previous directory");
+                const char *target=previous ? s->previous_cwd : st.argc==2 ? st.args[1] : "/";
+                char *cwd=query(CHDIR,0,target);
                 if (!cwd) return fail("directory not found");
+                strcpy(s->previous_cwd,s->cwd);
                 strcpy(s->cwd,cwd);
+                if (previous) {
+                    if (capture) {
+                        char line[LINE+2];
+                        snprintf(line,sizeof(line),"%s\n",s->cwd);
+                        if (service(APPEND_STREAM,0,line)<0) return -1;
+                    } else puts(s->cwd);
+                }
                 if (service(CLEAR_STREAM,0,"")<0) return -1;
             } else if (equal(kind,"@help")) {
-                const char *help="agent bash cat cd cecho clear echo exit git grep help htop kilo ls lust mkdir nano paint pwd python q rm sh shell shutdown tcc touch wc\n";
                 if (service(CLEAR_STREAM,0,"")<0) return -1;
                 if (capture) { if (service(APPEND_STREAM,0,help)<0) return -1; }
                 else printf("%s",help);
             } else {
-                if ((capture || stream) && kind[0]=='@' && !equal(kind,"@touch") && !equal(kind,"@mkdir") && !equal(kind,"@rm"))
+                if ((capture || stream) && kind[0]=='@' && !equal(kind,"@touch") && !equal(kind,"@mkdir") && !equal(kind,"@rm") && !equal(kind,"@rmdir") && !equal(kind,"@cp") && !equal(kind,"@mv") && !equal(kind,"@python"))
                     return fail("this command requires a foreground terminal");
                 int status=lx_spawn_flags(path,st.argc,st.args,stream+2*capture);
                 if (status<0) { char *msg=query(LAST_ERROR,0,""); return fail(msg ? msg : "process request failed"); }
@@ -331,6 +454,9 @@ static void completion(Session *s,int list) {
     int command=begin==t.count-1;
     if (command && !slash) {
         if (prefix("shell",leaf)) add_match(&m,"shell",0);
+        const char *builtins[]={"command","history","type","unset","exit"};
+        for (unsigned i=0;i<sizeof(builtins)/sizeof(*builtins);++i)
+            if (prefix(builtins[i],leaf)) add_match(&m,builtins[i],0);
         const char *part=value(s,"PATH");
         do { char dir[LINE+1]; part=path_dir(part,dir); if (*dir) scan_dir(&m,dir,leaf,1,0,0); } while(part);
     } else {
@@ -469,9 +595,32 @@ static int command(Terminal *t) {
     return result;
 }
 int main(int argc,char **argv) {
+    if (argc>=3 && equal(argv[1],"--stage-builtin")) {
+        if (equal(argv[2],"help")) {printf("%s",help);return 0;}
+        if (equal(argv[2],"cd")) return argc>4 || !query(CHDIR,0,argc==4 ? argv[3] : "/");
+        return argc!=3 || !strchr(argv[2],'=');
+    }
     if (argc==2 && equal(argv[1],"--version")) {
         puts(shell_identity);
         return 0;
+    }
+    if (argc==3 && equal(argv[1],"-c")) {
+        if (strlen(argv[2])>LINE) {
+            lx_error("Bash command exceeds 512 bytes\n");
+            return 2;
+        }
+        char *cwd=query(CHDIR,0,".");
+        Session *s=new_session(1,cwd ? cwd : "/");
+        Tokens tokens={0};
+        int result=lex(s,argv[2],&tokens,0,0);
+        if (result>=0 && tokens.count && tokens.items[tokens.count-1].kind==BACKGROUND)
+            result=fail("background commands require an interactive shell");
+        if (result>=0) result=execute(s,&tokens);
+        clear_tokens(&tokens);
+        int status=s->status;
+        drop_session(s);
+        if (result<0) { printf("shell: %s\n",error); return 1; }
+        return status;
     }
     if (argc!=1 || !lx_stdout_is_terminal()) {
         lx_error("Bash requires an interactive terminal\n");
@@ -490,6 +639,13 @@ int main(int argc,char **argv) {
     unsigned long screen=lx_geometry();
     if ((flags&2) && (screen>>32) && (screen&65535)>=60) {
         printf("\033[2J\033[H\033[36m  L I X I N O S   SYSTEM CONSOLE\033[0m\n");
+        long length = lx_console_call(29, 2); /* uname -r */
+        if (length > 0 && length < 128) {
+            char release[128];
+            memcpy(release, (const char *)0x443d7000, length);
+            release[length] = 0;
+            printf("  Kernel %s\n", release);
+        }
         puts("  ARM64 / QEMU virt   Disk mounted\n  help  Commands     htop  System monitor     shutdown  Power off\n");
     }
     if (flags&2) puts(shell_identity);

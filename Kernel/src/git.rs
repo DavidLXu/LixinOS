@@ -77,7 +77,7 @@ impl Session {
         let result = if volume.files.len() > ENTRY_LIMIT {
             Err("filesystem full")
         } else {
-            volume.disk.save(&volume.files, &volume.versions)
+            volume.save_changes(undo.iter().map(|(path, old)| (path.as_str(), old.is_some())), &crate::disk::Times::new())
         };
         if result.is_err() {
             for (p, v) in undo {

@@ -11,11 +11,7 @@ enter_user:
     msr elr_el1, x9
     mov x9, #0x44400000
     msr sp_el0, x9
-    .if {split}
     mov x9, #0x340
-    .else
-    mov x9, #0x3c0
-    .endif
     msr spsr_el1, x9
     eret
 
@@ -28,11 +24,7 @@ user_vectors:
 .endr
     b user_sync
     .balign 128
-    .if {split}
     b user_timer_irq
-    .else
-    b kernel_vector_fault
-    .endif
     .balign 128
 .rept 6
     b kernel_vector_fault
@@ -48,7 +40,7 @@ user_sync:
     b.eq resume_shell
     cmp x8, #32
     b.eq suspend_for_child
-    cmp x8, #31
+    cmp x8, #51
     b.hi unknown_call
     // The kernel uses the soft-float target (no SIMD registers). Preserve
     // the user integer context across the shared Rust console implementation.
@@ -74,6 +66,12 @@ user_sync:
     ldp x5, x6, [sp], #16
     ldp x3, x4, [sp], #16
     ldp x1, x2, [sp], #16
+    // A closed desktop terminal unwinds the foreground process at a syscall.
+    cmn x0, #1, lsl #12
+    b.ne 1f
+    mov x0, #0
+    b resume_shell
+1:
     cmp x8, #6
     b.hs return_to_user
     cmn x0, #2
@@ -88,6 +86,10 @@ unknown_call:
     eret
 user_fault:
     mov x0, #-1
+    b resume_shell
+.global agent_timeout_exit
+agent_timeout_exit:
+    mov x0, #124
 resume_shell:
     ldp x27, x28, [sp], #16
     ldp x25, x26, [sp], #16

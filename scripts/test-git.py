@@ -76,13 +76,14 @@ def test(temp):
     # Fill the disposable disk's latest snapshot to its byte limit so that
     # creating one more blob must roll back the staged index.
     codec = runpy.run_path(str(ROOT / "scripts/export-git.py"))
-    slot = 64 << 20
+    from disk_image import SLOT
+    slot = SLOT
     with disk.open("r+b") as f:
         heads = []
         for base in (512, 512 + slot):
             f.seek(base)
             header = f.read(512)
-            if header.startswith(b"LIXINFS1"):
+            if header.startswith(b"LIXINFS3"):
                 heads.append((struct.unpack_from("<Q", header, 8)[0], base, header))
         gen, base, header = max(heads)
         f.seek(base + 512)
@@ -90,12 +91,12 @@ def test(temp):
         count, = struct.unpack_from("<I", data)
         while len(data) < slot - 512:
             name = f"/pad{count}".encode()
-            size = min(1 << 20, slot - 512 - len(data) - len(name) - 8)
+            size = min(1 << 20, slot - 512 - len(data) - len(name) - 16)
             assert size >= 0
-            data.extend(struct.pack("<II", len(name), size) + name + bytes(size))
+            data.extend(struct.pack("<IIII", len(name), size, 0, 0) + name + bytes(size))
             count += 1
         struct.pack_into("<I", data, 0, count)
-        h = struct.pack("<8sQII", b"LIXINFS1", gen + 1, len(data), codec["checksum"](data))
+        h = struct.pack("<8sQII", b"LIXINFS3", gen + 1, len(data), codec["checksum"](data))
         f.seek(512 + ((gen + 1) % 2) * slot)
         f.write((h + struct.pack("<I", codec["checksum"](h))).ljust(512, b"\0"))
         f.write(data)

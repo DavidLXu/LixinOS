@@ -3,14 +3,44 @@ import asyncio
 from contextlib import contextmanager
 import os
 from pathlib import Path
+import pty
 import runpy
 import secrets
+import select
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 serial = runpy.run_path(str(ROOT / "scripts/test-user.py"))
+
+
+def curses_cursor(terminal):
+    master, slave = pty.openpty()
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-c",
+             "import curses; curses.initscr(); curses.curs_set(0); curses.endwin()"],
+            stdin=slave, stdout=slave, stderr=slave,
+            env=dict(os.environ, TERM=terminal),
+        )
+    finally:
+        os.close(slave)
+    try:
+        deadline = time.monotonic() + 5
+        while process.poll() is None and time.monotonic() < deadline:
+            if select.select([master], [], [], 0.1)[0]:
+                try:
+                    os.read(master, 4096)
+                except OSError:
+                    break
+        return process.wait(timeout=1) == 0
+    finally:
+        os.close(master)
+        if process.poll() is None:
+            process.kill()
+            process.wait()
 
 
 async def serve(keyfile, port):
@@ -27,12 +57,24 @@ async def serve(keyfile, port):
         if not proc.get_terminal_type() or proc.command:
             proc.exit(1)
             return
-        proc.stdout.write("remote$ ")
-        async for line in proc.stdin:
+        terminal = proc.get_terminal_type()
+        cols, rows, _, _ = proc.get_terminal_size()
+        proc.stdout.write(f"PTY {terminal} {cols}x{rows}\nremote$ ")
+        while True:
+            try:
+                line = await proc.stdin.readline()
+            except asyncssh.TerminalSizeChanged:
+                cols, rows, _, _ = proc.get_terminal_size()
+                proc.stdout.write(f"PTY resized to {cols}x{rows}\n")
+                continue
+            if not line:
+                break
             if line.strip() == "hostname":
                 p = await asyncio.create_subprocess_exec("hostname", stdout=asyncio.subprocess.PIPE)
                 data, _ = await p.communicate()
                 proc.stdout.write(data.decode() + "remote$ ")
+            elif line.strip() == "cursor-test":
+                proc.stdout.write(f"curs_set(0): {'OK' if curses_cursor(terminal) else 'ERR'}\nremote$ ")
             elif line.strip() == "exit":
                 proc.exit(0)
                 return
@@ -80,7 +122,10 @@ def test(tmp):
             s.expect(cmd, b"Trust this host (yes/no)? ", expected)
             s.expect(b"yes\r", b"password: ")
             s.send(password.encode() + b"\r")
-            assert password.encode() not in s.until(b"remote$ ")
+            login = s.until(b"remote$ ")
+            assert password.encode() not in login
+            assert b"PTY xterm 80x24" in login, login
+            s.expect(b"cursor-test\r", b"remote$ ", b"curs_set(0): OK")
             s.expect(b"hostname\r", b"remote$ ", subprocess.check_output(["hostname"]).strip())
             s.expect(b"exit\r", prompt)
             s.send(b"shutdown\r")

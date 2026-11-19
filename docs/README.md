@@ -1,10 +1,10 @@
 # LixinOS 系统手册
 
-LixinOS 是一个用 Rust 编写的 ARM64 操作系统，在 Apple Silicon Mac 的 QEMU 虚拟机里运行。你可以在系统里编辑 Python 和 C 源码、运行脚本、编译程序，再把程序保存在虚拟磁盘上。当前版本为 [0.1.0](0.1.0.md)。
+LixinOS 是一个提供 Rust 原版内核和 TCC 自举内核的 ARM64 操作系统，在 Apple Silicon Mac 的 QEMU 虚拟机里运行。你可以在系统里编辑 Python 和 C 源码、运行脚本、编译程序，再把程序保存在虚拟磁盘上。当前版本为 [0.1.0](0.1.0.md)。
 
 ## 从终端开始
 
-在 Mac 的项目根目录运行 `./scripts/run-kernel.sh`，等到窗口出现 `lixin:/$` 后，就可以输入 guest 命令。首次构建会下载交叉编译工具和上游源码。想直接在当前 Mac 终端操作，可以用 `./scripts/run-kernel.sh --serial`。安装步骤和其他启动模式见[项目 README](../README.md)。
+在 Mac 的项目根目录运行 `./scripts/run-kernel.sh`，在弹出的中文窗口中选择 **Rust 原版内核**（默认）或 **TCC 自举内核**，点击 **启动**。看到 `lixin:/$` 就可以输入命令。原版使用 `data/lixinos.img`，TCC 版使用 `data/tcc-os/system.img`，各自保存文件。首次构建会下载交叉编译工具和上游源码。想直接在当前 Mac 终端操作，可以用 `./scripts/run-kernel.sh --serial`，输入 `1` 或 `2` 后回车选内核。要跳过菜单，可用 `./scripts/run-kernel.sh --kernel rust` 或 `./scripts/run-kernel.sh --kernel tcc`，两者均可搭配 `--split` 等启动模式。安装步骤和其他启动模式见[项目 README](../README.md)。
 
 | 想做什么 | 在 LixinOS 里怎么做 |
 |---|---|
@@ -14,6 +14,10 @@ LixinOS 是一个用 Rust 编写的 ARM64 操作系统，在 Apple Silicon Mac �
 | 查看文件或系统状态 | `ls -lah` 显示隐藏文件、类型和大小；`htop` 显示内核堆和文件系统统计，按 q 返回 |
 | 找回上一次的命令 | 按 ↑ 或 ↓ 浏览最近 64 条历史；Tab 补全命令或路径，连续按两次可列出候选 |
 | 关机并保留工作 | 输入 `shutdown`。再次启动时使用同一块磁盘，文件、编译好的程序和命令历史就会恢复 |
+
+## 在两种内核上运行 CPython
+
+在 Bash 输入 `python3` 即可进入 CPython 3.14.5，按 Ctrl+D 退出。输入 `python3 hello.py` 运行磁盘上的脚本，或用 `python3 -c "import sys; print(sys.implementation.name, sys.platform)"` 查看实现和平台，结果是 `cpython lixinos`。`python` 仍可运行 MicroPython。[支持范围与构建方法](../User/cpython/README.md)
 
 ## 用 Kilo 写 C 代码
 
@@ -56,12 +60,20 @@ git -C ~/Desktop/lixinos-project status
 
 ## 重启后，哪些东西还在？
 
-默认磁盘是 Mac 项目目录下的 `data/lixinos.img`，镜像布局依次为 512 字节格式标识、两份 64 MiB 快照槽和 65 KiB 历史区。首次使用旧镜像时，启动器复制有效快照和历史记录，校验后原子替换原文件。内核在内存中维护目录树和文件内容。保存文件时，它先写另一份快照的数据并刷盘，再写入带校验信息的头部；启动时选择最新的有效快照。历史区用 65 个 1 KiB 槽循环保存最近 64 条命令。当前上限是 1,048,576 个条目（含根目录），单个文件 1 MiB；所有文件内容、路径和版本记录合计需放进一份 64 MiB 快照（含 512 字节头部）。Python 交互变量和正在编辑但尚未保存的文字只存在于当前会话。[磁盘格式与恢复逻辑](../Kernel/src/disk.rs)
+默认磁盘是 Mac 项目目录下的 `data/lixinos.img`，镜像布局依次为 512 字节格式标识、两份 192 MiB 快照槽和 65 KiB 历史区。首次使用旧镜像时，启动器复制有效快照和历史记录，校验后原子替换原文件。内核在内存中维护目录树和文件内容。保存文件时，它先写另一份快照的数据并刷盘，再写入带校验信息的头部；启动时选择最新的有效快照。历史区用 65 个 1 KiB 槽循环保存最近 64 条命令。当前上限是 1,048,576 个条目（含根目录），单个文件 100 MiB；所有文件内容、路径和版本记录合计需放进一份 192 MiB 快照（含 512 字节头部）。Python 交互变量和正在编辑但尚未保存的文字只存在于当前会话。[磁盘格式与恢复逻辑](../Kernel/src/disk.rs)
 
 ## 编译好的 C 程序是什么格式？
 
-`tcc hello.c -o hello` 在 guest 里生成 ARM64 机器码，保存为 **LXE1**。文件以 16 字节头部开头，之后依次存放代码和初始数据。头部的前四个字节是字符 `LXE1`，其余三个字段都是小端 32 位整数，依次表示 `main` 在代码段内的字节偏移、代码长度和数据长度。
+在 LixinOS 内运行 `tcc hello.c -o hello` 会生成 ARM64 **LXE1**。文件以 16 字节头部开头，依次是四字节 `LXE1` 标记以及三个小端 32 位字段，记录入口偏移、代码长度和数据长度。头部之后存放代码和完整的数据段。此前生成的 LXE2 程序需要从源码重新编译。
 
-运行 `./hello` 时，加载器校验头部、文件长度和入口范围，装入代码、恢复初始数据，再通过用户态运行库调用 `main(void)`。版本 1 为 `puts`、`printf` 和 `putchar` 约定了固定入口，因此源码删除后，保存的程序仍然可以执行。维护旧程序兼容性时，除了文件头，还要保留这些调用约定。**0.1.0 继续使用 LXE1 可执行文件格式。** [TinyCC 写入端](../User/tcc/port.c) · [加载端](../Kernel/src/user.rs) · [运行库入口](../User/tcc/runner.c)
+在 QEMU 主图形终端里用以下命令构建两个示例，再到桌面点击相应图标。
+
+```sh
+tcc /src/gui/calculator.c -o /bin/calculator
+tcc /src/gui/text-editor.c -o /bin/text-editor
+desktop
+```
+
+桌面文件浏览器也可以打开扩展名为 `.app` 的 LXE1 程序。应用在当前窗格前台运行，关闭后回到桌面。编辑器默认打开 `/notes.txt`，支持 32 KiB 以内的 ASCII 文本。应用和保存的文件会留在磁盘上。[图形头文件](../User/gui/lixin-gui.h) · [编译器](../User/tcc/port.c) · [加载器](../Kernel/src/user.rs)
 
 可选的 `agent` 命令借助 Mac 端桥接调用模型服务，生成脚本后在 guest 中验证。编辑、编译和运行本地程序可以独立使用。桥接配置和调用示例见[项目 README](../README.md#generate-a-script-with-the-agent)。

@@ -1,8 +1,10 @@
 """Exercise the real QEMU bridge and guest Agent with deterministic model responses."""
 import importlib.util
+from functools import partial
 from io import BytesIO
 import json
 from pathlib import Path
+import re
 import socket
 import sys
 import tempfile
@@ -36,6 +38,8 @@ LEGACY_TESTS = [{"stdin": "7\n", "stdout": "21\n"}]
 LEGACY_EXAMPLES = [{"stdin": "\n", "stdout": "0\n"}]
 INSPECT = "Report CPU, RAM, disk, filesystem, and the file in the current directory"
 UNSUPPORTED = "Try to remove sample.txt, then check whether it still exists"
+INSPECT_IDENTITY = "Is this a Linux system and what is its name?"
+GIT_REFERENCE_MARKER = "Guest Git reference loaded from disk."
 FILE_CONTENT = b"guest-private-content"
 PROJECT = "Stage two scripts and preserve the workspace boundary"
 PROJECT_CHECK = "Check the persisted project with the rebuilt harness"
@@ -48,12 +52,21 @@ PROJECT_TUNED_LIMIT = "Try to exceed the tuned budget"
 SYSTEM_UPDATE = "Stage a compiled executable and edit files in two directories"
 
 
-def mock_inspect(instruction, data):
+def mock_inspect(instruction, data, directory_count):
     assert "LixinOS read-only system inspector" in instruction
+    assert "does not run a Linux kernel" in " ".join(instruction.split())
+    assert "git diff --staged" in data["git_reference"]
     assert data["cwd"] == "/lab"
     observations = data["observations"]
     assert data["remaining_queries"] == 6 - len(observations)
     assert all(FILE_CONTENT.decode() not in item for item in observations)
+    if data["question"] == INSPECT_IDENTITY:
+        if not observations:
+            return {"queries": [{"tool": "system"}]}
+        assert "name=LixinOS" in observations[0]
+        assert "linux_kernel=false" in observations[0]
+        assert "architecture=aarch64" in observations[0]
+        return {"answer": "The guest is LixinOS, a standalone ARM64 OS."}
     if data["question"] == UNSUPPORTED:
         if len(observations) == 0:
             return {"queries": [{"tool": "rm", "path": "sample.txt"}]}
@@ -64,18 +77,22 @@ def mock_inspect(instruction, data):
         return {"answer": "Removal is unavailable. sample.txt still exists."}
 
     assert data["question"] == INSPECT
-    source_dirs = 1 + sum(p.is_dir() for p in (serial.ROOT / "User").rglob("*"))
     tools = [
-        ({"tool": "cpu"}, ("vcpus=1", "uptime_seconds=", "guest_busy_percent=unavailable")),
+        ({"tool": "cpu"}, ("vcpus=1", "uptime_seconds=", "guest_busy_percent=", "sample_ms=")),
         ({"tool": "memory"}, ("guest_ram_bytes=167772160", "heap_used_bytes=", "heap_free_bytes=")),
         ({"tool": "disk"}, ("capacity_bytes=143654912", "committed_snapshot_generation=")),
-        ({"tool": "filesystem"}, ("files=", f"directories={3 + source_dirs}", "file_content_bytes=")),
+        ({"tool": "filesystem"}, ("files=", f"directories={directory_count} (includes root)", "file_content_bytes=")),
         ({"tool": "list", "path": "."}, ('path="/lab"', 'file "sample.txt" (22 bytes)')),
         ({"tool": "stat", "path": "sample.txt"}, ('path="/lab/sample.txt"', "size_bytes=22")),
     ]
     for observation, (tool, evidence) in zip(observations, tools):
         assert f'tool="{tool["tool"]}"' in observation, observation
         assert all(value in observation for value in evidence), observation
+        if tool["tool"] == "cpu":
+            busy = re.search(r"guest_busy_percent=(\d+)", observation)
+            sample = re.search(r"sample_ms=(\d+)", observation)
+            assert busy and 0 <= int(busy[1]) <= 100, observation
+            assert sample and int(sample[1]) >= 250, observation
     if not observations:
         return {"queries": [tool for tool, _ in tools[:4]]}
     if len(observations) == 4:
@@ -83,7 +100,7 @@ def mock_inspect(instruction, data):
     return {"answer": "1 vCPU, 160 MiB of RAM, 137 MiB disk, and sample.txt is 22 bytes.\x1b[2J"}
 
 
-def mock_deepseek(request, timeout):
+def mock_deepseek(request, timeout, *, directory_count):
     assert request.full_url == bridge.ENDPOINT
     assert request.get_header("Authorization") == "Bearer fixture-key"
     payload = json.loads(request.data)
@@ -91,7 +108,7 @@ def mock_deepseek(request, timeout):
     instruction, content = payload["messages"]
     data = json.loads(content["content"])
     if "question" in data:
-        result = mock_inspect(instruction["content"], data)
+        result = mock_inspect(instruction["content"], data, directory_count)
     elif "workspace" in data:
         result = mock_project(instruction["content"], data)
     elif bridge.BASELINE_PROMPT in instruction["content"]:
@@ -150,10 +167,16 @@ def mock_improvement(data):
 
 def mock_project(instruction, data):
     assert "LixinOS project agent" in instruction
+    assert "does not run a Linux kernel" in " ".join(instruction.split())
+    assert "git diff --staged" in data["git_reference"]
     observations = data["observations"]
     if data["task"] == SYSTEM_UPDATE:
         assert data["workspace"] == "/" and "system mode" in instruction
         actions = [
+            ("system", [], "linux_kernel=false"),
+            ("list", ["/proc"], 'file "stat"'),
+            ("read", ["/proc/stat"], "cpu0 "),
+            ("remove", ["/proc/stat"], "read-only filesystem"),
             ("read", ["/work/preview.txt"], "p" * 96),
             ("replace", ["/work/preview.txt", "p" * 96, "changed"], "staged replace"),
             ("remove", ["/work/note"], "staged remove"),
@@ -223,6 +246,7 @@ def mock_project(instruction, data):
             return {"tool": "finish", "args": ["Follow-up at review accepted."]}
         return {"tool": "finish", "args": ["Ready for the first review."]}
     if data["task"] == PROJECT_CHECK:
+        assert GIT_REFERENCE_MARKER in data["git_reference"]
         if not observations:
             return {"tool": "read", "args": ["double.py"]}
         assert "print(int(input()) * 2)" in observations[0]
@@ -287,9 +311,16 @@ def test():
     with tempfile.TemporaryDirectory() as temporary:
         disk = Path(temporary) / "agent.img"
         with serial.boot(disk) as s:
+            s.expect(b"uname -s | cat\r", serial.SHELL, b"\nLixinOS\n")
+            s.expect(b"uname -m\r", serial.SHELL, b"\naarch64\n")
+            s.expect(b"uname -a\r", serial.SHELL, b"(standalone; non-Linux)")
+            s.expect(b"sysinfo\r", serial.SHELL, b"linux_kernel=false")
             s.expect(b'agent inspect "How much RAM?"\r', serial.SHELL, b"model bridge unavailable")
             s.expect(b'agent offline.py "demo"\r', serial.SHELL, b"model bridge unavailable")
             s.expect(b"cat offline.py\r", serial.SHELL, b"file not found")
+            s.send(b"find / -type d\r")
+            directories = s.until(serial.SHELL).splitlines()[1:]
+            directory_count = sum(path != b"/proc" for path in directories)
         with disk.open("r+b") as image:
             image.truncate(137 * 1024 * 1024)
 
@@ -301,7 +332,8 @@ def test():
             "-device", "virtio-blk-device,drive=fs,bus=virtio-mmio-bus.0",
             "-kernel", str(serial.ROOT / "Kernel/target/aarch64-unknown-none-softfloat/release/lixin-kernel"),
         ]
-        command = [sys.executable, __file__, "--model-fixture", *qemu]
+        # The inspection fixture creates one directory, /lab.
+        command = [sys.executable, __file__, "--model-fixture", str(directory_count + 1), *qemu]
         with serial.boot(disk, command) as s:
             s.expect(b"mkdir lab\r", serial.SHELL)
             s.expect(b"echo " + FILE_CONTENT + b" > lab/sample.txt\r", serial.SHELL)
@@ -312,6 +344,8 @@ def test():
             assert b"1 vCPU, 160 MiB of RAM, 137 MiB disk, and sample.txt is 22 bytes." in output, output
             assert b"\x1b[2J" not in output, output
             s.expect(f'agent inspect "{UNSUPPORTED}"\r'.encode(), b"lixin:/lab$ ", b"sample.txt still exists")
+            s.expect(f'agent inspect "{INSPECT_IDENTITY}"\r'.encode(),
+                     b"lixin:/lab$ ", b"The guest is LixinOS, a standalone ARM64 OS.")
             assert disk.read_bytes() == disk_before, "inspection modified the guest disk"
             s.expect(b"cd /\r", serial.SHELL)
             s.expect(b'agent auth.py "reject with HTTP error"\r', serial.SHELL, b"DeepSeek HTTP 401")
@@ -439,6 +473,7 @@ def test():
             assert b"project agent reached its tool limit" in output, output
             assert b"agent: [04/" not in output, output
             s.expect(b"agent rollback-tune\r", serial.SHELL, b"restored previous version")
+            s.expect(f'echo "{GIT_REFERENCE_MARKER}" >> /src/git/README.md\r'.encode(), serial.SHELL)
             s.expect(f'agent run /work "{PROJECT_CHECK}"\r'.encode(), serial.SHELL,
                      b"The rebuilt harness read the saved script.")
             s.expect(b'agent run / "edit root"\r', serial.SHELL, b"use agent system")
@@ -479,7 +514,8 @@ def test():
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["--model-fixture"]:
-        sys.exit(bridge.launch(sys.argv[2:], bridge.DeepSeek("fixture-key", "fixture", mock_deepseek)))
+        complete = partial(mock_deepseek, directory_count=int(sys.argv[2]))
+        sys.exit(bridge.launch(sys.argv[3:], bridge.DeepSeek("fixture-key", "fixture", complete)))
     check_chunked_bridge()
     test()
     print("Passed QEMU inspection, tuning, system changes, reboot, and rollback.")

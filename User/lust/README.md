@@ -30,3 +30,11 @@ The host can run python3 scripts/test-lust.py for the QEMU integration test.
 
 Upstream sources: https://github.com/t3dotgg/lust-lang and
 https://github.com/TinyCC/tinycc.
+
+The guest frontend also supports separate native compilation. Use
+`lust emit-c source.rs -o generated.c` followed by
+`./tcc generated.c -o program` with a guest-built TinyCC. For a C project,
+`lust emit-fn keycode /src/foreground/keycode.rs -o keycode.c` exports
+`lxrs_keycode` with integer parameters and an integer result. Link the
+generated unit alongside the application's C sources. This mode currently
+supports one generated Rust library unit per final program.

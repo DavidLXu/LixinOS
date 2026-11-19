@@ -26,12 +26,6 @@ def exercise(guest, control, directory):
         command("human-monitor-command", **{"command-line": "sendkey ctrl-tab 20"})
         time.sleep(0.12)
 
-    def left_data():
-        path = directory / "data.bin"
-        # Observe the left pane's writable 2 MiB block, including C globals.
-        command("pmemsave", val=0x44200000, size=2 << 20, filename=str(path))
-        return path.read_bytes()
-
     assert "QMP" in json.loads(control.readline())
     command("qmp_capabilities")
     prompt = serial["SHELL"]
@@ -58,24 +52,62 @@ def exercise(guest, control, directory):
     guest.expect(b"x\r", repl, b"\n42\n")
     guest.expect(b"\x04", prompt)
     guest.expect(b"""echo '#include <stdio.h>' > spin.c\r""", prompt)
-    guest.expect(b"""echo 'volatile unsigned n; int main(void){puts("spinning");for(;;)++n;}' >> spin.c\r""", prompt)
-    guest.expect(b"tcc -run spin.c\r", b"spinning\r\n")
-    switch()
-    guest.expect(b"x\r", repl, b"\n7\n")
-    paused = left_data()
-    time.sleep(0.15)
-    assert paused == left_data(), "C loop advanced in the inactive pane"
-    switch()
-    time.sleep(0.15)
+    guest.expect(b"echo '#include <lixin.h>' >> spin.c\r", prompt)
+    guest.expect(b"echo 'int main(void){puts(\"spinning\");for(;;){' >> spin.c\r", prompt)
+    guest.expect(b"echo 'for(volatile int i=0;i<5000000;i++){}' >> spin.c\r", prompt)
+    guest.expect(b"echo 'if(lx_stat(\"signal\")>=0)return lx_save_file(\"done\",\"ok\",2);}}' >> spin.c\r", prompt)
+    guest.expect(b"tcc spin.c -o spin\r",prompt)
+    guest.expect(b"./spin\r", b"spinning\r\n")
     switch()
     guest.expect(b"x * 2\r", repl, b"\n14\n")
-    assert paused != left_data(), "C loop did not resume"
     guest.expect(b"\x04", prompt)
+    guest.expect(b"touch signal\r", prompt)
+    deadline=time.monotonic()+5
+    while time.monotonic()<deadline:
+        guest.send(b"cat done\r")
+        if b"\nok" in guest.until(prompt): break
+    else: raise AssertionError("unfocused process did not finish")
+    # A network job outlives its launching shell. Keep the right-hand editor
+    # open while its peer compiles on the left, then close the left terminal.
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1",0))
+        listener.listen()
+        listener.settimeout(10)
+        switch()
+        guest.send(b"echo left-ready\r")
+        guest.until(b"\nleft-ready\r\n")
+        guest.until(prompt)
+        for source in (
+            "#include <lixin.h>",
+            f'int main(void){{char c;int fd=lx_tcp_connect("10.0.2.2",{listener.getsockname()[1]});',
+            'if(fd<0 || lx_read(fd,&c,1)!=1)return 1;',
+            'return lx_save_file("socket-result",&c,1);}',
+        ):
+            guest.expect(f"echo '{source}' >> worker.c\r".encode(),prompt)
+        guest.expect(b"tcc worker.c -o worker\r",prompt)
+        guest.expect(b"./worker &\r",prompt,b"[pid ")
+        with listener.accept()[0] as conn:
+            switch()
+            guest.expect(b"kilo draft.c\r",b"Ctrl-F = find")
+            guest.send(b"working")
+            switch()
+            guest.send(b"tcc worker.c -o built\r")
+            guest.until(prompt)
+            guest.expect(b"ls -1 built\r",prompt,b"\nbuilt\n")
+            guest.send(b"exit\r")
+            time.sleep(.12)
+            switch()
+            guest.send(b" draft\x13")
+            guest.until(b"bytes written on disk")
+            conn.sendall(b"K")
+            guest.expect(b"\x11",prompt)
+            guest.expect(b"cat draft.c\r",prompt,b"working draft")
+            guest.expect(b"cat socket-result\r",prompt,b"\nK")
     guest.send(b"shutdown\r")
     assert guest.vm.wait(timeout=5) == 0
 
 
-def test(exercise=exercise, mode="--split"):
+def test(exercise=exercise, mode="--split", disk=None):
     with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
         directory = Path(tmp)
         if not (qemu := shutil.which("qemu-system-aarch64")):
@@ -95,7 +127,7 @@ os.execv(os.environ['PANE_TEST_QEMU'], [os.environ['PANE_TEST_QEMU'], *args,
         endpoint = directory / "qmp"
         launch = ["env", f"PATH={directory}:{os.environ['PATH']}", f"PANE_TEST_QEMU={qemu}",
                   f"PANE_TEST_SOCKET={endpoint}", here / "run-kernel.sh", mode]
-        with serial["boot"](directory / "disk.img", launch) as guest, socket.socket(socket.AF_UNIX) as sock:
+        with serial["boot"](disk if disk is not None else directory / "disk.img", launch) as guest, socket.socket(socket.AF_UNIX) as sock:
             sock.settimeout(10)
             sock.connect(str(endpoint))
             with sock.makefile("rwb") as control:
@@ -104,4 +136,4 @@ os.execv(os.environ['PANE_TEST_QEMU'], [os.environ['PANE_TEST_QEMU'], *args,
 
 if __name__ == "__main__":
     test()
-    print("Passed native Kilo colors, cross-pane save conflict, Python isolation and C pause/resume.")
+    print("Passed native Kilo colors, cross-pane save conflict, Python isolation and independent CPU progress.")

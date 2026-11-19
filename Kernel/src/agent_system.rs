@@ -1,6 +1,6 @@
 //! Staged edits to the guest volume and a durable undo record for the last batch.
-use crate::{agent::Version, disk, print, process::Volume, user};
-use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
+use crate::{agent::Version, disk, print, process::{Entry as VolumeEntry, Volume}, user};
+use alloc::{borrow::Cow, collections::BTreeMap, format, string::String, vec::Vec};
 use core::fmt::Write;
 use serde::{Deserialize, Serialize};
 
@@ -128,9 +128,13 @@ fn parse_hex(text: &str) -> Result<Vec<u8>> {
 }
 
 impl Plan {
-    fn bytes<'a>(&'a self, volume: &'a Volume, path: &str) -> Result<&'a [u8]> {
+    fn bytes<'a>(&'a self, volume: &'a Volume, path: &str) -> Result<Cow<'a, [u8]>> {
+        if volume.is_virtual_proc(path) {
+            return volume.read_file(path).map(Cow::Owned);
+        }
         effective(&volume.files, &self.edits, path)
             .and_then(Option::as_deref)
+            .map(Cow::Borrowed)
             .ok_or("guest file not found")
     }
 
@@ -167,6 +171,9 @@ impl Plan {
             return Err("expected a system tool and path");
         };
         let path = resolve(operand)?;
+        if !matches!(tool.as_str(), "list" | "read" | "readhex") {
+            volume.require_writable(&path)?;
+        }
         match (tool.as_str(), args) {
             ("list", []) => return self.list(volume, &path),
             ("read", [] | [_]) => {
@@ -178,7 +185,7 @@ impl Plan {
                     return Err("binary guest file; use readhex");
                 }
                 let text =
-                    core::str::from_utf8(bytes).map_err(|_| "binary guest file; use readhex")?;
+                    core::str::from_utf8(&bytes).map_err(|_| "binary guest file; use readhex")?;
                 return text
                     .get(offset..)
                     .map(String::from)
@@ -220,7 +227,8 @@ impl Plan {
                 self.stage(volume, path.clone(), Some(Some(bytes)))?;
             }
             ("replace", [old, new]) => {
-                let text = core::str::from_utf8(self.bytes(volume, &path)?)
+                let bytes = self.bytes(volume, &path)?;
+                let text = core::str::from_utf8(&bytes)
                     .map_err(|_| "binary guest file")?;
                 if old.is_empty() || text.matches(old).count() != 1 {
                     return Err("old text must occur exactly once");
@@ -238,10 +246,10 @@ impl Plan {
                     if !source.ends_with(".c") {
                         return Err("expected C source");
                     }
-                    let text = core::str::from_utf8(bytes).map_err(|_| "C source must be UTF-8")?;
+                    let text = core::str::from_utf8(&bytes).map_err(|_| "C source must be UTF-8")?;
                     user::compile(&source, text)?
                 } else {
-                    bytes.to_vec()
+                    bytes.into_owned()
                 };
                 self.stage(volume, path.clone(), Some(Some(candidate)))?;
                 return Ok(format!("staged {path:?} from {source:?} using {tool}"));
@@ -252,17 +260,21 @@ impl Plan {
     }
 
     fn list(&self, volume: &Volume, directory: &str) -> Result<String> {
-        if effective(&volume.files, &self.edits, directory) != Some(&None) {
+        let is_dir = match self.edits.get(directory) {
+            Some(entry) => entry == &Some(None),
+            None => matches!(volume.entry(directory), Some(VolumeEntry::Directory)),
+        };
+        if !is_dir {
             return Err("guest directory not found");
         }
         let prefix = directory.trim_end_matches('/');
         let mut output = String::new();
-        for (name, entry) in disk::children(&volume.files, directory) {
+        for (name, entry) in volume.children(directory, "", None) {
             let path = format!("{prefix}/{name}");
             if reserved(&path) || self.edits.contains_key(&path) {
                 continue;
             }
-            let kind = if entry.is_some() { "file" } else { "directory" };
+            let kind = if matches!(entry, VolumeEntry::Directory) { "directory" } else { "file" };
             writeln!(output, "{kind} {name:?}").unwrap();
             if output.len() >= 3000 {
                 output.push_str("[directory listing truncated]\n");
@@ -376,6 +388,7 @@ fn commit(
 ) -> Result<()> {
     let mut count = volume.files.len();
     for (key, entry) in &changes {
+        volume.require_writable(key)?;
         let existed = volume.files.contains_key(key);
         if existed && entry.is_none() {
             count -= 1;
@@ -405,7 +418,7 @@ fn commit(
         }
         undo.push((key, old, old_version));
     }
-    if let Err(error) = volume.disk.save(&volume.files, &volume.versions) {
+    if let Err(error) = volume.save_changes(undo.iter().map(|(path, old, _)| (path.as_str(), old.is_some())), &disk::Times::new()) {
         for (key, old, version) in undo {
             if let Some(data) = old {
                 volume.files.insert(key.clone(), data);

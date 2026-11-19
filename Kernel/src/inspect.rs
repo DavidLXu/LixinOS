@@ -1,13 +1,26 @@
 //! Read-only observations from the guest, independent of the model bridge.
 use crate::{
     disk,
-    monitor::{heap_usage, kernel_span_bytes, seconds_to_ticks, ticks},
-    user,
+    monitor::{self, heap_usage, kernel_span_bytes, seconds_to_ticks},
+    process::{Entry, Volume},
 };
 use alloc::{format, string::String};
 use core::{fmt::Write, ptr::read_volatile, slice};
 
 type Result<T> = core::result::Result<T, &'static str>;
+
+pub const SYSTEM_NAME: &str = "LixinOS";
+pub const SYSTEM_RELEASE: &str = concat!(env!("CARGO_PKG_VERSION"), "-rust");
+pub const ARCHITECTURE: &str = "aarch64";
+pub fn system_summary() -> String {
+    format!("{SYSTEM_NAME} {SYSTEM_RELEASE} {ARCHITECTURE} (standalone; non-Linux)")
+}
+
+pub fn system() -> String {
+    format!(
+        "name={SYSTEM_NAME}\nrelease={SYSTEM_RELEASE}\narchitecture={ARCHITECTURE}\nlinux_kernel=false\nplatform=QEMU virt guest\nidentity_command=uname -a"
+    )
+}
 
 fn device_tree() -> Option<fdt::Fdt<'static>> {
     // QEMU virt places the bare-metal ELF's DTB at RAM start. The linker
@@ -25,18 +38,21 @@ fn device_tree() -> Option<fdt::Fdt<'static>> {
     fdt::Fdt::new(unsafe { slice::from_raw_parts(BASE as *const u8, size) }).ok()
 }
 
-pub fn cpu(started: u64) -> String {
+pub fn cpu() -> String {
     let vcpus = device_tree()
         .and_then(|tree| tree.find_node("/cpus").map(|_| tree.cpus().count()))
         .filter(|&count| count != 0);
     let frequency = seconds_to_ticks(1);
-    let uptime = ticks().wrapping_sub(started) / frequency;
-    #[cfg(feature = "retina")]
-    let busy = crate::graphics::cpu_busy_percent();
-    #[cfg(not(feature = "retina"))]
-    let busy: Option<u64> = None;
+    let start = monitor::cpu_counters();
+    crate::scheduler::sleep_ms(250);
+    let end = monitor::cpu_counters();
+    let busy = end.busy_percent(start);
+    let sample_ms = end.ticks.wrapping_sub(start.ticks) * 1000 / frequency;
+    let uptime = crate::scheduler::uptime_ticks() / frequency;
     format!(
-        "architecture=aarch64\n         vcpus={} (QEMU boot device tree)\n         uptime_seconds={uptime}\n         architectural_timer_hz={frequency} (not CPU clock speed)\n         guest_busy_percent={} (latest console sample, excludes input waits; not Mac CPU utilization)",
+        "architecture={ARCHITECTURE}\nvcpus={} (QEMU boot device tree)\n\
+         uptime_seconds={uptime}\narchitectural_timer_hz={frequency}\n\
+         guest_busy_percent={}\nsample_ms={sample_ms}\nscope=guest_scheduler",
         measurement(vcpus),
         measurement(busy)
     )
@@ -57,11 +73,11 @@ pub fn memory() -> String {
     let ram = ram_size();
     let (used, free) = heap_usage();
     let kernel = kernel_span_bytes();
-    let reserved = user::BANKS * user::USER_REGION_BYTES;
+    let timer_irqs=crate::scheduler::timer_interrupts();
     format!(
-        "guest_ram_bytes={} (QEMU boot device tree)\n         heap_used_bytes={used}\nheap_free_bytes={free}\n         kernel_image_and_stacks_excluding_heap_arena_bytes={kernel}\n         user_program_ram_reserved_bytes={reserved}\n         known_usage_estimate_bytes={} (kernel span excluding heap arena, plus allocated heap and reserved user regions)\n         total_guest_free_bytes=unavailable (no physical-page allocator)",
+        "guest_ram_bytes={} (QEMU boot device tree)\n         heap_used_bytes={used}\nheap_free_bytes={free}\n         kernel_image_and_stacks_excluding_heap_arena_bytes={kernel}\n         user_program_ram_reserved_bytes=0 (private images charged to heap)\n         scheduler_timer_interrupts={timer_irqs}\n         known_usage_estimate_bytes={} (kernel span excluding heap arena, plus allocated heap)\n         total_guest_free_bytes=unavailable (no physical-page allocator)",
         measurement(ram),
-        kernel + used + reserved
+        kernel + used
     )
 }
 
@@ -85,27 +101,28 @@ pub fn filesystem(files: &disk::Files) -> String {
     )
 }
 
-pub fn stat(files: &disk::Files, path: &str) -> Result<String> {
-    match files.get(path).ok_or("path not found")? {
-        Some(bytes) => Ok(format!("path={path:?}\ntype=file\nsize_bytes={}", bytes.len())),
+pub fn stat(volume: &Volume, path: &str) -> Result<String> {
+    let entry = volume.entry(path).ok_or("path not found")?;
+    match entry.size() {
+        Some(size) => Ok(format!("path={path:?}\ntype=file\nsize_bytes={size}")),
         None => Ok(format!(
             "path={path:?}\ntype=directory\ndirect_children={}",
-            disk::children(files, path).count()
+            volume.children(path, "", None).count()
         )),
     }
 }
 
-pub fn list(files: &disk::Files, path: &str) -> Result<String> {
+pub fn list(volume: &Volume, path: &str) -> Result<String> {
     const LIST_LIMIT: usize = 4096;
-    if files.get(path).ok_or("path not found")?.is_some() {
+    if !matches!(volume.entry(path).ok_or("path not found")?, Entry::Directory) {
         return Err("not a directory");
     }
     let mut output = format!("path={path:?}\n");
     let mut shown = 0;
-    let total = disk::children(files, path).count();
-    for (name, value) in disk::children(files, path) {
-        let row = match value {
-            Some(bytes) => format!("file {name:?} ({} bytes)\n", bytes.len()),
+    let total = volume.children(path, "", None).count();
+    for (name, entry) in volume.children(path, "", None) {
+        let row = match entry.size() {
+            Some(size) => format!("file {name:?} ({size} bytes)\n"),
             None => format!("directory {name:?}\n"),
         };
         if output.len() + row.len() > LIST_LIMIT {

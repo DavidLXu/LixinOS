@@ -57,6 +57,7 @@ struct Stack {
     iface: Interface,
     sockets: SocketSet<'static>,
     closing: Vec<(SocketHandle, Instant)>,
+    dns: SocketHandle,
     port: u16,
     last_poll: Instant,
 }
@@ -88,10 +89,14 @@ impl Stack {
             ips.push(IpCidr::new(ADDRESS.into(), 24)).unwrap();
         });
         iface.routes_mut().add_default_ipv4_route(GATEWAY).ok()?;
+        let mut sockets = SocketSet::new(Vec::new());
+        let dns = sockets.add(smoltcp::socket::dns::Socket::new(
+            &[Ipv4Addr::new(10, 0, 2, 3).into()], Vec::new(),
+        ));
         Some(Self {
             nic,
             iface,
-            sockets: SocketSet::new(Vec::new()),
+            sockets, dns,
             closing: Vec::new(),
             port: 49152,
             last_poll: now(),
@@ -124,7 +129,7 @@ impl Stack {
             let p = self.port;
             self.port = self.port.checked_add(1).unwrap_or(49152);
             (!self.sockets.iter().any(|(_, s)| {
-                let smoltcp::socket::Socket::Tcp(t) = s;
+                let smoltcp::socket::Socket::Tcp(t) = s else { return false };
                 t.local_endpoint().is_some_and(|e| e.port == p)
             }))
             .then_some(p)
@@ -133,19 +138,7 @@ impl Stack {
             .connect(self.iface.context(), (ip, port), local)
             .ok()?;
         let handle = self.sockets.add(socket);
-        let deadline = now() + Duration::from_secs(5);
-        loop {
-            let time = now();
-            self.poll(time);
-            match self.sockets.get::<tcp::Socket>(handle).state() {
-                State::Established | State::CloseWait => return Some(handle),
-                State::SynSent if time < deadline => core::hint::spin_loop(),
-                _ => {
-                    self.sockets.remove(handle);
-                    return None;
-                }
-            }
-        }
+        Some(handle)
     }
     fn close(&mut self, h: SocketHandle) {
         self.sockets.get_mut::<tcp::Socket>(h).close();
@@ -172,15 +165,82 @@ pub fn info() -> Option<String> {
     ))
 }
 
+// Keep the shared stack borrow inside each polling step. Other tasks can use
+// their sockets while a DNS reply or a TCP handshake is outstanding.
+pub(crate) fn resolve(name: &str) -> Option<Ipv4Addr> {
+    use smoltcp::{
+        socket::dns::{GetQueryResultError, Socket},
+        wire::{DnsQueryType, IpAddress},
+    };
+    if let Ok(ip) = name.parse() {
+        return Some(ip);
+    }
+    let query = {
+        let mut network = NETWORK.0.borrow_mut();
+        let net = network.as_mut()?;
+        net.sockets
+            .get_mut::<Socket>(net.dns)
+            .start_query(net.iface.context(), name, DnsQueryType::A)
+            .ok()?
+    };
+    let deadline = now() + Duration::from_secs(8);
+    loop {
+        {
+            let mut network = NETWORK.0.borrow_mut();
+            let net = network.as_mut()?;
+            net.poll(now());
+            let socket = net.sockets.get_mut::<Socket>(net.dns);
+            match socket.get_query_result(query) {
+                Ok(addrs) => {
+                    let IpAddress::Ipv4(ip) = *addrs.first()?;
+                    return Some(ip);
+                }
+                Err(GetQueryResultError::Failed) => return None,
+                Err(GetQueryResultError::Pending) if now() >= deadline => {
+                    socket.cancel_query(query);
+                    return None;
+                }
+                _ => (),
+            }
+        }
+        crate::scheduler::sleep_ms(2);
+    }
+}
+fn connected(ip: Ipv4Addr, port: u16) -> Option<SocketHandle> {
+    let handle = NETWORK.0.borrow_mut().as_mut()?.connect(ip, port)?;
+    let deadline = now() + Duration::from_secs(5);
+    loop {
+        {
+            let mut network = NETWORK.0.borrow_mut();
+            let net = network.as_mut()?;
+            net.poll(now());
+            match net.sockets.get::<tcp::Socket>(handle).state() {
+                State::Established | State::CloseWait => return Some(handle),
+                State::SynSent if now() < deadline => (),
+                _ => {
+                    net.sockets.remove(handle);
+                    return None;
+                }
+            }
+        }
+        crate::scheduler::sleep_ms(2);
+    }
+}
+
 // Handles belong to the calling process. On exit or fault all its sockets are closed.
 #[derive(Default)]
 pub struct Connections([Option<SocketHandle>; 8]);
 impl Connections {
+    pub fn ready(&self,slot:usize)->Option<u8> {
+        let h=(*self.0.get(slot)?)?;
+        let mut network=NETWORK.0.borrow_mut();
+        let net=network.as_mut()?;
+        net.poll(now());
+        let socket=net.sockets.get::<tcp::Socket>(h);
+        Some(u8::from(socket.can_recv() || !socket.may_recv()) |
+             (u8::from(socket.can_send() || !socket.may_send())<<1))
+    }
     pub fn call(&mut self, op: u64, value: u64, mail: &mut [u8]) -> i64 {
-        let mut network = NETWORK.0.borrow_mut();
-        let Some(net) = network.as_mut() else {
-            return -1;
-        };
         if op == 25 {
             let Some(slot) = self.0.iter().position(Option::is_none) else {
                 return -1;
@@ -188,17 +248,21 @@ impl Connections {
             let Ok(port) = u16::try_from(value) else {
                 return -1;
             };
-            let addr = mail[..16]
+            let addr = mail[..254]
                 .split(|&b| b == 0)
                 .next()
                 .and_then(|bytes| core::str::from_utf8(bytes).ok())
-                .and_then(|ip| ip.parse().ok());
-            let Some(h) = addr.and_then(|ip| net.connect(ip, port)) else {
+                .and_then(resolve);
+            let Some(h) = addr.and_then(|ip| connected(ip, port)) else {
                 return -1;
             };
             self.0[slot] = Some(h);
             return slot as i64;
         }
+        let mut network = NETWORK.0.borrow_mut();
+        let Some(net) = network.as_mut() else {
+            return -1;
+        };
         let Some(slot) = self.0.get_mut((value >> 32) as usize) else {
             return -1;
         };

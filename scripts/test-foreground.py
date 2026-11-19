@@ -1,6 +1,7 @@
 """Exercise the EL0 editors, text utilities, and Git through the guest UART."""
 from pathlib import Path
 import runpy
+import argparse
 import struct
 import tempfile
 
@@ -24,11 +25,21 @@ def legacy_image(disk):
         stream.write(data)
 
 
-def test():
+def test(guest_build=False):
     with tempfile.TemporaryDirectory() as directory:
         disk = Path(directory) / "disk.img"
         legacy_image(disk)
         with serial["boot"](disk) as s:
+            if guest_build:
+                for cmd in [
+                    "mkdir /libexec",
+                    "tcc /src/tinycc/bootstrap.c -o /tcc-new",
+                    "lust emit-fn keycode /src/foreground/keycode.rs -o keys.c",
+                    "/tcc-new -DAPP_KILO -I/src/tinycc/sdk /src/foreground/runtime.c /src/kilo/kilo.c keys.c -o /libexec/kilo",
+                    "/tcc-new -DAPP_HTOP -I/src/tinycc/sdk /src/foreground/runtime.c /src/foreground/htop.c -o /libexec/htop",
+                ]:
+                    s.expect(cmd.encode()+b"\r",prompt)
+                    s.expect(b"echo $?\r",prompt,b"\n0\n")
             s.expect(b"echo upgraded\r", prompt, b"\nupgraded\n")
             s.expect(b"cat keep\r", prompt, b"local file")
             s.expect(b"kilo limit.c\r", b"Ctrl-F = find")
@@ -65,5 +76,7 @@ def test():
 
 
 if __name__ == "__main__":
-    test()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--guest-build", action="store_true")
+    test(parser.parse_args().guest_build)
     print("Passed EL0 editing, highlighting, search, Git diff and persistent large-file save.")

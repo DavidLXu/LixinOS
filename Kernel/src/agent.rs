@@ -14,7 +14,7 @@ use virtio_drivers::{
 #[cfg(not(feature = "split"))]
 use crate::monitor::ticks;
 #[cfg(feature = "split")]
-use crate::panes::ticks;
+use crate::scheduler::ticks;
 
 type Result<T> = core::result::Result<T, &'static str>;
 // A project turn can include 60 tool results of 4 KiB each, hex encoded.
@@ -25,8 +25,20 @@ const MAX_CASES: usize = 3;
 const MAX_INPUT: usize = 1024;
 const MAX_SUITE: usize = 12;
 const MAX_INSPECT_QUERIES: usize = 6;
+pub(crate) const PLATFORM_GUIDE: &str = include_str!("../../User/agent/README.md");
+pub(crate) const GIT_GUIDE_PATH: &str = "/src/git/README.md";
+const GIT_GUIDE: &str = include_str!("../../User/git/README.md");
+pub(crate) fn git_reference(files: &crate::disk::Files) -> &str {
+    files.get(GIT_GUIDE_PATH).and_then(Option::as_deref)
+        .filter(|bytes| bytes.len() <= 2048)
+        .and_then(|bytes| core::str::from_utf8(bytes).ok())
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or(GIT_GUIDE)
+}
+
 const INSPECT_PROMPT: &str = "You are the LixinOS read-only system inspector. The guest, \
     not the Mac, runs the tools. Based on the question and observations, return a single JSON object. \
+    For the OS name, release, architecture, or whether it runs Linux, query {\"queries\":[{\"tool\":\"system\"}]}. \
     With empty observations, return a queries array covering every part of the question, in a single \
     JSON object. For example, a system overview requires \
     {\"queries\":[{\"tool\":\"cpu\"},{\"tool\":\"memory\"},{\"tool\":\"disk\"},{\"tool\":\"filesystem\"}]}. \
@@ -45,6 +57,12 @@ pub struct Bridge {
     request_id: u64,
     incoming: Vec<u8>,
     discard_line: bool,
+    model_error: Option<ModelError>,
+}
+
+pub(crate) struct ModelError {
+    pub detail: String,
+    pub retryable: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,7 +113,12 @@ impl Bridge {
             request_id: 0,
             incoming: Vec::new(),
             discard_line: false,
+            model_error: None,
         })
+    }
+
+    pub(crate) fn take_model_error(&mut self) -> Option<ModelError> {
+        self.model_error.take()
     }
 
     // One newline-terminated record per request/response. Tab-delimited UTF-8 fields
@@ -107,6 +130,7 @@ impl Bridge {
     pub(crate) fn request_interruptible(
         &mut self, action: &str, fields: &[&str], mut checkpoint: impl FnMut() -> Result<()>,
     ) -> Result<Vec<String>> {
+        self.model_error = None;
         self.request_id += 1;
         let id = format!("{}", self.request_id);
         let mut frame = format!("{id}\t{action}");
@@ -145,6 +169,8 @@ impl Bridge {
             Some(b"error") => {
                 if let Some(Ok(detail)) = parts.next().map(decode) {
                     print(&format!("agent: model error: {detail:?}\n"));
+                    let retryable = parts.next().and_then(|part| decode(part).ok()).as_deref() == Some("retryable");
+                    self.model_error = Some(ModelError { detail, retryable });
                 }
                 Err("model bridge returned an error")
             }
@@ -159,11 +185,10 @@ impl Bridge {
         checkpoint: &mut impl FnMut() -> Result<()>,
     ) -> Result<Vec<u8>> {
         while ticks() < deadline {
-            #[cfg(feature = "split")]
-            crate::panes::checkpoint();
+            crate::scheduler::checkpoint();
             checkpoint()?;
             let Some(byte) = self.console.recv(true).map_err(|_| "model response failed")? else {
-                core::hint::spin_loop();
+                crate::scheduler::sleep_ms(1);
                 continue;
             };
             if byte != b'\n' {
@@ -212,16 +237,18 @@ pub fn inspect(
     bridge: &mut Bridge,
     question: &str,
     cwd: &str,
+    git_reference: &str,
     query: impl Fn(&str, &str) -> Result<String>,
 ) -> Result<()> {
     print("agent: inspecting guest state\n");
+    let instruction = format!("{INSPECT_PROMPT}\n\n{PLATFORM_GUIDE}");
     let mut observations = Vec::<String>::new();
     loop {
         let remaining = MAX_INSPECT_QUERIES - observations.len();
         let budget = format!("{remaining}");
-        let mut fields = alloc::vec![INSPECT_PROMPT, question, cwd, &budget];
+        let mut fields = alloc::vec![instruction.as_str(), question, cwd, &budget, git_reference];
         fields.extend(observations.iter().map(String::as_str));
-        let reply = bridge.request("inspect", &fields)?;
+        let reply = bridge.request("inspect-context", &fields)?;
         match reply.as_slice() {
             [kind, answer] if kind == "answer" => {
                 if observations.is_empty() {
