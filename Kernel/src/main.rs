@@ -74,7 +74,17 @@ unsafe impl GlobalAlloc for Allocator {
 static HEAP: Allocator = Allocator(UnsafeCell::new(Heap::empty()));
 // Keep the fixed EL0 virtual image range clear of identity-mapped heap addresses.
 const HEAP_START: usize = 0x4440_0000;
-const MAPPED_RAM: usize = 512 * 1024 * 1024;
+// The first EL0 arena begins at 0x68000000. Physical heap memory stays
+// below that alias in every process's identity map.
+const MAPPED_RAM: usize = user::ARENA_BASE - 0x4000_0000;
+
+// Large build VMs have a contiguous privileged heap above the 32-bit EL0 ABI.
+const HIGH_HEAP: usize = 1 << 32;
+const GIB: usize = 1 << 30;
+pub(crate) fn high_heap_end() -> Option<usize> {
+    let end = (0x4000_0000 + inspect::ram_size()?).min(32 * GIB) / GIB * GIB;
+    (end >= HIGH_HEAP + GIB).then_some(end)
+}
 
 fn put(byte: u8) {
     if !process::capture_agent_output(byte) { return; }
@@ -213,9 +223,12 @@ extern "C" fn console_io(value: u64, operation: u64) -> u64 {
 extern "C" fn kernel_main() -> ! {
     unsafe {
         let ram = inspect::ram_size().unwrap_or(128 * 1024 * 1024).min(MAPPED_RAM);
-        let heap_bytes = (0x4000_0000 + ram).saturating_sub(HEAP_START);
+        let (start, heap_bytes) = high_heap_end().map_or(
+            (HEAP_START, (0x4000_0000 + ram).saturating_sub(HEAP_START)),
+            |end| (HIGH_HEAP, end - HIGH_HEAP),
+        );
         if heap_bytes < 1024 * 1024 { print("Insufficient guest RAM\n"); idle(); }
-        (&mut *HEAP.0.get()).init(HEAP_START as *mut u8, heap_bytes);
+        (&mut *HEAP.0.get()).init(start as *mut u8, heap_bytes);
         write_volatile(UART_LINE_CONTROL, WORD_LENGTH_8);
         write_volatile(UART_CONTROL, TX_ENABLE | UART_ENABLE | (1 << 9));
     }

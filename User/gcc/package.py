@@ -20,7 +20,7 @@ sdk = py/"sysroot"
 def run(*args):
     subprocess.run(args, check=True)
 
-def tool(package, name, elf):
+def tool(package, name, elf, library="/lib/gcc", launcher_flag="-DLX_GCC", build_dir=work):
     data = elf.read_bytes()
     entry, phoff = struct.unpack_from("<QQ", data, 24)
     phsize, n = struct.unpack_from("<HH", data, 54)
@@ -29,9 +29,9 @@ def tool(package, name, elf):
     if (rx[1:4] != (5, 0, 0x78000000) or rw[1] != 6 or rw[3] % (2<<20)
         or not rx[3] <= entry < rx[3]+rx[5] <= rw[3] or rw[3]+rw[6]+(2<<20) >= 0x80000000):
         raise ValueError(f"invalid load image for {name}")
-    layout = work/f"launch-{elf.stem}"
+    layout = build_dir/f"launch-{elf.stem}"
     layout.mkdir(exist_ok=True)
-    contents = package/"lib/gcc/images"
+    contents = package/library.lstrip("/")/"images"
     contents.mkdir(parents=True, exist_ok=True)
     constants = dict(IMAGE_BASE=rx[3], TEXT_BYTES=rw[3]-rx[3], ENTRY_PC=entry, PHNUM=n,
                      STACK_TOP=((rw[3]+rw[6]+4095) & ~4095) + (2<<20))
@@ -46,13 +46,13 @@ def tool(package, name, elf):
         digest = 2166136261
         for b in block:
             digest = ((digest ^ b) * 16777619) & 0xffffffff
-        lines.append(f'{{"/lib/gcc/images/{filename}", {seg[3]:#x}, {len(block)}, {digest:#x}}},')
+        lines.append(f'{{"{library}/images/{filename}", {seg[3]:#x}, {len(block)}, {digest:#x}}},')
     (layout/"layout.h").write_text("\n".join([*lines,"};",""]))
     target = package/name.lstrip("/")
     target.parent.mkdir(parents=True,exist_ok=True)
     run("aarch64-none-elf-gcc","-Os","-ffreestanding","-fno-builtin","-fdata-sections","-ffunction-sections",
         "-nostdlib","-Wl,--gc-sections,--build-id=none,-z,max-page-size=4096,-s","-T",port.parent/"ls/link.ld",
-        "-DLX_GCC",f'-DLX_ARGV0="{name}"',"-I",layout,port.parent/"cpython/loader.c",
+        launcher_flag,f'-DLX_ARGV0="{name}"',"-I",layout,port.parent/"cpython/loader.c",
         port.parent/"tcc/api.c","-o",target)
 
 def package_tools(directory):
@@ -70,7 +70,9 @@ def package_tools(directory):
                     ignore=shutil.ignore_patterns("openssl","zconf.h","zlib.h"))
     shutil.copyfile(port.parent/"tcc/lixin.h", library/"include/lixin.h")
     shutil.copyfile(sdk/"lib/libc.a", library/"libc.a")
-    shutil.copyfile(sdk/"lib/libm.a", library/"libm.a")
+    # musl supplies the symbols in libc and ships these linker-compatible archives.
+    for archive in ("libm.a", "libdl.a", "libpthread.a", "librt.a"):
+        shutil.copyfile(sdk/"lib"/archive, library/archive)
     shutil.copyfile(work/"rt/liblx.a", library/"liblixin.a")
     shutil.copyfile(port/"application.ld", library/"application.ld")
     libgcc = subprocess.check_output(["aarch64-none-elf-gcc","-print-libgcc-file-name"],text=True).strip()

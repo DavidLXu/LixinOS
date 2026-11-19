@@ -66,11 +66,11 @@ pub(crate) struct Batch {
 
 impl Batch {
     pub fn new(volume: &Volume) -> Self {
-        Self { generation: volume.disk.snapshot_status().1, changes: Changes::new(), moved_versions: Versions::new(), moved_times: disk::Times::new(), touched: BTreeSet::new() }
+        Self { generation: volume.disk.revision(), changes: Changes::new(), moved_versions: Versions::new(), moved_times: disk::Times::new(), touched: BTreeSet::new() }
     }
 
     fn unchanged(&self, volume: &Volume) -> Result<()> {
-        if self.generation != volume.disk.snapshot_status().1 {
+        if self.generation != volume.disk.revision() {
             return Err("filesystem changed during transaction; retry");
         }
         Ok(())

@@ -41,6 +41,7 @@ static int magic(struct file f, const char *s, u32 n) {
 
 static u64 root[512] __attribute__((aligned(4096)));
 static u64 ram[512] __attribute__((aligned(4096)));
+static u64 extended[512] __attribute__((aligned(4096)));
 static u64 ram_high[512] __attribute__((aligned(4096)));
 extern void enable_mmu(u64 *table, void (*vectors)(void)), native_vectors(void), sync_image(void);
 extern long enter_el0(u64 a, u64 b, u64 c, u64 d);
@@ -50,15 +51,16 @@ static u8 *physical(void) {
                     : (u8 *)(0x48000000UL + (bank - 8) * (2 * BLOCK));
 }
 #define ARENA 0x68000000UL
-#define HEAP_FRAMES 80
+#define HEAP_FRAMES 144
 static u8 heap_used[HEAP_FRAMES];
 /* Keep physical frames out of the identity-map addresses used by EL0 arenas. */
 static u64 frame_address(unsigned frame) {
+    if (frame >= 80) return 0x98000000UL + (frame - 80) * BLOCK;
     return frame < 16 ? 0x66000000UL + frame * BLOCK
                       : 0x70000000UL + (frame - 16) * BLOCK;
 }
-enum { GRAPHICS_ARENA, LIBC_ARENA, ARENAS };
-static const u64 arena_base[ARENAS] = {ARENA, 0x78000000UL};
+enum { GRAPHICS_ARENA, LIBC_ARENA, EXTENDED_ARENA, ARENAS };
+static const u64 arena_base[ARENAS] = {ARENA, 0x78000000UL, 0xc0000000UL};
 static struct frame_map {
     u8 frames[64];
     unsigned count, sealed;
@@ -66,9 +68,10 @@ static struct frame_map {
 static void map_heap(unsigned id) {
     for (unsigned kind = 0; kind < ARENAS; kind++) {
         struct frame_map *heap = &heaps[id][kind];
-        unsigned first = (arena_base[kind] - 0x40000000UL) / BLOCK;
+        u64 *table = kind == EXTENDED_ARENA ? extended : ram;
+        unsigned first = (arena_base[kind] % (1UL << 30)) / BLOCK;
         for (unsigned i = 0; i < 64; i++) {
-            ram[first + i] = i < heap->count ? frame_address(heap->frames[i]) | NORMAL |
+            table[first + i] = i < heap->count ? frame_address(heap->frames[i]) | NORMAL |
                                                    EL0 | PXN | (i < heap->sealed ? RO : UXN)
                                              : 0;
         }
@@ -117,6 +120,8 @@ struct process {
     char cwd[513], path[513], args[32768];
     char executable[513], start_args[32768], git_meta[513];
     unsigned start_used, start_argc, pane, start_flags;
+    unsigned null_streams, env_result;
+    char environment[8192];
     int background, agent, agent_child;
     char scope[513];
     unsigned command_output;
@@ -163,6 +168,8 @@ int agent_path_allowed(const char *path, int writing) {
         under(path,"/libexec") || under(path,"/proc") || equal(path,"/"));
 }
 static void inherit_scope(struct process *child, struct process *parent) {
+    child->env_result = parent->env_result;
+    if (child->env_result) memcpy(child->environment,parent->environment,child->env_result-1);
     if (parent->scope[0]) {
         memcpy(child->scope,parent->scope,length(parent->scope,513)+1);
         child->command_deadline=parent->command_deadline;
@@ -608,6 +615,7 @@ static long stream_read(struct process *p, u8 *dst, unsigned n) {
         return 0;
     if (p->closed & 1)
         return -1;
+    if (p->null_streams & 1) return 0;
     if (p->in)
         return pipe_read(p->in, dst, n);
     if (p->input) {
@@ -635,6 +643,7 @@ static long stream_write(struct process *p, unsigned fd, const u8 *src, unsigned
     }
     if (p->closed & (1u << fd))
         return -1;
+    if (p->null_streams & (1u << fd)) return n;
     if (fd == 2 && p->err) return pipe_write(p->err, src, n);
     if (fd == 1 && p->out)
         return pipe_write(p->out, src, n);
@@ -776,6 +785,7 @@ long native_syscall(u64 value, u64 op) {
     case 45:
         return file_operation(bank, p->cwd, value, mail);
     case 42:
+        if (value == 5) return reply(mail, p->executable);
         if (!value)
             return reply(mail, p->cwd);
         if (length(mail, 513) > 512 || !resolve(p->cwd, mail, path))
@@ -862,7 +872,8 @@ long native_syscall(u64 value, u64 op) {
         u64 start = clock_ticks(), duration = clock_hz() * (u32)value / 1000;
         for (;;) {
             unsigned ready = 0;
-            if (index == 0)
+            if (index < 3 && (p->null_streams & (1u << index))) ready = index ? 2 : 1;
+            else if (index == 0)
                 ready =
                     p->in ? pipe_ready(p->in, 0) : !!(p->input || p->background || console_ready());
             else if (index < 3)
@@ -1068,6 +1079,14 @@ long native_syscall(u64 value, u64 op) {
         memset(child, 0, sizeof(*child));
         child->agent_child = p->agent;
         inherit_scope(child,p);
+        if (value & (1UL << 24)) {
+            unsigned len = (u8)data[0] | ((unsigned)(u8)data[1] << 8);
+            if (len > sizeof(child->environment) || len+2 >= size || (len && data[1+len])) return -1;
+            memcpy(child->environment, data+2, len);
+            child->env_result = len+1;
+            data += 2+len;
+            size -= 2+len;
+        }
         if (!resolve(p->cwd, data, child->cwd) || !vfs_lookup(child->cwd,&f) || f.size != 0xffffffff) return -1;
         unsigned offset = length(data,size)+1;
         if (offset >= size || !resolve(child->cwd, data+offset, child->executable) ||
@@ -1082,10 +1101,18 @@ long native_syscall(u64 value, u64 op) {
         }
         struct pipe *streams[3] = {p->in,p->out,p->err};
         child->closed = p->closed;
+        child->null_streams = p->null_streams;
         for (unsigned i=0;i<3;i++) {
             unsigned raw = (value >> (i*8)) & 255;
             if (raw == i) continue;
-            if (raw == 1 && i == 2) {streams[2]=streams[1]; continue;}
+            child->null_streams &= ~(1u << i);
+            if (raw == 255) {
+                child->null_streams |= 1u << i;
+                child->closed &= ~(1u << i);
+                streams[i] = 0;
+                continue;
+            }
+            if (raw == 1 && i == 2) {streams[2]=streams[1]; child->null_streams |= (child->null_streams & 2) << 1; continue;}
             if (raw < 3 || raw >= 19 || !p->handles[raw-3].pipe ||
                 p->handles[raw-3].writer != !!i) return -1;
             streams[i] = p->handles[raw-3].pipe;
@@ -1126,6 +1153,11 @@ long native_syscall(u64 value, u64 op) {
         sync_image();
         return 0;
     }
+    case 54: return task_pid();
+    case 53:
+        if (p->env_result) memcpy((void *)MAIL,p->environment,p->env_result-1);
+        return p->env_result;
+    case 52: return grow_heap(EXTENDED_ARENA, value);
     case 37:
         return grow_heap(LIBC_ARENA, value);
     case 23:
@@ -1134,7 +1166,7 @@ long native_syscall(u64 value, u64 op) {
         reply(mail, path);
         return 0;
     case 24:
-        if (value == 2) return !p->agent && !(p->closed & 1) && !p->in && !p->input;
+        if (value == 2) return !p->agent && !(p->null_streams & 1) && !(p->closed & 1) && !p->in && !p->input;
         return !p->out && !p->capture;
     default:
         return -1;
@@ -1575,6 +1607,7 @@ int run_login(void) {
     root[0] = 1 | (1 << 10) | 4 | PXN | UXN;
     root[1] = (u64)ram | 3;
     root[2] = (u64)ram_high | 3;
+    root[3] = (u64)extended | 3;
     for (unsigned i = 0; i < 512; i++)
         ram[i] = (0x40000000UL + i * BLOCK) | NORMAL | UXN;
     for (unsigned i = 0; i < (NATIVE_RAM_BYTES - (1024UL << 20)) / BLOCK; i++)

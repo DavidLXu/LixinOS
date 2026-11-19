@@ -111,7 +111,15 @@ case $mode in
 esac
 
 kernel_image=${LIXINOS_KERNEL:-target/aarch64-unknown-none-softfloat/$profile/lixin-kernel}
-if [[ -n ${LIXINOS_KERNEL:-} ]]; then
+release_dir="$root/kernel-artifacts"
+cpython_package=target/user-build/cpython-port/cpython.pkg
+if [[ -z ${LIXINOS_KERNEL:-} && -f "$release_dir/manifest.json" ]]; then
+    variant=$profile
+    if [[ $mode == --ssh ]]; then variant=ssh; fi
+    kernel_image="$release_dir/rust-$variant.elf"
+    cpython_package="$release_dir/cpython.pkg"
+fi
+if [[ -n ${LIXINOS_KERNEL:-} || -f "$release_dir/manifest.json" ]]; then
     [[ -r "$kernel_image" ]] || { printf 'Cannot read kernel image: %s\n' "$kernel_image" >&2; exit 1; }
 else
     if ! rustup_bin=$(command -v rustup); then
@@ -127,7 +135,7 @@ else
 fi
 disk=${LIXINOS_DISK:-../data/lixinos.img}
 # Keep existing standalone kernels on the layout they were built to read.
-ram=512M
+ram=640M
 if [[ -z ${LIXINOS_KERNEL:-} ]]; then
     python3 ../scripts/disk_image.py "$disk"
 elif LC_ALL=C grep -aq LIXDISK4 "$kernel_image"; then
@@ -135,6 +143,13 @@ elif LC_ALL=C grep -aq LIXDISK4 "$kernel_image"; then
     ram=1536M
 else
     python3 ../scripts/disk_image.py --previous-layout "$disk"
+fi
+if [[ $(head -c8 "$disk") == LIXBLD01 ]]; then
+    if [[ -n ${LIXINOS_KERNEL:-} ]]; then
+        echo "The dedicated Rust build volume requires the Rust kernel." >&2
+        exit 1
+    fi
+    ram=12G
 fi
 clock_offset=$(TZ="${LIXINOS_TIMEZONE:-Asia/Shanghai}" date +%z)
 launcher=("$(command -v qemu-system-aarch64)")
@@ -160,7 +175,7 @@ vm_args=(
 if [[ -n ${LIXINOS_KERNEL:-} ]]; then
     vm_args+=(-fw_cfg "name=opt/lixinos/mode,string=${mode#--}")
 else
-    vm_args+=(-fw_cfg "name=opt/lixinos/cpython,file=target/user-build/cpython-port/cpython.pkg")
+    vm_args+=(-fw_cfg "name=opt/lixinos/cpython,file=${cpython_package//,/,,}")
 fi
 if [[ ${DEEPSEEK_API_KEY+x} != x ]]; then
     if DEEPSEEK_API_KEY=$(/usr/bin/security find-generic-password \

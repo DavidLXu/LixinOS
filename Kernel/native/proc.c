@@ -44,7 +44,7 @@ int vfs_lookup(const char *path, struct file *f) {
     if (i == 0)
         p = add_text(p, "processor\t: 0\nmodel name\t: LixinOS aarch64 vCPU\n");
     if (i == 1) {
-        u64 free = ((160UL << 20) + NATIVE_FILE_POOL - heap_bytes()) / 1024;
+        u64 free = ((288UL << 20) + NATIVE_FILE_POOL - heap_bytes()) / 1024;
         p = add_number(add_text(p, "MemTotal:       1572864 kB\nMemFree:        "), free);
         p = add_number(add_text(p, " kB\nMemAvailable:   "), free);
         p = add_text(p, " kB\nSwapTotal:      0 kB\nSwapFree:       0 kB\n");

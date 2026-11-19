@@ -159,7 +159,7 @@ impl RunTarget {
         let volume = project.volume.borrow();
         let bytes = volume.read_file(&path).ok()?;
         Some(Self { path, bytes, command: visible(&format!("{argv:?}"), 256),
-            generation: volume.disk.snapshot_status().1 })
+            generation: volume.disk.revision() })
     }
 }
 

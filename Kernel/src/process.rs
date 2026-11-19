@@ -143,7 +143,9 @@ impl Volume {
         let now = crate::utility::wall_seconds();
         let mut undo = Vec::with_capacity(changes.size_hint().0);
         let mut parents = alloc::collections::BTreeSet::new();
+        let mut scratch_only = true;
         for (path, existed) in changes {
+            scratch_only &= self.disk.scratch_path(path) && !self.versions.contains_key(path);
             let present = self.files.contains_key(path);
             let previous = self.disk.times.get(path).copied();
             undo.push((path, previous));
@@ -172,7 +174,12 @@ impl Volume {
                 ..previous.unwrap_or_default()
             }));
         }
-        if let Err(error) = self.disk.save(&self.files, &self.versions) {
+        let saved = if scratch_only && !undo.is_empty() {
+            self.disk.write_back(&self.files, &undo)
+        } else {
+            self.disk.save(&self.files, &self.versions)
+        };
+        if let Err(error) = saved {
             for (path, time) in undo.into_iter().rev() {
                 self.set_time(path, time);
             }
@@ -371,7 +378,7 @@ impl Services {
             ("cpu", "") => Ok(inspect::cpu()),
             ("memory", "") => Ok(inspect::memory()),
             ("disk", "") => Ok(inspect::disk(&self.volume.borrow().disk)),
-            ("filesystem", "") => Ok(inspect::filesystem(&self.volume.borrow().files)),
+            ("filesystem", "") => Ok(inspect::filesystem(&self.volume.borrow())),
             ("list" | "stat", path) if !path.is_empty() => {
                 let path = self.path(path)?;
                 let volume = self.volume.borrow();
@@ -403,6 +410,13 @@ impl Services {
     fn launch_legacy(&mut self, cmd: &str, tokens: &[String], status_out: &mut u8) -> Result<()> {
         let standalone = (tokens.len() == 1).then_some(cmd);
         if standalone == Some("shutdown") {
+            {
+                let mut volume = self.volume.borrow_mut();
+                if volume.disk.scratch_dirty {
+                    let Volume { disk, files, versions } = &mut *volume;
+                    disk.save(files, versions)?;
+                }
+            }
             print("Shutting down LixinOS...\n");
             // QEMU virt exposes PSCI SYSTEM_OFF via HVC at EL1.
             unsafe {
@@ -690,7 +704,7 @@ fn install_sources(volume: &mut Volume) -> Result<()> {
                     "/src/kernel/loader-sources" => (bytes.len(), disk::checksum(bytes)) == (80, 0x7534928c),
                     "/src/kernel/sources" => (bytes.len(), disk::checksum(bytes)) == (1080, 0x2cdd_da4a),
                     "/src/kernel/process.c" => matches!((bytes.len(), disk::checksum(bytes)),
-                        (13400, 0x0898_6dcc) | (45380, 0x5748_cd25) | (45801, 0x0a75_b6e9) | (52797, 0x254e_c10a) | (58020, 0x29ef_4f7f)),
+                        (13400, 0x0898_6dcc) | (45380, 0x5748_cd25) | (45801, 0x0a75_b6e9) | (52797, 0x254e_c10a) | (58020, 0x29ef_4f7f) | (58028, 0x44859e47)),
                     "/src/kernel/net.c" => (bytes.len(), disk::checksum(bytes)) == (8078, 0xfdb2_d249),
                     "/src/kernel/task.c" => matches!((bytes.len(), disk::checksum(bytes)), (5587, 0xb041_d7c8) | (5698, 0x6ff2_a8b3)),
                     "/src/kernel/disk.c" => matches!((bytes.len(), disk::checksum(bytes)),
@@ -699,7 +713,7 @@ fn install_sources(volume: &mut Volume) -> Result<()> {
                         (999, 0x055d_fc37) | (4091, 0xf3f4_5034) | (4367, 0x5e65_fa6c)),
                     "/src/kernel/display.c" => matches!((bytes.len(), disk::checksum(bytes)),
                         (4726, 0x739a_83ce) | (25975, 0xc6a3_fe7b) | (27711, 0x4571_61b1)),
-                    "/src/kernel/proc.c" => matches!((bytes.len(), disk::checksum(bytes)), (3080, 0x5026_f57d) | (3094, 0x934c_4a47)),
+                    "/src/kernel/proc.c" => matches!((bytes.len(), disk::checksum(bytes)), (3080, 0x5026_f57d) | (3094, 0x934c_4a47) | (3085, 0xcd825883)),
                     "/src/kernel/kernel.c" => matches!((bytes.len(), disk::checksum(bytes)),
                         (1090, 0x4f0a_818c) | (2768, 0x69ee_92b2) | (2768, 0x7556_94ab)),
                     "/src/console.h" => matches!((bytes.len(), disk::checksum(bytes)), (569, 0x5646a81d)),
@@ -949,8 +963,8 @@ fn session(services: Services, history: VecDeque<String>) -> u8 {
         Some(image) => {
             // A locally compiled replacement can also serve as the login program.
             crate::utility::with_io("/", services.volume.clone(), None, false, || {
-                if let Some((code, data)) = crate::utility::load_segments(&image) {
-                    crate::user::launch_segments(code, data, Some(("/", "")), false)
+                if crate::utility::load_segments(&image).is_some() {
+                    crate::utility::launch_program(&image, "/", "")
                         .and_then(|status| u8::try_from(status).map_err(|_| "invalid exit status"))
                 } else {
                     Err("invalid login program")

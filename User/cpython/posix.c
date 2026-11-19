@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/auxv.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -30,8 +31,9 @@
 long lx_mmap(long, unsigned long, long, long, long);
 long lx_munmap(uintptr_t, unsigned long);
 long lx_brk(uintptr_t);
+extern int lx_save_buffer(const char *, const void *, unsigned);
 int lx_getchar(void);
-#define FILE_LIMIT (100L << 20)
+#define FILE_LIMIT (512L << 20) /* The mounted volume enforces its own limit. */
 #define MAIL ((char *)0x443d7000)
 struct handle {
     char path[513];
@@ -45,7 +47,7 @@ static struct handle files[32];
 static struct handle *handle(long fd) {
     return fd >= 3 && fd < 35 && files[fd - 3].path[0] ? &files[fd - 3] : NULL;
 }
-enum { TCP = 1, PIPE_FD };
+enum { TCP = 1, PIPE_FD, NULL_FD };
 static int stream_fd(int kind, int raw, int flags) {
     for (int i = 0; i < 32; ++i) if (!files[i].path[0]) {
         struct handle *h = &files[i];
@@ -69,6 +71,7 @@ static int ready(long fd, int events) {
     struct handle *h = handle(fd);
     if (!h && fd >= 3) return POLLNVAL;
     if (h && !h->kind) return events & (POLLIN | POLLOUT);
+    if (h && h->kind == NULL_FD) return events & (POLLIN | POLLOUT);
     if (h && h->fd < 0) return POLLHUP;
     int interests = ((events & POLLIN) ? 1 : 0) | ((events & POLLOUT) ? 2 : 0);
     if (!interests) return 0;
@@ -114,6 +117,7 @@ int lx_child_descriptor(int fd, int standard) {
     if (fd == -1 || fd == standard) return standard;
     if (standard == 2 && fd == 1) return 1;
     struct handle *h = handle(fd);
+    if (h && h->kind == NULL_FD) return 255;
     return h && h->kind == PIPE_FD ? h->fd : -1;
 }
 static int children[64];
@@ -161,8 +165,16 @@ static int resolve_at(long parent, const char *path, char absolute[513]) {
 }
 static long port_openat(long parent, const char *path, int flags) {
     char absolute[513];
+    if (!strcmp(path, "/dev/null")) {
+        if (flags & O_DIRECTORY) return -ENOTDIR;
+        return stream_fd(NULL_FD, -1, flags);
+    }
     int error = resolve_at(parent, path, absolute);
     if (error) return error;
+    if (!strcmp(absolute, "/dev/null")) {
+        if (flags & O_DIRECTORY) return -ENOTDIR;
+        return stream_fd(NULL_FD, -1, flags);
+    }
     long size = lx_stat(absolute);
     if (size < 0 && size != LX_DIR && !(flags & O_CREAT))
         return -ENOENT;
@@ -267,6 +279,11 @@ static long transfer(long fd, void *buf, size_t n, int write) {
     struct handle *h = handle(fd);
     if (fd < 0 || (!h && fd >= 3))
         return -EBADF;
+    if (h && h->kind == NULL_FD) {
+        int mode = h->flags & O_ACCMODE;
+        if ((write && mode == O_RDONLY) || (!write && mode == O_WRONLY)) return -EBADF;
+        return write ? (long)n : 0;
+    }
     if (h && h->kind) return stream_io(h,buf,n,write,0);
     if (h && h->size == LX_DIR)
         return -EISDIR;
@@ -300,6 +317,33 @@ static long seek_file(struct handle *h, long off, int whence) {
     h->pos = pos;
     return pos;
 }
+// Fast path for a complete copy into an empty file. The native save ABI
+// publishes all bytes in one snapshot. Other copy shapes use libc's fallback.
+static long copy_whole_file(long infd, long outfd, unsigned long length) {
+    struct handle *in = handle(infd), *out = handle(outfd);
+    if (!in || !out) return -EBADF;
+    if (in->kind || out->kind || in->size < 0 || out->size < 0) return -EXDEV;
+    if ((in->flags & O_ACCMODE) != O_RDONLY || (out->flags & O_ACCMODE) == O_RDONLY) return -EBADF;
+    if (in->pos == in->size || !length) return 0;
+    if (in->pos || out->pos || out->size || (unsigned long)in->size > length) return -EXDEV;
+    unsigned char *data = malloc(in->size);
+    if (!data) return -EXDEV;
+    long done = 0;
+    while (done < in->size) {
+        int n = lx_read(in->fd, data + done, in->size - done);
+        if (n <= 0) break;
+        done += n;
+    }
+    long result = -EIO;
+    if (done == in->size && lx_save_buffer(out->path, data, done) == 0) {
+        in->pos = done;
+        result = seek_file(out, done, SEEK_SET);
+    } else {
+        seek_file(in, 0, SEEK_SET);
+    }
+    free(data);
+    return result;
+}
 static long port_getdents(struct handle *h, char *out, size_t cap) {
     if (!h || h->size != LX_DIR)
         return -ENOTDIR;
@@ -331,6 +375,18 @@ long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
     char absolute[513], target[513];
     int error;
     switch (op) {
+    case SYS_prlimit64: {
+        if (a != 0 || b != RLIMIT_NOFILE || c) return -ENOTSUP;
+        if (!d) return 0;
+        long limit = console_call(42, 6);
+        // Older kernels provide 16 file handles in addition to standard I/O.
+        if (limit < 3) limit = 19;
+        long local_limit = 3 + sizeof(files) / sizeof(files[0]);
+        if (limit > local_limit) limit = local_limit;
+        struct rlimit *info = (void *)d;
+        info->rlim_cur = info->rlim_max = limit;
+        return 0;
+    }
     case SYS_exit:
         lx_thread_exit(NULL, 0);
     case SYS_exit_group:
@@ -451,11 +507,29 @@ long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
         if (op == SYS_truncate) lx_posix(SYS_close, fd,0,0,0,0,0);
         return status < 0 ? -EIO : 0;
     }
+    case SYS_copy_file_range:
+        if (f) return -EINVAL;
+        if (b || d) return -EXDEV;
+        return copy_whole_file(a, c, e);
+    case SYS_pread64:
+    case SYS_pwrite64: {
+        if (!h || h->kind || h->size < 0) return -ESPIPE;
+        long saved = h->pos;
+        long pos = seek_file(h, d, SEEK_SET);
+        if (pos < 0) return pos;
+        long count = transfer(a, (void *)b, c, op == SYS_pwrite64);
+        long restored = seek_file(h, saved, SEEK_SET);
+        return restored < 0 ? restored : count;
+    }
     case SYS_lseek:
         return seek_file(h, b, c);
     case SYS_getdents64:
         return port_getdents(h, (void *)b, c);
+    case SYS_fchmod:
+        if (!h) return -EBADF;
+        return (b & 07777) == 0777 ? 0 : -ENOTSUP;
     case SYS_fstat:
+        if (h && h->kind == NULL_FD) return stat_info("/dev/null", 0, (void *)b, 1);
         if (a >= 0 && a < 3)
             return stat_info("stdio", 0, (void *)b, 1);
         if (h && h->kind) { struct stat *st=(void *)b; memset(st,0,sizeof(*st)); st->st_mode=h->kind == TCP ? S_IFSOCK : S_IFIFO; return 0; }
@@ -476,14 +550,28 @@ long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
         if (error) return error;
         if (lx_stat(absolute) == LX_MISSING) return -ENOENT;
         if (!strcmp(absolute, target)) return 0;
-        if (console_call(45, 0) < 0) return -EBUSY;
-        strcpy(MAIL, absolute);
-        strcpy(MAIL + 513, target);
-        if (console_call(45, 5) >= 0 && console_call(45, 6) >= 0) return 0;
-        console_call(45, 7);
-        return -EIO;
-    case SYS_readlinkat:
-        return -EINVAL;
+        for (;;) {
+            if (console_call(45, 0) < 0) return -EBUSY;
+            strcpy(MAIL, absolute);
+            strcpy(MAIL + 513, target);
+            if (console_call(45, 5) >= 0 && console_call(45, 6) >= 0) return 0;
+            // A concurrent writer may commit between the three batch operations.
+            int retry = !strcmp(MAIL, "filesystem changed during transaction; retry");
+            console_call(45, 7);
+            if (!retry) return -EIO;
+        }
+    case SYS_readlinkat: {
+        if (!strcmp(path, "/proc/self/exe")) {
+            const char *exe = (const char *)getauxval(AT_EXECFN);
+            if (!exe || !*exe) return -ENOENT;
+            if (!d) return -EINVAL;
+            size_t n = strnlen(exe, (size_t)d);
+            memcpy((void *)c, exe, n);
+            return n;
+        }
+        error = resolve_at(a, path, absolute);
+        return error ? error : lx_stat(absolute) == LX_MISSING ? -ENOENT : -EINVAL;
+    }
     case SYS_getcwd: {
         long length = console_call(42, 0);
         if (length < 0 || length > 512)
@@ -565,8 +653,10 @@ long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
     }
     case SYS_gettid: return lx_thread_id();
     case SYS_set_tid_address: return lx_clear_tid((int *)a);
-    case SYS_getpid:
-        return lx_pid();
+    case SYS_getpid: {
+        long pid = console_call(54, 0);
+        return pid >= 0 ? pid : lx_pid();
+    }
     case SYS_getuid:
     case SYS_getgid:
     case SYS_geteuid:

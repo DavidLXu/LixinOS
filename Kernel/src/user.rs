@@ -17,6 +17,9 @@ pub const BANKS: usize = crate::scheduler::CAPACITY;
 struct Tables {
     root: Table,
     ram: Table,
+    extended: Table,
+    program: Table,
+    wide: [Table; 4],
 }
 static mut SPACES: [*mut Tables; BANKS] = [core::ptr::null_mut(); BANKS];
 fn tables(slot: usize) -> *mut Tables {
@@ -152,9 +155,19 @@ pub fn setup_bank(bank: usize) -> Result<(), &'static str> {
         // MAIR slot 0 = Normal write-through RAM (also permits EL0 exclusives), slot 1 = Device-nGnRnE.
         (*tables(bank)).root.0[0] = 1 | AF | 4 | PXN | UXN;
         (*tables(bank)).root.0[1] = addr_of_mut!((*tables(bank)).ram) as u64 | 3;
+        (*tables(bank)).root.0[2] = addr_of_mut!((*tables(bank)).program) as u64 | 3;
+        (*tables(bank)).root.0[3] = addr_of_mut!((*tables(bank)).extended) as u64 | 3;
         for i in 0..crate::MAPPED_RAM / BLOCK {
             let pa = 0x40000000 + i * BLOCK;
             (*tables(bank)).ram.0[i] = pa as u64 | AF | SH | UXN | 1;
+        }
+        if let Some(end) = crate::high_heap_end() {
+            for i in 0..4 {
+                (*tables(bank)).root.0[WIDE_BASE / crate::GIB + i] = addr_of_mut!((*tables(bank)).wide[i]) as u64 | 3;
+            }
+            for address in (crate::HIGH_HEAP..end).step_by(crate::GIB) {
+                (*tables(bank)).root.0[address / crate::GIB] = address as u64 | AF | SH | PXN | UXN | 1;
+            }
         }
         // No program has been launched into this address space yet.
         for i in 0..2 {
@@ -234,7 +247,7 @@ pub fn init() {
             "mrs x9, sctlr_el1","orr x9,x9,#1","orr x9,x9,#4","msr sctlr_el1,x9","isb",
             "mrs x9,cpacr_el1","orr x9,x9,#(3<<20)","msr cpacr_el1,x9","isb",
             vectors=in(reg)user_vectors as *const () as usize,attr=in(reg)0xbbu64,
-            tcr=in(reg)(25u64|(1<<23)|(3<<12)),table=in(reg)addr_of_mut!((*tables(0)).root),out("x9") _);
+            tcr=in(reg)(25u64|(1<<23)|(3<<12)|((crate::high_heap_end().is_some() as u64)<<32)),table=in(reg)addr_of_mut!((*tables(0)).root),out("x9") _);
     }
 }
 // Reserved by User/user.ld immediately below the user stack.
@@ -299,7 +312,9 @@ pub(crate) fn copy_user_file(descriptor: u64, heap: Option<&UserArena>) -> Optio
     // Nonempty parts contribute at least one byte apiece.
     if count > size { return None; }
     let table = buffer(address.checked_add(4)?, count.checked_mul(12)?)?;
-    let mut file = alloc::vec![0; size];
+    let mut file = Vec::new();
+    file.try_reserve_exact(size).ok()?;
+    file.resize(size, 0);
     let mut remaining = size;
     for part in table.chunks_exact(12) {
         let offset = word(&part[..4]);
@@ -415,6 +430,15 @@ pub(crate) fn launch_segments(image: &[u8], data: &[u8], script: Option<(&str, &
     }
 }
 #[unsafe(no_mangle)]
+extern "C" fn report_user_fault(esr: u64, pc: u64, address: u64, sp: u64) -> u64 {
+    crate::print(&alloc::format!("User fault: ESR={esr:#x} PC={pc:#x} FAR={address:#x} SP={sp:#x}\n"));
+    match esr >> 26 {
+        0x20 | 0x24 => 139, // instruction or data abort from EL0
+        _ => 132,
+    }
+}
+
+#[unsafe(no_mangle)]
 extern "C" fn kernel_vector_fault() -> ! {
     crate::print("Fatal EL1 exception\n");
     crate::idle()
@@ -424,6 +448,10 @@ extern "C" fn kernel_vector_fault() -> ! {
 // blocks. The normal identity mapping of the kernel heap stays privileged.
 pub(crate) const ARENA_BASE: usize = 0x6800_0000;
 pub(crate) const WEB_HEAP_BASE: usize = 0x7800_0000;
+const PROGRAM_BASE: usize = 0xa000_0000;
+pub(crate) const EXTENDED_BASE: usize = 0xc000_0000;
+pub(crate) const WIDE_BASE: usize = 64 * crate::GIB;
+const PROGRAM_LIMIT: usize = EXTENDED_BASE - PROGRAM_BASE;
 const ARENA_LIMIT: usize = 128 * 1024 * 1024;
 const _: () = assert!(ARENA_BASE + ARENA_LIMIT <= ALIAS && ALIAS + USER_REGION_BYTES <= WEB_HEAP_BASE
     && WEB_HEAP_BASE + ARENA_LIMIT <= 0x8000_0000);
@@ -437,8 +465,32 @@ impl UserArena {
     pub fn new() -> Self {
         Self::at(ARENA_BASE)
     }
+    pub fn browser_heap_limit() -> usize {
+        if crate::high_heap_end().is_some() { PROGRAM_BASE - WEB_HEAP_BASE } else { ARENA_LIMIT }
+    }
     pub fn for_browser_heap() -> Self {
         Self::at(WEB_HEAP_BASE)
+    }
+    pub fn for_program() -> Self { Self::at(PROGRAM_BASE) }
+    pub fn wide() -> Self { Self::at(WIDE_BASE) }
+    pub fn extended() -> Self {
+        Self::at(EXTENDED_BASE)
+    }
+    unsafe fn entry(&self, i: usize) -> *mut u64 {
+        let space = tables(self.bank);
+        unsafe {
+            if self.base == WEB_HEAP_BASE && WEB_HEAP_BASE + i * BLOCK >= 0x8000_0000 {
+                addr_of_mut!((*space).program.0[(WEB_HEAP_BASE + i * BLOCK - 0x8000_0000) / BLOCK])
+            } else if self.base == PROGRAM_BASE {
+                addr_of_mut!((*space).program.0[(PROGRAM_BASE % crate::GIB) / BLOCK + i])
+            } else if self.base == WIDE_BASE {
+                addr_of_mut!((*space).wide[i / 512].0[i % 512])
+            } else if self.base == EXTENDED_BASE {
+                addr_of_mut!((*space).extended.0[i])
+            } else {
+                addr_of_mut!((*space).ram.0[(self.base - 0x40000000) / BLOCK + i])
+            }
+        }
     }
     fn at(base: usize) -> Self {
         Self {
@@ -449,7 +501,7 @@ impl UserArena {
     pub fn set_mapped(&self, visible: bool) {
         if self.blocks.is_empty() { return; }
         for (i, block) in self.blocks.iter().enumerate() {
-            unsafe { (*tables(self.bank)).ram.0[(self.base-0x40000000)/BLOCK+i] =
+            unsafe { *self.entry(i) =
                 if visible {block.as_ptr() as u64 | 1 | AF | SH | USER_ACCESS | PXN
                     | if i < self.sealed { READ_ONLY } else { UXN }} else {0}; }
         }
@@ -469,7 +521,14 @@ impl UserArena {
         address>=self.base && address.checked_add(bytes).is_some_and(|end| end<=self.base+self.blocks.len()*BLOCK)
     }
     pub fn grow(&mut self, bytes: usize) -> Result<(), &'static str> {
-        if bytes > ARENA_LIMIT {
+        let limit = match self.base {
+            WEB_HEAP_BASE if bytes > ARENA_LIMIT => Self::browser_heap_limit(),
+            PROGRAM_BASE => PROGRAM_LIMIT,
+            EXTENDED_BASE if bytes > ARENA_LIMIT && crate::high_heap_end().is_some() => crate::GIB,
+            WIDE_BASE => 4 * crate::GIB,
+            _ => ARENA_LIMIT,
+        };
+        if bytes > limit {
             return Err("user heap limit");
         }
         let count = bytes.div_ceil(BLOCK);
@@ -480,9 +539,9 @@ impl UserArena {
         while self.blocks.len() < count {
             let block = core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
                 .ok_or("out of memory")?;
-            let index = (self.base - 0x40000000) / BLOCK + self.blocks.len();
+            let index = self.blocks.len();
             unsafe {
-                (*tables(self.bank)).ram.0[index] =
+                *self.entry(index) =
                     block.as_ptr() as u64 | 1 | AF | SH | USER_ACCESS | PXN | UXN;
                 asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
             }
@@ -497,7 +556,7 @@ impl Drop for UserArena {
         let layout = core::alloc::Layout::from_size_align(BLOCK, BLOCK).unwrap();
         unsafe {
             for i in 0..self.blocks.len() {
-                (*tables(self.bank)).ram.0[(self.base - 0x40000000) / BLOCK + i] = 0;
+                *self.entry(i) = 0;
             }
             asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
             for block in self.blocks.drain(..) {
@@ -578,4 +637,53 @@ pub(crate) fn continue_process()->Result<u16,&'static str> {
 fn resume_with_flags(memory: ImageMemory, flags: usize) -> Result<u16, &'static str> {
     replace_image(Some(memory));
     u16::try_from(unsafe { enter_user(0, 0, 0, flags) }).map_err(|_| "user program fault")
+}
+
+// A small entry segment preserves the utility calling convention. A separate
+// arena holds the full program, with a block-aligned boundary between RX and RW.
+pub(crate) struct LargeProgram<'a> {
+    pub entry: &'a [u8],
+    text: &'a [u8],
+    data: &'a [u8],
+    writable_offset: usize,
+    bytes: usize,
+}
+impl LargeProgram<'_> {
+    pub fn load(&self, arena: &mut UserArena) -> Result<(), &'static str> {
+        arena.grow(self.bytes)?;
+        unsafe {
+            copy_nonoverlapping(self.text.as_ptr(), PROGRAM_BASE as *mut u8, self.text.len());
+            copy_nonoverlapping(self.data.as_ptr(), (PROGRAM_BASE + self.writable_offset) as *mut u8, self.data.len());
+        }
+        if !arena.seal_text(self.writable_offset) { return Err("cannot seal program text"); }
+        Ok(())
+    }
+}
+
+pub(crate) fn large_program(file: &[u8]) -> Option<LargeProgram<'_>> {
+    if file.get(..7)? != b"\x7fELF\x02\x01\x01" || file.get(16..24)? != [2,0,183,0,1,0,0,0]
+        || file.get(54..58)? != [56,0,4,0] { return None; }
+    let wide = |s: &[u8]| usize::try_from(u64::from_le_bytes(s.try_into().ok()?)).ok();
+    if wide(file.get(24..32)?)? != USER { return None; }
+    let off = wide(file.get(32..40)?)?;
+    let table = file.get(off..off.checked_add(4 * 56)?)?;
+    if table[168..172] != 7u32.to_le_bytes() { return None; }
+    let segment = |i:usize, flags:u32| {
+        let p = &table[i*56..(i+1)*56];
+        if p[..4] != 1u32.to_le_bytes() || p[4..8] != flags.to_le_bytes() { return None; }
+        let offset = wide(&p[8..16])?;
+        let size = wide(&p[32..40])?;
+        let mem = wide(&p[40..48])?;
+        if size > mem { return None; }
+        Some((wide(&p[16..24])?, file.get(offset..offset.checked_add(size)?)?, mem))
+    };
+    let (start, entry, stub_size) = segment(0,5)?;
+    let (rx, text, rx_size) = segment(1,5)?;
+    let (rw, data, rw_size) = segment(2,6)?;
+    let writable_offset = rw.checked_sub(PROGRAM_BASE)?;
+    let bytes = writable_offset.checked_add(rw_size)?;
+    if start != USER || entry.len() < 4 || stub_size > BLOCK || rx != PROGRAM_BASE
+        || text.is_empty() || rx_size > PROGRAM_LIMIT || writable_offset != rx_size.next_multiple_of(BLOCK)
+        || bytes > PROGRAM_LIMIT { return None; }
+    Some(LargeProgram { entry, text, data, writable_offset, bytes })
 }
