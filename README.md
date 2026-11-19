@@ -782,3 +782,9 @@ the current index and untracked files. It reads the newest valid snapshot from
 Run `python3 scripts/test-git.py` for the disposable-disk interoperability test.
 The build fetches pinned libgit2 sources, including its COPYING file, into the
 user build cache.
+
+## 内核版本归档
+
+每次内核迭代使用 `python3 scripts/kernel-release.py publish` 生成带日期的 Git 标签，
+同时保留 Rust 与 TCC 的源码、内核二进制和引导文件。用 `list` 查看版本，
+用 `restore TAG 新目录` 恢复可启动的旧版。[发布和回滚说明](docs/kernel-releases.md)

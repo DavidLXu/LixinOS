@@ -43,13 +43,18 @@ fn kernel_sources(dir: &Path, guest: &str, entries: &mut String) {
         if path.is_dir() {
             kernel_sources(&path, &target, entries);
         } else if matches!(path.extension().and_then(|x| x.to_str()), Some("h" | "c" | "S"))
-            || matches!(name, "sources" | "loader-sources") {
+            || matches!(name, "sources" | "loader-sources" | "COPYING") {
             writeln!(entries, "({target:?}, Some(include_bytes!({:?}))),", path.canonicalize().unwrap()).unwrap();
         }
     }
 }
 
 fn main() {
+    // The C kernel and Rust kernel share the revision engraved in a release.
+    let version = include_str!("native/version.h").lines()
+        .find_map(|line| line.strip_prefix("#define KERNEL_TAG \"")?.strip_suffix('"'))
+        .expect("missing KERNEL_TAG in native/version.h");
+    println!("cargo:rustc-env=LIXINOS_KERNEL_TAG={version}");
     let root = Path::new("../User");
     let mut entries = String::from("&[(\"/src\", None),\n");
     source_manifest(root, root, &mut entries);
@@ -109,23 +114,26 @@ fn main() {
         .expect("start ARM64 user program build");
     assert!(status.success(), "failed to build ARM64 user programs");
     kernel_sources(Path::new("native"), "/src/kernel", &mut entries);
-    let lwip = Path::new("target/user-build/micropython/lib/lwip");
-    entries.push_str("(\"/src/kernel/lwip\", None),\n");
-    writeln!(entries, "({:?}, Some(include_bytes!({:?}))),", "/src/kernel/lwip/COPYING",
-        lwip.join("COPYING").canonicalize().unwrap()).unwrap();
-    kernel_sources(&lwip.join("src/include"), "/src/kernel/lwip/include", &mut entries);
-    let mut dirs = std::collections::BTreeSet::new();
-    for line in include_str!("native/sources").lines() {
-        if let Some(source) = line.strip_prefix("/src/kernel/lwip/") {
-            let path = Path::new(line);
-            for parent in path.ancestors().skip(1).collect::<Vec<_>>().into_iter().rev() {
-                if parent.starts_with("/src/kernel/lwip") && parent != Path::new("/src/kernel/lwip")
-                    && dirs.insert(parent.to_owned()) {
-                    writeln!(entries, "({:?}, None),", parent).unwrap();
+    // A release imported from a guest carries its exact lwIP sources in native/lwip.
+    if !Path::new("native/lwip").is_dir() {
+        let lwip = Path::new("target/user-build/micropython/lib/lwip");
+        entries.push_str("(\"/src/kernel/lwip\", None),\n");
+        writeln!(entries, "({:?}, Some(include_bytes!({:?}))),", "/src/kernel/lwip/COPYING",
+            lwip.join("COPYING").canonicalize().unwrap()).unwrap();
+        kernel_sources(&lwip.join("src/include"), "/src/kernel/lwip/include", &mut entries);
+        let mut dirs = std::collections::BTreeSet::new();
+        for line in include_str!("native/sources").lines() {
+            if let Some(source) = line.strip_prefix("/src/kernel/lwip/") {
+                let path = Path::new(line);
+                for parent in path.ancestors().skip(1).collect::<Vec<_>>().into_iter().rev() {
+                    if parent.starts_with("/src/kernel/lwip") && parent != Path::new("/src/kernel/lwip")
+                        && dirs.insert(parent.to_owned()) {
+                        writeln!(entries, "({:?}, None),", parent).unwrap();
+                    }
                 }
+                writeln!(entries, "({:?}, Some(include_bytes!({:?}))),", line,
+                    lwip.join("src").join(source).canonicalize().unwrap()).unwrap();
             }
-            writeln!(entries, "({:?}, Some(include_bytes!({:?}))),", line,
-                lwip.join("src").join(source).canonicalize().unwrap()).unwrap();
         }
     }
     entries.push_str(&fs::read_to_string("target/user-build/micropython-sources.rs").unwrap());

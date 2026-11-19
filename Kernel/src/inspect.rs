@@ -10,7 +10,7 @@ use core::{fmt::Write, ptr::read_volatile, slice};
 type Result<T> = core::result::Result<T, &'static str>;
 
 pub const SYSTEM_NAME: &str = "LixinOS";
-pub const SYSTEM_RELEASE: &str = concat!(env!("CARGO_PKG_VERSION"), "-rust");
+pub const SYSTEM_RELEASE: &str = concat!(env!("LIXINOS_KERNEL_TAG"), "-rust");
 pub const ARCHITECTURE: &str = "aarch64";
 pub fn system_summary() -> String {
     format!("{SYSTEM_NAME} {SYSTEM_RELEASE} {ARCHITECTURE} (standalone; non-Linux)")
