@@ -21,6 +21,18 @@ q
 
 宿主目录中的 `kernel.elf` 是制盘时导出的初始副本。QEMU 的启动参数加载固定的 `loader.elf`，后者从磁盘加载 `/boot/kernel.elf`。引导程序也可以在系统内用 `tcc --bootloader @/src/kernel/loader-sources -o /boot/loader.elf` 重建。更换 QEMU 使用的引导程序需要单独导出这个文件。
 
+### 最小裸机示例
+
+在 TCC 系统镜像副本中，从来宾 Bash 执行以下命令。新制镜像会安装示例源码。使用已有镜像时，先将 [hello-bare.c](examples/hello-bare.c) 放到来宾的 `/src/kernel/examples/`。`boot.S` 提供入口和栈，`hello-bare.c` 直接写 QEMU `virt` 的 PL011 串口寄存器。TCC 引导程序下次启动时会加载副本上的示例，串口会输出 `Hello from bare metal!`，随后关机。
+
+```sh
+tcc --kernel /src/kernel/boot.S /src/kernel/examples/hello-bare.c -o /boot/hello-bare.elf
+cp /boot/hello-bare.elf /boot/kernel.elf
+q
+```
+
+在 Mac 上用 `LIXINOS_TCC_DISK=/path/to/copy.img ./scripts/run-tcc-kernel.sh --serial` 重新启动同一份镜像副本。
+
 ## 从零制盘
 
 选取空目录保存三个输出。首次制盘通过原版 LixinOS 安装用户程序、源码和编译环境，随后在虚拟机内生成引导程序和内核。 使用旧版引导程序的磁盘继续以原有布局启动。要使用 100 MiB 文件，可先用 Rust 内核启动旧磁盘的副本以迁移布局，再在副本中重建内核并导出新版引导程序。以下脚本先验证自举、重启和图形输入，再保存产物。
@@ -64,4 +76,4 @@ python3 scripts/test-million-files.py
 
 在 `agent chat` 中，Bypass 默认开启，本地命令可以直接改动工作目录内的文件。输入 `/bypass` 可切换为逐次询问。暂存脚本的保存和交互终端接管都需要确认。终端接管支持 Bash、Python、Nano 和 Kilo，命令输出通过管道返回。
 
-TCC 内核目前使用针对单 vCPU、1536 MiB 的物理内存布局。启动器保留独立的 Rust 和 TCC 磁盘。
+日常 TCC 系统盘使用 1536 MiB RAM。用于 Rust 自举的独立 `LIXBLD01` 构建盘使用 24 GiB RAM、每文件 512 MiB 上限和大程序地址空间。构建盘把 `/scratch` 的中间文件保存在内存中，正常关机或提交持久文件时才写入磁盘。制作构建盘、选择 TCC 内核以及验证 stage1 的命令见 [Rust 工具链说明](../../User/rust/README.md#native-compiler-and-cargo-build)。

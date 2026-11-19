@@ -578,7 +578,7 @@ fn run_session(
             .to_vec();
         let (steps, preview) = policy_values(policy_source(&volume)).unwrap();
         let mode = if root == "/" { 's' } else if tuning { 't' } else { 'p' };
-        (image, volume.disk.snapshot_status().1, format!("{mode}{steps} {preview}"),
+        (image, volume.disk.revision(), format!("{mode}{steps} {preview}"),
             visible(crate::agent::git_reference(&volume.files), 2048), steps.parse::<usize>().unwrap())
     };
     if chat.is_none() {
@@ -761,7 +761,7 @@ fn run_session(
         let mut stopped_repeating = false;
         let outcome = if command {
             let limit = if turn.modern { budget } else { LEGACY_STEPS };
-            let scope = (project.volume.borrow().disk.snapshot_status().1, updates.len());
+            let scope = (project.volume.borrow().disk.revision(), updates.len());
             if scope != failure_scope {
                 failed_commands.clear();
                 failure_scope = scope;
@@ -776,7 +776,7 @@ fn run_session(
                 let run_target = RunTarget::before(&project, &action[1..]);
                 let outcome = run_command(&mut project, &action[1..], tool == "terminal",
                     (step, limit), chat.as_mut().unwrap());
-                let after = project.volume.borrow().disk.snapshot_status().1;
+                let after = project.volume.borrow().disk.revision();
                 changed_by_tools |= tool == "exec" && scope.0 != after;
                 if let Some(target) = run_target
                     && let Ok(report) = &outcome
@@ -894,7 +894,7 @@ fn run_command(
     {
         return Err("expected a guest command and literal arguments, at most 4096 bytes");
     }
-    let before = project.volume.borrow().disk.snapshot_status().1;
+    let before = project.volume.borrow().disk.revision();
     let outcome = crate::process::agent_command(
         project.root, project.volume.clone(), chat.started, argv.to_vec(), interactive, progress, |full| {
             if chat.auto_approve && !interactive {
@@ -924,7 +924,7 @@ fn run_command(
     );
     // Approved commands can write through their normal filesystem APIs. Never
     // rebase staged changes across writes performed outside their review.
-    let after = project.volume.borrow().disk.snapshot_status().1;
+    let after = project.volume.borrow().disk.revision();
     if after != before {
         if project.pending.is_empty() {
             project.generation = after;
@@ -1211,7 +1211,7 @@ impl Project<'_> {
             if plan.is_empty() { return Ok(Review::Empty); }
             if !review_confirmation("Apply these system filesystem changes? [y/N] ", false, |expanded| {
                 let volume = self.volume.borrow();
-                if volume.disk.snapshot_status().1 != self.generation {
+                if volume.disk.revision() != self.generation {
                     return Err("filesystem changed during the system task");
                 }
                 plan.preview(&volume, if expanded { visible } else { preview_text });
@@ -1221,7 +1221,7 @@ impl Project<'_> {
                 return Ok(Review::Declined);
             }
             let mut volume = self.volume.borrow_mut();
-            if volume.disk.snapshot_status().1 != self.generation {
+            if volume.disk.revision() != self.generation {
                 return Err("filesystem changed during review");
             }
             plan.apply(&mut volume)?;
@@ -1236,7 +1236,7 @@ impl Project<'_> {
         }
         if !review_confirmation("Apply the staged scripts to disk? [y/N] ", delivery.is_some(), |expanded| {
             let volume = self.volume.borrow();
-            if volume.disk.snapshot_status().1 != self.generation {
+            if volume.disk.revision() != self.generation {
                 return Err("filesystem changed during the project task");
             }
             let preview = if expanded { visible } else { preview_text };
@@ -1260,7 +1260,7 @@ impl Project<'_> {
             return Ok(Review::Declined);
         }
         let mut volume = self.volume.borrow_mut();
-        if volume.disk.snapshot_status().1 != self.generation {
+        if volume.disk.revision() != self.generation {
             return Err("filesystem changed during review");
         }
         if self.tuning {
@@ -1293,7 +1293,7 @@ impl Project<'_> {
             }
             return Err(error);
         }
-        self.generation = volume.disk.snapshot_status().1;
+        self.generation = volume.disk.revision();
         let saved = core::mem::take(&mut self.pending);
         if let Some(delivery) = delivery {
             for (path, candidate) in saved {

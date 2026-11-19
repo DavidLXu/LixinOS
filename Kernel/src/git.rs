@@ -31,7 +31,7 @@ pub fn run(volume: Rc<RefCell<Volume>>, root: &str, args: &[String]) -> Result<(
     if packed.len() >= 1024 {
         return Err("git arguments too long");
     }
-    let generation = volume.borrow().disk.snapshot_status().1;
+    let generation = volume.borrow().disk.revision();
     let bank = user::bank();
     unsafe {
         (*SLOTS.0.get())[bank] = Some(Session {
@@ -60,7 +60,7 @@ impl Session {
     fn publish(self) -> Result<(), &'static str> {
         let mut borrowed = self.volume.borrow_mut();
         let volume = &mut *borrowed;
-        if volume.disk.snapshot_status().1 != self.generation {
+        if volume.disk.revision() != self.generation {
             return Err("filesystem changed during git command; retry");
         }
         if self.changes.is_empty() {
@@ -158,7 +158,7 @@ fn operation(s: &mut Session, m: &mut Message, op: u64) -> Result<i64, i64> {
         0 => {
             let entry = entry.ok_or(2i64)?;
             m.length = entry.as_ref().map_or(-1, |b| b.len() as i32);
-            m.number = volume.disk.snapshot_status().1 as i32 + 1;
+            m.number = volume.disk.revision() as i32 + 1;
             Ok(0)
         }
         1 => {

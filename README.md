@@ -28,7 +28,7 @@ If your shell cannot find `rustup`, use `"$HOME/.cargo/bin/rustup"` for the targ
 
 The default launcher opens a native QEMU Cocoa window at the guest display size. If macOS Accessibility access is unavailable to the launcher, enable **View → Zoom To Fit** in QEMU after launch to unlock window dragging. Drag the window edge to change the number of terminal rows and columns. LixinOS reflows visible text at the same Menlo cell size and sends the new terminal dimensions to connected SSH sessions. Split mode gives each pane half the available width. Nano in the main QEMU console updates its layout as you resize the window. The desktop, Paint and Kilo apply pending resizes when they return to the main console. Enlarge the window before opening the desktop if it has too little space. Press Control–Option–G to release captured input before resizing. Type `shutdown` at the shell prompt to power off. In MicroPython press Ctrl+D to return to the shell first.
 
-The status bar samples once per second at console and Python VM polling points. CPU is the fraction of elapsed guest time outside scheduler idle waits. RAM counts the kernel image, stack, framebuffer, allocated heap (including live process images and stacks) against the configured 512 MiB. HEAP shows allocated kernel heap memory in KiB below 1 MiB, then in MiB to one decimal place. STACK shows sampled kernel stack use and capacity for the executing pane in KiB. FILES counts files on the mounted disk, including empty files. DISK shows how much of the usable snapshot capacity the current data occupies, including filesystem metadata and saved Agent versions. The bar remains visible while scrolling, clearing the screen, or editing a file.
+The status bar samples once per second at console and Python VM polling points. CPU is the fraction of elapsed guest time outside scheduler idle waits. RAM counts the kernel image, stack, framebuffer, allocated heap (including live process images and stacks) against the available guest RAM. HEAP shows allocated kernel heap memory in KiB below 1 MiB, then in MiB to one decimal place. STACK shows sampled kernel stack use and capacity for the executing pane in KiB. FILES counts files on the mounted disk, including empty files. DISK shows how much of the usable snapshot capacity the current data occupies, including filesystem metadata and saved Agent versions. The bar remains visible while scrolling, clearing the screen, or editing a file.
 
 The clock at the right shows 24-hour local time. Narrow windows show hours
 and minutes. The launcher uses Asia/Shanghai by default. Set
@@ -368,7 +368,7 @@ and is released when the editor exits.
 
 Type `htop` at the guest prompt for a live dashboard. It refreshes once per second. Press `q` to return to the shell. In the QEMU window the last dashboard frame stays in the terminal history. Uptime comes from the ARM virtual counter. Heap usage comes from the allocator. File counts include empty files, directory counts include the root, and content bytes exclude filesystem metadata.
 
-The launcher assigns one vCPU and 512 MiB of RAM. The boot stack is 128 KiB. Up to 16 tasks, including the login shells, share the CPU. The kernel allocates a 128 KiB stack and private translation tables for each new task, and backs each EL0 image with 4 MiB of heap memory on launch. Code is executable and read-only, data is writable and non-executable. Additional user arenas grow in 2 MiB blocks. A synchronous caller waits for its child while other runnable tasks take turns. Exiting releases image memory, and the next continuation reclaims the stack and page tables. A joinable child's PID and exit status remain until collected. The filesystem tree and file contents occupy heap memory while mounted. The kernel alternates between two checksummed disk snapshots, flushing the payload before publishing its header. On boot it loads the newest valid snapshot. The current limits are 1,048,576 entries including the root and 100 MiB per file. A snapshot has 192 MiB minus its 512-byte header for all names, contents, timestamps and version history together. The two 192 MiB slots follow the layout header. A separate 65 KiB ring at the end keeps the latest 64 shell commands. On first launch with an older disk, the launcher copies valid snapshots and history to a temporary image and atomically replaces the old image after verification. Use `touch --files-from names.txt` to create a batch of files with one path per line and one snapshot commit.
+The launcher assigns one vCPU and 640 MiB of RAM to the Rust kernel, or 1536 MiB to the TCC kernel. The boot stack is 128 KiB. Up to 16 tasks, including the login shells, share the CPU. The kernel allocates a 128 KiB stack and private translation tables for each new task, and backs each EL0 image with 4 MiB of heap memory on launch. Code is executable and read-only, data is writable and non-executable. Additional user arenas grow in 2 MiB blocks. A synchronous caller waits for its child while other runnable tasks take turns. Exiting releases image memory, and the next continuation reclaims the stack and page tables. A joinable child's PID and exit status remain until collected. The filesystem tree and file contents occupy heap memory while mounted. The kernel alternates between two checksummed disk snapshots, flushing the payload before publishing its header. On boot it loads the newest valid snapshot. The current limits are 1,048,576 entries including the root and 100 MiB per file. A snapshot has 192 MiB minus its 512-byte header for all names, contents, timestamps and version history together. The two 192 MiB slots follow the layout header. A separate 65 KiB ring at the end keeps the latest 64 shell commands. On first launch with an older disk, the launcher copies valid snapshots and history to a temporary image and atomically replaces the old image after verification. Use `touch --files-from names.txt` to create a batch of files with one path per line and one snapshot commit.
 
 ### Run a C program or MicroPython
 
@@ -412,6 +412,16 @@ The Agent's isolated test runner blocks filesystem and command calls.
 Cargo builds both C images before embedding them. The first build needs Git, Make, Python 3 and network access to fetch the pinned MicroPython source and, on Apple Silicon, Arm's checksummed bare-metal GNU toolchain. Sources, toolchain and build products are cached under `Kernel/target/user-build/`. An existing `aarch64-none-elf-gcc` with newlib on PATH can also be used. Run `python3 scripts/test-user.py` to exercise the serial interface on a temporary disk.
 
 ### Compile and run Rust inside LixinOS
+
+With the native Rust toolchain installed, either kernel can build a Cargo project from its guest shell:
+
+```sh
+cargo new --vcs none demo
+cd demo
+cargo run
+```
+
+The project prints `Hello, world!`. The upstream Rust 1.100.0 compiler uses Cranelift and the guest GNU linker. For single-file programs use `rustc hello.rs -o hello` and `./hello`. See the [Rust toolchain port](User/rust/README.md) for installation, supported dependencies and executable size limits. On the dedicated Rust-kernel build disk the seed toolchain also compiles `rustc` and Cargo from their locked sources. The resulting tools are available as `/stage1/rustc` and `/stage1/cargo`. The [guest bootstrap instructions](User/rust/README.md#native-compiler-and-cargo-build) describe the build and its seeded libraries.
 
 The user-space `/bin/lust` bundles the Lust Rust-subset frontend and the ARM64 TinyCC backend. Run these commands at the guest shell:
 
@@ -467,7 +477,7 @@ tcc hello.c -o hello
 ./hello
 ```
 
-Saved C and Rust programs use LXE1 and can fill a 1 MiB file including
+Programs saved by TinyCC and Lust use LXE1 and can fill a 1 MiB file including
 the 16-byte header. The ARM64 layout allows up to 512 KiB of code and 860 KiB
 of data, including zero-initialized storage, within that total. Rebuild
 programs saved in the experimental LXE2 format from their source.

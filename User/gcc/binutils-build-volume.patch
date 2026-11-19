@@ -1,0 +1,31 @@
+--- a/binutils/ar.c
++++ b/binutils/ar.c
+@@ -1289,7 +1289,7 @@
+   if (!bfd_set_archive_head (obfd, contents_head))
+     bfd_fatal (old_name);
+ 
+-  tmpfd = dup (tmpfd);
++  /* BFD closes the temporary file before the guest atomically renames it.  */
+   if (!bfd_close (obfd))
+     bfd_fatal (old_name);
+ 
+@@ -1298,7 +1298,7 @@
+   /* We don't care if this fails; we might be creating the archive.  */
+   bfd_close (iarch);
+ 
+-  if (smart_rename (new_name, old_name, tmpfd, NULL, false) != 0)
++  if (rename (new_name, old_name) != 0)
+     xexit (1);
+   free (old_name);
+   free (new_name);
+--- a/bfd/opncls.c
++++ b/bfd/opncls.c
+@@ -796,7 +796,7 @@
+ lixin_publish (bfd *abfd)
+ {
+   struct bfd_in_memory *image = abfd->iostream;
+-  if (image->size > (100UL << 20))
++  if (image->size > (512UL << 20))
+     {
+       errno = EFBIG;
+       bfd_set_error (bfd_error_system_call);

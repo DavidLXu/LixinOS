@@ -263,9 +263,11 @@ pub(crate) fn spawn_program(cwd: String, volume: Rc<RefCell<Volume>>, streams: u
         agent_bridge: Rc::new(RefCell::new(None)) };
     let image = services.executable_bytes(&path)?;
     let req = Spawn { path, args, flags: 0 };
-    crate::scheduler::spawn(alloc::boxed::Box::new(move ||
-        run_child(services, VecDeque::new(), req, image, streams)
-    ), crate::scheduler::pane())
+    crate::scheduler::spawn(alloc::boxed::Box::new(move || {
+        // The child has a PID even if its executable handler rejects the request.
+        // Its parent must be able to reap that PID and observe a command failure.
+        Ok(run_child(services, VecDeque::new(), req, image, streams).unwrap_or(126))
+    }), crate::scheduler::pane())
 }
 
 pub(crate) fn python_system() -> u64 {
@@ -387,10 +389,9 @@ impl Context {
         self.utility(image, &args)
     }
     fn utility(&mut self, image: &[u8], args: &[String]) -> Result<u8> {
-        let (code, data) = utility::load_segments(image).ok_or("invalid LixinOS executable")?;
         let io = self.io.take().ok_or("missing process descriptors")?;
         let packed = pack_args(&args[1..]);
-        let (io, status) = io.enter(|| user::launch_segments(code, data, Some((&self.services.cwd, &packed)), false));
+        let (io, status) = io.enter(|| utility::launch_program(image, &self.services.cwd, &packed));
         #[cfg(feature="retina")]
         if status == Ok(256) && io.canvas.is_some() {
             return desktop::resume(self, image, io);
@@ -667,7 +668,8 @@ fn run_child(
         return Err(SSH_HANDOFF);
     }
     let mut ctx = Context::new(services, history, false);
-    let io = utility::Context::new(&ctx.services.cwd, ctx.services.volume.clone(), streams);
+    let mut io = utility::Context::new(&ctx.services.cwd, ctx.services.volume.clone(), streams);
+    io.executable = ctx.services.path(&req.path)?;
     #[cfg(feature = "retina")]
     let io = {
         let mut io = io;

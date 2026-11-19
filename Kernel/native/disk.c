@@ -1,4 +1,5 @@
 #include "native.h"
+#include "build-memory.h"
 
 /* Modern virtio-mmio block device, queue zero. The kernel is single-core
  * and submits one read at a time. All DMA addresses are identity mapped. */
@@ -87,7 +88,10 @@ static int transfer(u32 type, u64 sector, void *data, u32 bytes) {
            status == 0;
 }
 
-#define SLOT_BYTES SNAPSHOT_SLOT_BYTES
+static u64 slot_bytes = SNAPSHOT_SLOT_BYTES;
+#define SLOT_BYTES slot_bytes
+int build_volume;
+u64 disk_capacity(void) { return slot_bytes - 512; }
 #define DIR_SIZE 0xffffffffu
 /* Live and staged snapshots occupy consecutive privileged RAM regions. */
 struct snapshot {
@@ -95,13 +99,46 @@ struct snapshot {
     u32 size, count, end, timed, buckets;
 };
 static struct snapshot live = {(u8 *)0x80000000UL}, staged = {(u8 *)0x8c000000UL};
-static int owner = -1, dirty, full;
+struct build_ref {
+    u8 *p;
+    u32 capacity;
+};
+struct build_view {
+    struct build_ref *items;
+    u32 count;
+    u64 bytes;
+    struct file versions;
+};
+struct disk_transaction {
+    int id, changed, out_of_space, durable;
+    u64 revision;
+    struct build_view view;
+};
+static struct disk_transaction ordinary = {.id = -1}, *transaction = &ordinary;
+#define owner (transaction->id)
+#define dirty (transaction->changed)
+#define full (transaction->out_of_space)
+#define needs_checkpoint (transaction->durable)
+#define build_staged (transaction->view)
+#ifndef LIXINOS_BOOT_DISK
+/* A task can be preempted between begin and rename/commit. Each index is
+ * private; publication checks its revision before replacing the live index. */
+static struct disk_transaction build_transactions[NATIVE_TASKS];
+static u64 build_revision;
+void disk_select_task(unsigned id) {
+    if (build_volume)
+        transaction = &build_transactions[id];
+}
+int batch_stale(int id) {
+    return build_volume && owner == id && transaction->revision != build_revision;
+}
+#endif
 int disk_full(void) { return full; }
 static unsigned active_slot;
 static u64 generation;
 
 u64 disk_generation(void) { return generation; }
-u32 disk_usage(void) { return live.size; }
+
 static u32 word(const u8 *p) {
     return (u32)p[0] | (u32)p[1] << 8 | (u32)p[2] << 16 | (u32)p[3] << 24;
 }
@@ -151,27 +188,12 @@ static int next_entry(struct snapshot *view, u32 *offset, struct entry *e) {
     return 1;
 }
 
-void file_stats(u64 *stats) {
-    u32 off = 4;
-    stats[0] = stats[1] = stats[2] = 0;
-    for (unsigned i = 0; i < live.count; i++) {
-        struct entry e;
-        if (!next_entry(&live, &off, &e))
-            break;
-        if (e.size == DIR_SIZE)
-            stats[1]++;
-        else {
-            stats[0]++;
-            stats[2] += e.size;
-        }
-    }
-}
-
 /* The two offset tables occupy the gap between syscall scratch and the
  * snapshot arenas. Zero is unused because entry records start at byte four. */
 #define MAX_BUCKETS (0x700000u / sizeof(u32))
 static u32 *table(struct snapshot *s) {
-    return (u32 *)(s->data == (u8 *)0x80000000UL ? 0x47200000UL : 0x47900000UL);
+    return (u32 *)((s->data == (u8 *)0x80000000UL || s->data == (u8 *)BUILD_FIRST) ? 0x47200000UL
+                                                                                   : 0x47900000UL);
 }
 static u32 bucket(struct snapshot *s, const u8 *name, u32 n) {
     u32 *slots = table(s), b = hash(name, n) % s->buckets;
@@ -274,9 +296,52 @@ static int order_view(struct snapshot *view) {
     ordered = view;
     return 1;
 }
-int lookup(const char *path, struct file *f) { return agent_path_allowed(path,0) && find(&live, path, f); }
+static void base_file_stats(u64 *stats) {
+    u32 off = 4;
+    stats[0] = stats[1] = stats[2] = 0;
+    for (unsigned i = 0; i < live.count; i++) {
+        struct entry e;
+        if (!next_entry(&live, &off, &e))
+            break;
+        if (e.size == DIR_SIZE)
+            stats[1]++;
+        else {
+            stats[0]++;
+            stats[2] += e.size;
+        }
+    }
+}
+
+static void store_word(u8 *p, u32 value) {
+    for (int i = 0; i < 4; i++)
+        p[i] = value >> (i * 8);
+}
+
+#include "build-fs.h"
+u32 disk_usage(void) { return build_volume ? build_live.bytes : live.size; }
+void file_stats(u64 *stats) {
+    if (!build_volume) {
+        base_file_stats(stats);
+        return;
+    }
+    stats[0] = stats[1] = stats[2] = 0;
+    for (unsigned i = 0; i < build_live.count; i++) {
+        unsigned size = word(build_live.items[i].p + 4);
+        if (size == DIR_SIZE)
+            stats[1]++;
+        else {
+            stats[0]++;
+            stats[2] += size;
+        }
+    }
+}
+int lookup(const char *path, struct file *f) {
+    return agent_path_allowed(path, 0) &&
+           (build_live.items ? build_find(&build_live, path, f) : find(&live, path, f));
+}
 int batch_lookup(int id, const char *path, struct file *f) {
-    return id == owner && agent_path_allowed(path,0) && find(&staged, path, f);
+    return id == owner && !batch_stale(id) && agent_path_allowed(path, 0) &&
+           (build_volume ? build_find(&build_staged, path, f) : find(&staged, path, f));
 }
 #endif
 static int load_snapshot(const u8 *head, unsigned slot) {
@@ -287,8 +352,8 @@ static int load_snapshot(const u8 *head, unsigned slot) {
     u32 size = word(head + 16);
     if (size < 4 || size > SLOT_BYTES - 512)
         return 0;
-    u32 total = (size + 511) & ~511u;
-    for (u32 pos = 0; pos < total;) {
+    u64 total = ((u64)size + 511) & ~511UL;
+    for (u64 pos = 0; pos < total;) {
         u32 n = total - pos > 65536 ? 65536 : total - pos;
         if (!transfer(0, 2 + slot * (SLOT_BYTES / 512) + pos / 512, live.data + pos, n))
             return 0;
@@ -321,9 +386,69 @@ static int load_snapshot(const u8 *head, unsigned slot) {
     return 1;
 }
 
+/* QEMU virt reserves the first two MiB of RAM for the flattened device tree.
+ * Both boot stages check the actual RAM extent before touching a build volume. */
+static unsigned fdt_word(const unsigned char *p) {
+    return (unsigned)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3];
+}
+static int build_memory_present(void) {
+    const unsigned char *dt = (const unsigned char *)0x40000000UL;
+    unsigned size = fdt_word(dt + 4), strings = fdt_word(dt + 12), start = fdt_word(dt + 8);
+    if (fdt_word(dt) != 0xd00dfeed || size < 40 || size > (2u << 20) || strings >= size ||
+        start > size || fdt_word(dt + 36) > size - start)
+        return 0;
+    unsigned end = start + fdt_word(dt + 36), depth = 0, memory = 0;
+    for (unsigned i = start; i + 4 <= end;) {
+        unsigned token = fdt_word(dt + i);
+        i += 4;
+        if (token == 1) {
+            unsigned name = i;
+            while (i < end && dt[i])
+                i++;
+            if (i == end)
+                return 0;
+            depth++;
+            if (depth == 2)
+                memory = i - name >= 7 && !memcmp(dt + name, "memory@", 7);
+            i = (i + 4) & ~3u;
+        } else if (token == 2) {
+            if (!depth)
+                return 0;
+            if (depth-- == 2)
+                memory = 0;
+        } else if (token == 3) {
+            if (end - i < 8)
+                return 0;
+            unsigned len = fdt_word(dt + i), key = fdt_word(dt + i + 4);
+            i += 8;
+            if (len > end - i || key >= size - strings)
+                return 0;
+            if (memory && depth == 2 && len == 16 && size - strings - key >= 4 &&
+                !memcmp(dt + strings + key, "reg", 4) && !fdt_word(dt + i) &&
+                fdt_word(dt + i + 4) == 0x40000000 &&
+                (((u64)fdt_word(dt + i + 8) << 32) | fdt_word(dt + i + 12)) >= BUILD_RAM)
+                return 1;
+            i = (i + len + 3) & ~3u;
+        } else if (token != 4)
+            return 0;
+    }
+    return 0;
+}
+
 int mount_disk(void) {
     u8 layout[512], heads[2][512];
-    if (!init_blk() || !transfer(0, 0, layout, 512) || !matches(layout, "LIXDISK4", 8))
+    if (!init_blk() || !transfer(0, 0, layout, 512))
+        return 0;
+    if (matches(layout, "LIXBLD01", 8)) {
+        u64 sectors = REG(0x100) | ((u64)REG(0x104) << 32);
+        if (!build_memory_present() ||
+            (sectors != 1 + 2 * (3 * GIB / 512) + 130 && sectors != 1 + 2 * (4 * GIB / 512) + 130))
+            return 0;
+        slot_bytes = (sectors - 131) * 256;
+        build_volume = 1;
+        live.data = (u8 *)BUILD_FIRST;
+        staged.data = (u8 *)BUILD_SECOND;
+    } else if (!matches(layout, "LIXDISK4", 8))
         return 0;
     for (unsigned i = 8; i < 512; i++)
         if (layout[i])
@@ -333,7 +458,13 @@ int mount_disk(void) {
             return 0;
     u64 a = ((u64)word(heads[0] + 12) << 32) | word(heads[0] + 8);
     u64 b = ((u64)word(heads[1] + 12) << 32) | word(heads[1] + 8);
-    return load_snapshot(heads[b > a], b > a) || load_snapshot(heads[b <= a], b <= a);
+    if (!load_snapshot(heads[b > a], b > a) && !load_snapshot(heads[b <= a], b <= a))
+        return 0;
+#ifndef LIXINOS_BOOT_DISK
+    if (build_volume)
+        return build_index();
+#endif
+    return 1;
 }
 
 #ifndef LIXINOS_BOOT_DISK
@@ -365,20 +496,22 @@ static long list_entry(struct snapshot *view, const char *path, u64 index, char 
     return -1;
 }
 
-static void store_word(u8 *p, u32 value) {
-    for (int i = 0; i < 4; i++)
-        p[i] = value >> (i * 8);
-}
-
 long directory_entry(const char *path, u64 index, char *name) {
-    return agent_path_allowed(path,0) ? list_entry(&live, path, index, name) : -1;
+    return agent_path_allowed(path, 0) ? (build_volume ? build_child(&build_live, path, index, name)
+                                                       : list_entry(&live, path, index, name))
+                                       : -1;
 }
 long batch_child(int id, const char *path, u64 index, char *name) {
-    return id == owner && agent_path_allowed(path,0) ? list_entry(&staged, path, index, name) : -1;
+    return id == owner && !batch_stale(id) && agent_path_allowed(path, 0)
+               ? (build_volume ? build_child(&build_staged, path, index, name)
+                               : list_entry(&staged, path, index, name))
+               : -1;
 }
 int batch_begin(int id) {
     if (id < 0 || owner >= 0 || !writable || !flush_supported || generation == (u64)-1)
         return 0;
+    if (build_volume)
+        return build_begin(id);
     memcpy(staged.data, live.data, live.size);
     staged.size = live.size;
     staged.count = live.count;
@@ -395,8 +528,9 @@ int batch_begin(int id) {
     return 1;
 }
 void batch_abort(int id) {
-    if (owner == id)
+    if (owner == id) {
         owner = -1;
+    }
 }
 int canonical_path(const char *path) {
     if (path[0] != '/')
@@ -421,13 +555,16 @@ int canonical_path(const char *path) {
 // has size UINT32_MAX. A source view can alias the staged snapshot.
 #include "revision.h"
 int batch_set(int id, const char *path, const struct file *value) {
-    if (owner != id || !canonical_path(path) || !path[1] || !agent_path_allowed(path,1))
+    if (owner != id || batch_stale(id) || !canonical_path(path) || !path[1] ||
+        !agent_path_allowed(path, 1))
         return 0;
     u32 n = 0;
     while (path[n])
         n++;
     if (!value && n >= 3 && matches((const u8 *)path + n - 3, ".py", 3) && !edit_revision(id,path,0))
         return 0;
+    if (build_volume)
+        return build_set(path, value);
     unsigned parent = n;
     while (parent && path[parent - 1] != '/')
         parent--;
@@ -503,9 +640,22 @@ int batch_set(int id, const char *path, const struct file *value) {
     return 1;
 }
 struct file agent_versions(void) {
-    return (struct file){live.data + live.end, live.size - live.end};
+    return build_volume ? build_live.versions
+                        : (struct file){live.data + live.end, live.size - live.end};
 }
 int stage_versions(int slot, const u8 *bytes, unsigned size) {
+    if (build_volume) {
+        if (owner != slot || batch_stale(slot) || size > (1u << 20) ||
+            cursor + size > BUILD_ARENA_BYTES ||
+            build_staged.bytes - build_staged.versions.size + size > SLOT_BYTES - 512)
+            return 0;
+        build_staged.bytes = build_staged.bytes - build_staged.versions.size + size;
+        memcpy(arena + cursor, bytes, size);
+        build_staged.versions = (struct file){arena + cursor, size};
+        cursor += size;
+        dirty = needs_checkpoint = 1;
+        return 1;
+    }
     if (owner != slot || size > (1u << 20) || size > SLOT_BYTES - 512 - staged.end) return 0;
     if (size) memcpy(staged.data + staged.end, bytes, size);
     staged.size = staged.end + size;
@@ -515,9 +665,15 @@ int stage_versions(int slot, const u8 *bytes, unsigned size) {
 int batch_commit(int id) {
     if (owner != id)
         return 0;
+    if (batch_stale(id)) {
+        batch_abort(id);
+        return 0;
+    }
     owner = -1;
     if (!dirty)
         return 1;
+    if (build_volume)
+        return build_commit();
     u32 total = staged.size;
     u8 *scratch = staged.data;
     u32 rounded = (total + 511) & ~511u;
@@ -635,12 +791,19 @@ int batch_move(int id, const char *source, const char *dest) {
         src++;
     while (dest[dst])
         dst++;
-    if (!src || !dst || owner != id)
+    if (!src || !dst || owner != id || batch_stale(id))
         return 0;
     u32 offset = 4;
-    for (unsigned i = 0; i < live.count; i++) {
+    for (unsigned i = build_volume ? lower_bound(&build_live, source, src) : 0;
+         i < (build_volume ? build_live.count : live.count); i++) {
         struct entry e;
-        if (!next_entry(&live, &offset, &e))
+        if (build_volume) {
+            u8 *p = build_live.items[i].p;
+            struct file f = build_file(p);
+            e = (struct entry){p + 16, f.data, word(p), f.size, f.birth, f.modified};
+            if (e.length < src || memcmp(e.name, source, src))
+                break;
+        } else if (!next_entry(&live, &offset, &e))
             return 0;
         if (e.length < src || !matches(e.name, source, src) ||
             (e.length > src && e.name[src] != '/'))
@@ -659,7 +822,7 @@ int batch_move(int id, const char *source, const char *dest) {
             !edit_revision(id,from,to_len>=3 && !memcmp(to+to_len-3,".py",3) ? to : 0)) return 0;
         if (!batch_set(id, from, 0) || !batch_set(id, to, &f))
             return 0;
-        if (staged.timed && find(&staged, to, &f)) {
+        if ((build_volume || staged.timed) && batch_lookup(id, to, &f)) {
             u8 *stamp = (u8 *)f.data - (dst + e.length - src) - 8;
             store_word(stamp, e.birth);
             store_word(stamp + 4, e.modified);

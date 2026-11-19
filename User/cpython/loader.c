@@ -58,12 +58,30 @@ __attribute__((section(".text.start"), noreturn)) void _start(const char *cwd, c
     if (console_call(46, TEXT_BYTES))
         fail(LX_ARGV0 ": kernel lacks executable image support\n");
 #endif
-    uintptr_t random = ((uintptr_t)strings & ~(uintptr_t)15) - 16;
+    // A tagged spawn supplies a complete environment, including an explicit
+    // empty one. Older kernels and interactive launches use launcher defaults.
+    long env_result = console_call(53, 0);
+    if (env_result > 8193) fail(LX_ARGV0 ": invalid environment\n");
+    size_t env_len = env_result > 0 ? (size_t)env_result - 1 : 0;
+    char *env = strings - env_len;
+    for (size_t i = 0; i < env_len; i++) env[i] = ((const char *)0x443d8000)[i];
+    const char *executable = LX_ARGV0;
+    char *stack_low = env;
+#ifdef LX_APPLICATION
+    long path_len = console_call(42, 5);
+    if (path_len > 0 && path_len <= 512) {
+        stack_low -= path_len + 1;
+        for (long i = 0; i < path_len; ++i) stack_low[i] = ((char *)0x443d7000)[i];
+        stack_low[path_len] = 0;
+        executable = stack_low;
+    }
+#endif
+    uintptr_t random = ((uintptr_t)stack_low & ~(uintptr_t)15) - 16;
     if (lx_random((void *)random, 16))
         fail(LX_ARGV0 ": entropy unavailable\n");
-    uintptr_t *sp = (uintptr_t *)(random - (512 + 32) * sizeof(uintptr_t));
+    uintptr_t *sp = (uintptr_t *)(random - (512 + 256 + 32) * sizeof(uintptr_t));
     uintptr_t *v = sp + 1;
-    *v++ = (uintptr_t)LX_ARGV0;
+    *v++ = (uintptr_t)executable;
 #ifdef LX_PIP
     *v++ = (uintptr_t)"-m";
     *v++ = (uintptr_t)"pip";
@@ -79,11 +97,36 @@ __attribute__((section(".text.start"), noreturn)) void _start(const char *cwd, c
     }
     *sp = v - sp - 1;
     *v++ = 0;
-#ifdef LX_GCC
+    if (env_result > 0) {
+        unsigned count = 0;
+        for (size_t i = 0; i < env_len;) {
+            if (++count > 256) fail(LX_ARGV0 ": too many environment variables\n");
+            *v++ = (uintptr_t)(env + i);
+            while (i < env_len && env[i]) ++i;
+            if (i++ == env_len) fail(LX_ARGV0 ": invalid environment\n");
+        }
+    } else {
+#ifdef LX_RUST
+    *v++ = (uintptr_t)"COMPILER_PATH=/lib/gcc/bin:/bin";
+    *v++ = (uintptr_t)"PATH=/bin";
+    *v++ = (uintptr_t)"HOME=/";
+    *v++ = (uintptr_t)"TMPDIR=/tmp";
+    *v++ = (uintptr_t)"CARGO_HOME=/.cargo";
+    *v++ = (uintptr_t)"CARGO_BUILD_JOBS=1";
+    *v++ = (uintptr_t)"CARGO_PROFILE_DEV_DEBUG=0";
+    *v++ = (uintptr_t)"CARGO_HTTP_CAINFO=/lib/cpython-3.14.5/roots.pem";
+    *v++ = (uintptr_t)"RUSTC=/bin/rustc";
+    *v++ = (uintptr_t)"CARGO_INCREMENTAL=0";
+#elif defined(LX_GCC)
     *v++ = (uintptr_t)"COMPILER_PATH=/lib/gcc/bin:/bin";
     *v++ = (uintptr_t)"PATH=/bin";
     *v++ = (uintptr_t)"TMPDIR=/tmp";
-#elif !defined(LX_APPLICATION)
+#elif defined(LX_APPLICATION)
+    *v++ = (uintptr_t)"HOME=/";
+    *v++ = (uintptr_t)"PATH=/bin";
+    *v++ = (uintptr_t)"TMPDIR=/tmp";
+    *v++ = (uintptr_t)"COMPILER_PATH=/lib/gcc/bin:/bin";
+#else
     *v++ = (uintptr_t)"PYTHON_BASIC_REPL=1";
     *v++ = (uintptr_t)"_PYTHON_SYSCONFIGDATA_NAME=_lixin_sysconfig";
     *v++ = (uintptr_t)"PIP_DISABLE_PIP_VERSION_CHECK=1";
@@ -95,6 +138,7 @@ __attribute__((section(".text.start"), noreturn)) void _start(const char *cwd, c
     *v++ = (uintptr_t)"SSL_CERT_FILE=/lib/cpython-3.14.5/roots.pem";
 #endif
     *v++ = (uintptr_t)"LC_ALL=C.UTF-8";
+    }
     *v++ = 0;
     *v++ = 3;
     *v++ = (uintptr_t)PHDR_ADDR; // AT_PHDR
@@ -104,6 +148,8 @@ __attribute__((section(".text.start"), noreturn)) void _start(const char *cwd, c
     *v++ = PHNUM;
     *v++ = 6;
     *v++ = 4096;
+    *v++ = 31; // AT_EXECFN
+    *v++ = (uintptr_t)executable;
     *v++ = 25;
     *v++ = random;
     *v++ = 0;

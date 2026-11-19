@@ -22,6 +22,8 @@ long file_operation(int slot, const char *cwd, u64 value, char *mail) {
         batch_abort(slot);
         return 0;
     }
+    if (batch_stale(slot))
+        return fail(slot, mail, "filesystem changed during transaction; retry");
     if (op == 0)
         return batch_begin(slot) ? 0 : fail(slot, mail, "filesystem busy");
     if (op == 6)

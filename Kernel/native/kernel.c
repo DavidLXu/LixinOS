@@ -99,7 +99,7 @@ void kernel_main(void) {
     UART[0x30 / 4] = (1 << 8) | (1 << 9) | 1;
     serial_text(KERNEL_BANNER "\n");
     if (!mount_disk())
-        serial_text("Cannot mount LIXDISK4 snapshot\n");
+        serial_text("Cannot mount system or build volume\n");
     else {
         net_init();
         read_history();
@@ -109,6 +109,8 @@ void kernel_main(void) {
         clipboard_init();
         if (run_login())
             serial_text("Login process failed\n");
+        if (!disk_checkpoint())
+            serial_text("Build disk checkpoint failed\n");
     }
     power_off();
     for (;;) {

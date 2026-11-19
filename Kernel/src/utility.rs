@@ -81,6 +81,7 @@ pub fn segment(file: &[u8]) -> Option<&[u8]> {
 }
 
 pub(crate) fn load_segments(file: &[u8]) -> Option<(&[u8], &[u8])> {
+    if let Some(large) = user::large_program(file) { return Some((large.entry, &[])); }
     segment(file).map(|code| (code, &[][..])).or_else(|| user::application_segments(file))
 }
 
@@ -95,6 +96,8 @@ struct DirectoryCursor {
 pub(super) struct Streams {
     buffer: Rc<RefCell<StreamData>>,
     closed:[bool;3],
+    null:[bool;3],
+    environment: Option<Rc<[u8]>>,
     pub input_pipe: Option<Rc<crate::pipe::Reader>>,
     pub error_pipe: Option<Rc<crate::pipe::Writer>>,
     pub output_pipe: Option<Rc<crate::pipe::Writer>>,
@@ -137,6 +140,8 @@ impl Streams {
                 error: None,
             })),
             closed:[false;3],
+            null:[false;3],
+            environment: None,
             input_pipe: None,
             output_pipe: None, error_pipe: None,
         }
@@ -173,6 +178,9 @@ enum Handle {
 
 pub(super) struct Context {
     heap: user::UserArena,
+    extended: user::UserArena,
+    program: user::UserArena,
+    wide: user::UserArena,
     connections: crate::net::Connections,
     #[cfg(feature = "retina")]
     pub allow_canvas: bool,
@@ -183,9 +191,11 @@ pub(super) struct Context {
     cursor: Option<DirectoryCursor>,
     volume: Rc<RefCell<Volume>>,
     cwd: String,
+    pub(super) executable: String,
     peeked:Option<u8>,
     pub streams: Streams,
-    handles: [Option<Handle>; 16],
+    // Match the 32 guest descriptors in the musl adapter, in addition to stdio.
+    handles: [Option<Handle>; 32],
     fs_batch: Option<crate::fs_batch::Batch>,
 }
 struct Slot(UnsafeCell<Option<Context>>);
@@ -219,6 +229,10 @@ impl Context {
             #[cfg(feature="retina")]
             popup_shell: false,
             heap: user::UserArena::for_browser_heap(),
+            extended: user::UserArena::extended(),
+            program: user::UserArena::for_program(),
+            wide: user::UserArena::wide(),
+            executable: String::new(),
             connections: Default::default(), peeked:None,cursor: None, volume, cwd: cwd.into(), streams, handles: core::array::from_fn(|_| None), fs_batch: None }
     }
     // Move open handles and the directory cursor back to the caller on yield.
@@ -226,12 +240,27 @@ impl Context {
     pub fn enter<T>(self, launch: impl FnOnce() -> T) -> (Self, T) {
         let slot = SLOTS[user::bank()].0.get();
         self.heap.set_mapped(true);
+        self.extended.set_mapped(true);
+        self.program.set_mapped(true);
+        self.wide.set_mapped(true);
         unsafe { *slot = Some(self); }
         let result = launch();
         let io = unsafe { (*slot).take().unwrap() };
         io.heap.set_mapped(false);
+        io.extended.set_mapped(false);
+        io.program.set_mapped(false);
+        io.wide.set_mapped(false);
         (io, result)
     }
+}
+
+pub(super) fn launch_program(file: &[u8], cwd: &str, args: &str) -> Result<u16, &'static str> {
+    let (text, data) = load_segments(file).ok_or("invalid LixinOS executable")?;
+    if let Some(large) = user::large_program(file) {
+        let io = unsafe { (&mut *SLOTS[user::bank()].0.get()).as_mut() }.ok_or("missing program context")?;
+        large.load(&mut io.program)?;
+    }
+    user::launch_segments(text, data, Some((cwd, args)), false)
 }
 
 pub fn with_io(
@@ -274,6 +303,14 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
             let len = (value >> 32) as usize;
             if !(4..=32768).contains(&len) { return Some(u64::MAX); }
             let raw = unsafe { slice::from_raw_parts(user::git_mailbox(), len) };
+            let mut streams = context.streams.clone();
+            let raw = if value & (1 << 24) != 0 {
+                let n = u16::from_le_bytes([raw[0], raw[1]]) as usize;
+                let Some(env) = raw.get(2..2+n) else { return Some(u64::MAX) };
+                if n > 8192 || (n > 0 && env.last() != Some(&0)) { return Some(u64::MAX); }
+                streams.environment = Some(Rc::from(env));
+                &raw[2+n..]
+            } else { raw };
             let Some(raw) = raw.strip_suffix(&[0]) else { return Some(u64::MAX); };
             let Ok(text) = core::str::from_utf8(raw) else { return Some(u64::MAX); };
             let mut words = text.split('\0');
@@ -286,11 +323,20 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
             if !matches!(volume.entry(&cwd), Some(Entry::Directory)) {return Some(u64::MAX)}
             let Ok(path) = volume.resolve(&cwd, path) else {return Some(u64::MAX)};
             drop(volume);
-            let mut streams = context.streams.clone();
             for stdio in 0..3 {
                 let fd = ((value >> (8*stdio)) & 255) as usize;
                 if fd == stdio {continue}
-                if fd == 1 && stdio == 2 { streams.error_pipe = streams.output_pipe.clone(); continue; }
+                streams.null[stdio] = fd == 255;
+                if fd == 255 {
+                    streams.closed[stdio] = false;
+                    match stdio {
+                        0 => streams.input_pipe = None,
+                        1 => streams.output_pipe = None,
+                        _ => streams.error_pipe = None,
+                    }
+                    continue;
+                }
+                if fd == 1 && stdio == 2 { streams.error_pipe = streams.output_pipe.clone(); streams.null[2] = streams.null[1]; continue; }
                 let h = fd.checked_sub(3).and_then(|i| context.handles.get(i)).and_then(Option::as_ref);
                 match (stdio, h) {
                     (0, Some(Handle::PipeRead(r))) => streams.input_pipe = Some(r.clone()),
@@ -323,8 +369,8 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
                 });
             }
             let Some(Handle::Writable { path, .. }) = handle else { return Some(u64::MAX); };
-            if size > disk::FILE_LIMIT { return Some(u64::MAX); }
             let mut volume = context.volume.borrow_mut();
+            if size > volume.disk.file_limit() { return Some(u64::MAX); }
             let Some(Some(mut data)) = volume.files.get(path).cloned() else { return Some(u64::MAX); };
             if data.try_reserve(size.saturating_sub(data.len())).is_err() { return Some(u64::MAX); }
             data.resize(size, 0);
@@ -351,7 +397,7 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
             })
         }
         0 => {
-            if context.streams.closed[0] {return Some(256);}
+            if context.streams.closed[0] || context.streams.null[0] {return Some(256);}
             #[cfg(feature = "split")]
             crate::process::ready_on_read();
             #[cfg(feature="retina")]
@@ -363,6 +409,7 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
         }
         1 => {
             if context.streams.closed[1]{return Some((-2i64) as u64);}
+            if context.streams.null[1] {return Some(value & 255);}
             if let Some(writer)=&context.streams.output_pipe {return Some(if writer.write(value as u8) {value & 255} else {(-2i64) as u64});}
             if let Some(ok) = context.streams.buffer.borrow_mut().capture(&[value as u8]) {
                 return Some(if ok { value & 255 } else { (-2i64) as u64 });
@@ -399,6 +446,7 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
             let fd = (value >> 32) as usize;
             let count = value as u32 as usize;
             if fd<3 && context.streams.closed[fd] {return Some(u64::MAX);}
+            if fd < 3 && context.streams.null[fd] && count <= 4096 { return Some(if operation == 9 { 0 } else { count as u64 }); }
             if count > 4096 {
                 return Some(u64::MAX);
             }
@@ -464,12 +512,22 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
                     append,
                 } if operation == 39 => {
                     let mut volume = context.volume.borrow_mut();
+                    if volume.disk.scratch_path(path) && !volume.versions.contains_key(path) {
+                        let Volume { files, disk, .. } = &mut *volume;
+                        let Some(Some(file)) = files.get_mut(path) else { return Some(u64::MAX); };
+                        let start = if *append { file.len() } else { *position };
+                        if count != 0 && disk.write_scratch(path, file, start, buffer).is_err() {
+                            return Some(u64::MAX);
+                        }
+                        *position = start + count;
+                        return Some(count as u64);
+                    }
                     let Some(Some(mut bytes)) = volume.files.get(path).cloned() else {
                         return Some(u64::MAX);
                     };
                     let start = if *append { bytes.len() } else { *position };
                     let end = start + count;
-                    if end > disk::FILE_LIMIT {
+                    if end > volume.disk.file_limit() {
                         return Some(u64::MAX);
                     }
                     bytes.resize(bytes.len().max(end), 0);
@@ -558,6 +616,7 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
             }
             loop {
                 let ready = match fd {
+                    0..=2 if context.streams.null[fd] => if fd == 0 { 1 } else { 2 },
                     0 if context.streams.input_pipe.is_some() => {
                         u8::from(context.streams.input_pipe.as_ref().unwrap().ready())
                     }
@@ -605,6 +664,7 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
 
         11 => {
             if context.streams.closed[2]{return Some(u64::MAX);}
+            if context.streams.null[2] { return Some(value & 255); }
             if let Some(w) = &context.streams.error_pipe { return Some(if w.write(value as u8) {value & 255} else {u64::MAX}); }
             terminal_byte(value as u8);
             Some(value & 255)
@@ -636,13 +696,13 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
                 5 => {
                     let volume = context.volume.borrow();
                     alloc::format!("{}\n{}\n{}\n{}", inspect::system(), inspect::memory(),
-                        inspect::disk(&volume.disk), inspect::filesystem(&volume.files))
+                        inspect::disk(&volume.disk), inspect::filesystem(&volume))
                 }
                 6 => crate::scheduler::process_list(),
                 7 => {
                     let volume = context.volume.borrow();
-                    let used = volume.disk.snapshot_bytes();
-                    let capacity = disk::SNAPSHOT_CAPACITY;
+                    let used = volume.disk.used_bytes();
+                    let capacity = volume.disk.capacity_bytes();
                     alloc::format!("Filesystem Capacity Used Available\n/ {capacity} {used} {}\n",
                         capacity.saturating_sub(used))
                 }
@@ -666,6 +726,19 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
                 _ => u64::MAX,
             })
         }
+        54 => Some(crate::scheduler::pid() as u64),
+        53 => Some(match context.streams.environment.as_ref() {
+            None => 0,
+            Some(env) => {
+                unsafe { core::ptr::copy_nonoverlapping(env.as_ptr(), user::git_mailbox(), env.len()); }
+                env.len() as u64 + 1
+            }
+        }),
+        52 => Some(if context.extended.grow(value as usize).is_ok() { user::EXTENDED_BASE as u64 } else { u64::MAX }),
+        37 if value == u64::MAX => Some(user::UserArena::browser_heap_limit() as u64),
+        37 if value >> 40 == 1 => Some(if crate::high_heap_end().is_some() && context.wide.grow((value - (1 << 40)) as usize).is_ok() {
+            user::WIDE_BASE as u64
+        } else { u64::MAX }),
         37 => Some(if context.heap.grow(value as usize).is_ok() { user::WEB_HEAP_BASE as u64 } else { u64::MAX }),
         // QEMU's PL031 RTC counts seconds since the Unix epoch.
         36 => Some(wall_seconds() as u64),
@@ -677,6 +750,11 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
         // Guest directory operations share the active process's working directory.
         42 => {
             let mail = unsafe { slice::from_raw_parts_mut(user::utility_mailbox(), 513) };
+            if value == 6 { return Some((3 + context.handles.len()) as u64); }
+            if value == 5 {
+                mail[..context.executable.len()].copy_from_slice(context.executable.as_bytes());
+                return Some(context.executable.len() as u64);
+            }
             if value == 0 {
                 mail[..context.cwd.len()].copy_from_slice(context.cwd.as_bytes());
                 return Some(context.cwd.len() as u64);
@@ -716,8 +794,8 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
             crate::scheduler::sleep_ms(value);
             Some(0)
         }
-        24 if value == 2 => Some(u64::from(!context.streams.closed[0] && context.streams.input_pipe.is_none() && context.streams.buffer.borrow().input.is_none())),
-        24 if value == 1 => Some(u64::from(!context.streams.redirected())),
+        24 if value == 2 => Some(u64::from(!context.streams.null[0] && !context.streams.closed[0] && context.streams.input_pipe.is_none() && context.streams.buffer.borrow().input.is_none())),
+        24 if value == 1 => Some(u64::from(!context.streams.null[1] && !context.streams.redirected())),
         24 => Some(u64::from(context.streams.output_pipe.is_none() && context.streams.buffer.borrow().output.is_none())),
         // SVC 22 atomically stores a file from a sparse-buffer descriptor or
         // legacy mailbox length. SVC 23 returns the resolved path.
@@ -738,7 +816,18 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
             // Exclusive creation for the first accepted SSH host fingerprint.
             if operation == 31 && volume.files.contains_key(&path) { return Some(u64::MAX); }
             if volume.files.get(&path) == Some(&None) { return Some(u64::MAX); }
-            let bytes = if value >> 32 != 0 {
+            let bytes = if operation == 22 && value == u64::MAX {
+                // The wide descriptor is a contiguous private heap buffer.
+                let range = unsafe { slice::from_raw_parts(user::utility_mailbox().add(520).cast::<usize>(), 2) };
+                let (address, size) = (range[0], range[1]);
+                if size > volume.disk.file_limit() || ![&context.heap, &context.extended, &context.wide]
+                    .iter().any(|arena| arena.contains(address, size)) { return Some(u64::MAX); }
+                let mut bytes = Vec::new();
+                if bytes.try_reserve_exact(size).is_err() { return Some(u64::MAX); }
+                bytes.extend_from_slice(unsafe { slice::from_raw_parts(address as *const u8, size) });
+                bytes
+            } else if value >> 32 != 0 {
+                if value as u32 as usize > volume.disk.file_limit() { return Some(u64::MAX); }
                 let Some(bytes) = user::copy_user_file(value, Some(&context.heap)) else { return Some(u64::MAX) };
                 bytes
             } else if value <= user::SCRIPT_CAPACITY as u64 {
@@ -837,7 +926,7 @@ fn metadata(context: &mut Context, index: u64) -> i64 {
     if !matches!(entry, Entry::Directory) {
         return -4;
     }
-    let generation = volume.disk.snapshot_status().1;
+    let generation = volume.disk.revision();
     let after = context.cursor.as_ref().filter(|c|
         c.directory == path && c.next_index == index && c.generation == generation
     ).map(|c| c.name.as_str());

@@ -24,6 +24,8 @@ enable_mmu:
     mov x9,#0xbb // Normal write-through RAM supports exclusive accesses.
     MSR(MAIR,9)
     mov x9,#0x803019
+    lsl x2,x2,#32
+    orr x9,x9,x2
     MSR(TCR,9)
     dsb sy
     isb

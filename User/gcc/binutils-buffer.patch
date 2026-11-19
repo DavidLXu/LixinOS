@@ -1,0 +1,49 @@
+--- a/bfd/bfdio.c
++++ b/bfd/bfdio.c
+@@ -773,6 +773,20 @@
+   return get;
+ }
+ 
++/* Guest BFD writes an entire ELF to this seekable stream. Grow the buffer
++   geometrically so a large link does not copy the whole ELF for each section. */
++static bfd_size_type
++memory_capacity (bfd_size_type size)
++{
++  if (size == 0)
++    return 0;
++  if (size <= 128)
++    return 128;
++  if (size <= (512UL << 20))
++    return 1ULL << (64 - __builtin_clzll (size - 1));
++  return (size + 127) & ~(bfd_size_type) 127;
++}
++
+ static file_ptr
+ memory_bwrite (bfd *abfd, const void *ptr, file_ptr size)
+ {
+@@ -782,10 +796,10 @@
+     {
+       bfd_size_type newsize, oldsize;
+ 
+-      oldsize = (bim->size + 127) & ~(bfd_size_type) 127;
++      oldsize = memory_capacity (bim->size);
+       bim->size = abfd->where + size;
+       /* Round up to cut down on memory fragmentation */
+-      newsize = (bim->size + 127) & ~(bfd_size_type) 127;
++      newsize = memory_capacity (bim->size);
+       if (newsize > oldsize)
+ 	{
+ 	  bim->buffer = (bfd_byte *) bfd_realloc_or_free (bim->buffer, newsize);
+@@ -835,10 +849,10 @@
+ 	{
+ 	  bfd_size_type newsize, oldsize;
+ 
+-	  oldsize = (bim->size + 127) & ~(bfd_size_type) 127;
++	  oldsize = memory_capacity (bim->size);
+ 	  bim->size = nwhere;
+ 	  /* Round up to cut down on memory fragmentation */
+-	  newsize = (bim->size + 127) & ~(bfd_size_type) 127;
++	  newsize = memory_capacity (bim->size);
+ 	  if (newsize > oldsize)
+ 	    {
+ 	      bim->buffer = (bfd_byte *) bfd_realloc_or_free (bim->buffer, newsize);

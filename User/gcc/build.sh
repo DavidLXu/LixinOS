@@ -76,15 +76,24 @@ if [[ $phase == deps || $phase == all ]]; then
 fi
 if [[ $phase == binutils || $phase == all ]]; then
     src="$w/binutils-2.43.1"
-    if ! (cd "$src" && patch -f -R --dry-run -s -p1 < "$port/binutils.patch") >/dev/null 2>&1; then
+    if ! grep -q 'lixin_publish (bfd' "$src/bfd/opncls.c"; then
         (cd "$src" && patch -f -p1 < "$port/binutils.patch")
+    fi
+    if ! (cd "$src" && patch -f -R --dry-run -s -p1 < "$port/binutils-build-volume.patch") >/dev/null 2>&1; then
+        (cd "$src" && patch -f -p1 < "$port/binutils-build-volume.patch")
+    fi
+    if ! grep -q 'lx_save_buffer' "$src/bfd/opncls.c"; then
+        (cd "$src" && patch -f -p1 < "$port/binutils-wide.patch")
+    fi
+    if ! grep -q 'memory_capacity (bfd_size_type' "$src/bfd/bfdio.c"; then
+        (cd "$src" && patch -f -p1 < "$port/binutils-buffer.patch")
     fi
     mkdir -p build-binutils
     (cd build-binutils
     [[ -f Makefile ]] || "$w/binutils-2.43.1/configure" "${common[@]}" --target=aarch64-none-elf --disable-werror --disable-gprofng --disable-gdb --disable-gprof --disable-sim --disable-gold --disable-plugins --without-zstd --with-system-zlib "${tools[@]}" >configure.log 2>&1
     relink_if_needed gas/as-new
     relink_if_needed ld/ld-new
-    make -j"$jobs" MAKEINFO=true all-gas all-ld >build.log 2>&1)
+    make -j"$jobs" MAKEINFO=true all-gas all-ld all-binutils >build.log 2>&1)
 fi
 if [[ $phase == gcc || $phase == all ]]; then
     python3 "$port/patch.py" "$w/gcc-4.8.5"

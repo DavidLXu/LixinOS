@@ -513,7 +513,7 @@ static void paint_status(void) {
     char *p = add_number(add_text(buf, "CPU "), cpu_percent());
     p = add_number(add_text(p, "%   Heap "), heap_bytes() >> 20);
     p = add_number(add_text(p, " MiB   Disk "), disk_usage() >> 20);
-    p = add_text(add_number(add_text(p, " / "), SNAPSHOT_SLOT_BYTES >> 20), " MiB");
+    p = add_text(add_number(add_text(p, " / "), (disk_capacity() + 512) >> 20), " MiB");
     unsigned metrics = p - buf;
     if ((14 + metrics + 1) * CW <= clock_x)
         for (unsigned i = 0; i < metrics; i++)
