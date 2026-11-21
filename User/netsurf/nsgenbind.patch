@@ -1,0 +1,46 @@
+--- a/nsgenbind/src/duk-libdom-interface.c
++++ b/nsgenbind/src/duk-libdom-interface.c
+@@ -780,6 +780,10 @@
+         int res = 0;
+ 
+         for (opc = 0; opc < entry->u.interface.operationc; opc++) {
++                struct ir_operation_entry *binding = &entry->u.interface.operationv[opc];
++                /* Expose only members for which the browser has a binding. */
++                if (binding->method == NULL)
++                        continue;
+                 res = output_prototype_method(
+                         outc,
+                         entry,
+@@ -820,6 +824,10 @@
+         int res = 0;
+ 
+         for (attrc = 0; attrc < entry->u.interface.attributec; attrc++) {
++                struct ir_attribute_entry *binding = &entry->u.interface.attributev[attrc];
++                /* Expose only members for which the browser has a binding. */
++                if (binding->getter == NULL && binding->setter == NULL && binding->putforwards == NULL)
++                        continue;
+                 res = output_prototype_attribute(
+                         outc,
+                         entry,
+@@ -1403,6 +1411,10 @@
+         int res = 0;
+ 
+         for (opc = 0; opc < ife->u.interface.operationc; opc++) {
++                struct ir_operation_entry *binding = &ife->u.interface.operationv[opc];
++                /* Expose only members for which the browser has a binding. */
++                if (binding->method == NULL)
++                        continue;
+                 res = output_interface_operation(
+                         outc,
+                         ife,
+@@ -1625,6 +1637,10 @@
+         int attrc;
+ 
+         for (attrc = 0; attrc < ife->u.interface.attributec; attrc++) {
++                struct ir_attribute_entry *binding = &ife->u.interface.attributev[attrc];
++                /* Expose only members for which the browser has a binding. */
++                if (binding->getter == NULL && binding->setter == NULL && binding->putforwards == NULL)
++                        continue;
+                 output_interface_attribute(
+                         outc,
+                         ife,

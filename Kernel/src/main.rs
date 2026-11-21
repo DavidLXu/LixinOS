@@ -87,9 +87,9 @@ pub(crate) fn high_heap_end() -> Option<usize> {
 }
 
 fn put(byte: u8) {
-    if !process::capture_agent_output(byte) { return; }
+    if !process::capture_agent_output(byte) || process::quiet_desktop_worker() { return; }
     #[cfg(feature = "retina")]
-    graphics::put(byte);
+    if !graphics::put(byte) { return; }
     #[cfg(feature = "ssh-mux")]
     serial_mux::write(byte);
     #[cfg(not(feature = "ssh-mux"))]
@@ -115,8 +115,14 @@ fn print(text: &str) {
 }
 
 fn poll_byte() -> Option<u8> {
+    let key = poll_console();
+    if key == Some(3) && scheduler::interrupt_reader() { return Some(4); }
+    key
+}
+
+fn poll_console() -> Option<u8> {
     scheduler::checkpoint();
-    if process::agent_noninteractive() { return None; }
+    if process::agent_noninteractive() || process::quiet_desktop_worker() { return None; }
     if scheduler::background() { return None; }
     #[cfg(feature="split")]
     if scheduler::pane() != scheduler::focus() { return None; }
@@ -124,6 +130,8 @@ fn poll_byte() -> Option<u8> {
     {
         graphics::sample();
         graphics::poll_window();
+        if !graphics::tab_input_allowed() { return None; }
+        graphics::tab_paste();
         if let Some(key) = graphics::window_input() { return Some(key); }
         let pasted = clipboard::input();
         graphics::apply_resize();
@@ -136,6 +144,7 @@ fn poll_byte() -> Option<u8> {
             Some(clipboard::COPY) if graphics::editor_popup() => return Some(3),
             Some(clipboard::COPY) => clipboard::copy(graphics::copied_text()),
             Some(clipboard::PASTE) => clipboard::paste(),
+            Some(byte) if graphics::dismiss_edit_menu(byte) => (),
             Some(byte) => return Some(byte),
             None => (),
         }
@@ -144,7 +153,31 @@ fn poll_byte() -> Option<u8> {
     #[cfg(feature = "ssh-mux")]
     { serial_mux::poll() }
     #[cfg(not(feature = "ssh-mux"))]
-    { uart_poll() }
+    { unsafe { (&mut *core::ptr::addr_of_mut!(SERIAL_INPUT)).pop_front() }.or_else(uart_poll) }
+}
+
+#[cfg(not(feature = "ssh-mux"))]
+static mut SERIAL_INPUT: alloc::collections::VecDeque<u8> = alloc::collections::VecDeque::new();
+
+// Peek for ETX during foreground waits. Retain ordinary keyboard and UART
+// input for the program that owns the terminal.
+fn take_interrupt() -> bool {
+    #[cfg(feature = "split")]
+    if scheduler::take_key_interrupt() { return true; }
+    #[cfg(all(feature = "retina", not(feature = "split")))]
+    if graphics::take_key_interrupt() { return true; }
+    #[cfg(feature = "ssh-mux")]
+    { serial_mux::take_interrupt() }
+    #[cfg(not(feature = "ssh-mux"))]
+    {
+        let queue = unsafe { &mut *core::ptr::addr_of_mut!(SERIAL_INPUT) };
+        while queue.len() < 4096 {
+            let Some(byte) = uart_poll() else { break };
+            if byte == 3 { return true; }
+            queue.push_back(byte);
+        }
+        false
+    }
 }
 
 fn uart_poll() -> Option<u8> {
@@ -155,6 +188,7 @@ fn uart_poll() -> Option<u8> {
 fn read_byte() -> u8 {
     if scheduler::background() || process::agent_noninteractive() {return 4;}
     loop {
+        if scheduler::stopped() != 0 { return 4; }
         if let Some(byte) = poll_byte() {
             return byte;
         }
@@ -169,7 +203,7 @@ fn read_timed_byte(milliseconds: u64) -> Option<u8> {
         if let Some(byte) = poll_byte() {
             return Some(byte);
         }
-        if monitor::ticks().wrapping_sub(start) >= duration {
+        if scheduler::stopped() != 0 || monitor::ticks().wrapping_sub(start) >= duration {
             return None;
         }
         scheduler::sleep_ms(1);
@@ -178,6 +212,15 @@ fn read_timed_byte(milliseconds: u64) -> Option<u8> {
 
 #[unsafe(no_mangle)]
 extern "C" fn console_io(value: u64, operation: u64) -> u64 {
+    let result = console_service(value, operation);
+    match scheduler::stopped() {
+        130 => (-4095i64) as u64,
+        137 => (-4094i64) as u64,
+        _ => result,
+    }
+}
+
+fn console_service(value: u64, operation: u64) -> u64 {
     #[cfg(feature = "retina")]
     {
         graphics::poll_window();
@@ -189,6 +232,8 @@ extern "C" fn console_io(value: u64, operation: u64) -> u64 {
     if agent_tools::active() {
         return if operation == 12 { agent_tools::exchange(value) } else { u64::MAX };
     }
+    if operation == 57 { scheduler::own_interrupt_key(); return 0; }
+    if operation == 55 { return if scheduler::stop_child(value as usize) { 0 } else { u64::MAX }; }
     if operation == 44 {
         return process::python_system();
     }

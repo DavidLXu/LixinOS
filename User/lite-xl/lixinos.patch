@@ -1,0 +1,354 @@
+--- a/src/main.c
++++ b/src/main.c
+@@ -6,6 +6,7 @@
+ #include "renwindow.h"
+ #include "rencache.h"
+ #include "renderer.h"
++#include "window.h"
+ 
+ #include <signal.h>
+ 
+@@ -121,6 +122,12 @@
+   signal(SIGPIPE, SIG_IGN);
+ #endif
+ 
++  int width, height;
++  if (!lxl_boot(&width, &height)) {
++    fputs("Open Lite XL from the LixinOS desktop Apps menu.\n", stderr);
++    return 1;
++  }
++
+   SDL_SetAppMetadata("Lite XL", LITE_PROJECT_VERSION_STR, "com.lite_xl.LiteXL");
+ 
+   if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
+@@ -145,9 +152,9 @@
+   SDL_SetHint("SDL_BORDERLESS_RESIZABLE_STYLE", "1");
+   SDL_SetHint(SDL_HINT_MOUSE_DOUBLE_CLICK_RADIUS, "4");
+ 
+-  const SDL_DisplayMode* dm = SDL_GetCurrentDisplayMode(SDL_GetPrimaryDisplay());
++
+   window = SDL_CreateWindow(
+-    "", (dm ? dm->w : 2) * 0.8, (dm ? dm->h : 2) * 0.8,
++    "Lite XL", width, height,
+     SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN);
+   if (!window) {
+     fprintf(stderr, "Error creating lite-xl window: %s", SDL_GetError());
+@@ -165,6 +172,7 @@
+   L = luaL_newstate();
+   luaL_openlibs(L);
+   api_load_libs(L);
++  lxl_bind(L);
+ 
+ 
+   lua_newtable(L);
+@@ -174,15 +182,13 @@
+   }
+   lua_setglobal(L, "ARGS");
+ 
+-  // hack to keep backwards compatibility with other PLATFORM enums
+-  const char *platform = SDL_GetPlatform();
+-  lua_pushstring(L, SDL_strcmp(platform, "macOS") == 0 ? "Mac OS X" : platform);
++  lua_pushstring(L, "LixinOS");
+   lua_setglobal(L, "PLATFORM");
+ 
+   lua_pushstring(L, LITE_ARCH_TUPLE);
+   lua_setglobal(L, "ARCH");
+ 
+-  char exename[2048];
++  char exename[2048] = {0};
+   get_exe_filename(exename, sizeof(exename));
+   if (*exename) {
+     lua_pushstring(L, exename);
+@@ -205,6 +211,12 @@
+ 
+   const char *init_lite_code = \
+     "local core\n"
++    "io.stdout = io.stderr\n"
++    "io.output(io.stderr)\n"
++    "print = function(...)\n"
++    "  for i=1,select('#', ...) do io.stderr:write(i == 1 and '' or '\\t', tostring(select(i, ...))) end\n"
++    "  io.stderr:write('\\n')\n"
++    "end\n"
+     "local os_exit = os.exit\n"
+     "os.exit = function(code, close)\n"
+     "  os_exit(code, close == nil and true or close)\n"
+@@ -212,9 +224,7 @@
+     "xpcall(function()\n"
+     "  local match = require('utf8extra').match\n"
+     "  HOME = os.getenv('" LITE_OS_HOME "')\n"
+-    "  local exedir = match(EXEFILE, '^(.*)" LITE_PATHSEP_PATTERN LITE_NONPATHSEP_PATTERN "$')\n"
+-    "  local prefix = match(exedir, '^(.*)" LITE_PATHSEP_PATTERN "bin$')\n"
+-    "  dofile((MACOS_RESOURCES or (prefix and prefix .. '/share/lite-xl' or exedir .. '/data')) .. '/core/start.lua')\n"
++    "  dofile('/lib/lite-xl/data/core/start.lua')\n"
+     "  core = require(os.getenv('LITE_XL_RUNTIME') or 'core')\n"
+     "  core.init()\n"
+     "  core.run()\n"
+--- a/src/renwindow.c
++++ b/src/renwindow.c
+@@ -2,6 +2,7 @@
+ #include <assert.h>
+ #include <stdio.h>
+ #include "renwindow.h"
++#include "window.h"
+ 
+ #ifdef LITE_USE_SDL_RENDERER
+ static int query_surface_scale(RenWindow *ren) {
+@@ -129,7 +130,7 @@
+   SDL_RenderTexture(ren->renderer, ren->texture, NULL, NULL);
+   SDL_RenderPresent(ren->renderer);
+ #else
+-  SDL_UpdateWindowSurfaceRects(ren->window, (SDL_Rect*) rects, count);
++  lxl_damage(SDL_GetWindowSurface(ren->window), (SDL_Rect*) rects, count);
+ #endif
+ }
+ 
+--- a/src/api/system.c
++++ b/src/api/system.c
+@@ -10,6 +10,7 @@
+ #include "api.h"
+ #include "../rencache.h"
+ #include "../renwindow.h"
++#include "window.h"
+ #ifdef _WIN32
+   #include <direct.h>
+   #include <windows.h>
+@@ -171,6 +172,8 @@
+ #endif
+ 
+ static int f_poll_event(lua_State *L) {
++  int count = lxl_poll_input(L);
++  if (count) return count;
+   char buf[16];
+   float mx, my;
+   int w, h;
+@@ -456,11 +459,8 @@
+ enum { WIN_NORMAL, WIN_MINIMIZED, WIN_MAXIMIZED, WIN_FULLSCREEN };
+ 
+ static int f_set_window_mode(lua_State *L) {
+-  int n = luaL_checkoption(L, 1, "normal", window_opts);
+-  SDL_SetWindowFullscreen(window_renderer.window, n == WIN_FULLSCREEN);
+-  if (n == WIN_NORMAL) { SDL_RestoreWindow(window_renderer.window); }
+-  if (n == WIN_MAXIMIZED) { SDL_MaximizeWindow(window_renderer.window); }
+-  if (n == WIN_MINIMIZED) { SDL_MinimizeWindow(window_renderer.window); }
++  /* The desktop title bar controls presentation mode. */
++  (void)luaL_checkoption(L, 1, "normal", window_opts);
+   return 0;
+ }
+ 
+@@ -497,13 +497,8 @@
+ 
+ 
+ static int f_set_window_size(lua_State *L) {
+-  double w = luaL_checknumber(L, 1);
+-  double h = luaL_checknumber(L, 2);
+-  double x = luaL_checknumber(L, 3);
+-  double y = luaL_checknumber(L, 4);
+-  SDL_SetWindowSize(window_renderer.window, w, h);
+-  SDL_SetWindowPosition(window_renderer.window, x, y);
+-  ren_resize_window(&window_renderer);
++  /* Desktop CONFIGURE controls the hosted window geometry. */
++  (void)L;
+   return 0;
+ }
+ 
+@@ -776,6 +771,7 @@
+ static int f_set_clipboard(lua_State *L) {
+   const char *text = luaL_checkstring(L, 1);
+   SDL_SetClipboardText(text);
++  lxl_copy(text);
+   return 0;
+ }
+ 
+--- a/data/core/start.lua
++++ b/data/core/start.lua
+@@ -1,17 +1,13 @@
+ -- this file is used by lite-xl to setup the Lua environment when starting
+-VERSION = "@PROJECT_VERSION@"
++VERSION = "2.1.8"
+ MOD_VERSION = "3"
+ 
+ SCALE = tonumber(os.getenv("LITE_SCALE") or os.getenv("GDK_SCALE") or os.getenv("QT_SCALE_FACTOR")) or 1
+ PATHSEP = package.config:sub(1, 1)
+ 
+ EXEDIR = EXEFILE:match("^(.+)[/\\][^/\\]+$")
+-if MACOS_RESOURCES then
+-  DATADIR = MACOS_RESOURCES
+-else
+-  local prefix = EXEDIR:match("^(.+)[/\\]bin$")
+-  DATADIR = prefix and (prefix .. PATHSEP .. 'share' .. PATHSEP .. 'lite-xl') or (EXEDIR .. PATHSEP .. 'data')
+-end
++DATADIR = "/lib/lite-xl/data"
++if HOME == "/" and system.get_file_info("/home/lixin") then HOME = "/home/lixin" end
+ USERDIR = (system.get_file_info(EXEDIR .. PATHSEP .. 'user') and (EXEDIR .. PATHSEP .. 'user'))
+        or os.getenv("LITE_USERDIR")
+        or ((os.getenv("XDG_CONFIG_HOME") and os.getenv("XDG_CONFIG_HOME") .. PATHSEP .. "lite-xl"))
+--- a/data/core/init.lua
++++ b/data/core/init.lua
+@@ -1400,6 +1400,15 @@
+ 
+ 
+ function core.run()
++  if system.lixin_next_event then
++    while system.lixin_next_event() do
++      core.frame_start = system.get_time()
++      run_threads()
++      core.step()
++      if not system.lixin_present() or core.quit_request or core.restart_request then break end
++    end
++    return
++  end
+   local next_step
+   local last_frame_time
+   local run_threads_full = 0
+--- a/data/core/style.lua
++++ b/data/core/style.lua
+@@ -23,10 +23,16 @@
+ -- On High DPI monitor or non RGB monitor you may consider using antialiasing grayscale instead.
+ -- The antialiasing grayscale with full hinting is interesting for crisp font rendering.
+ style.font = renderer.font.load(DATADIR .. "/fonts/FiraSans-Regular.ttf", 15 * SCALE)
++local fallback_path = DATADIR .. "/fonts/NotoSansMonoCJKsc-Regular.otf"
++local fallback = renderer.font.load(fallback_path, 15 * SCALE, {antialiasing="grayscale"})
++style.font = renderer.font.group { style.font, fallback }
+ style.big_font = style.font:copy(46 * SCALE)
+ style.icon_font = renderer.font.load(DATADIR .. "/fonts/icons.ttf", 16 * SCALE, {antialiasing="grayscale", hinting="full"})
+ style.icon_big_font = style.icon_font:copy(23 * SCALE)
+-style.code_font = renderer.font.load(DATADIR .. "/fonts/JetBrainsMono-Regular.ttf", 15 * SCALE)
++style.code_font = renderer.font.group {
++  renderer.font.load(DATADIR .. "/fonts/JetBrainsMono-Regular.ttf", 15 * SCALE),
++  fallback
++}
+ 
+ style.syntax = {}
+ 
+--- a/data/core/doc/init.lua
++++ b/data/core/doc/init.lua
+@@ -105,12 +105,9 @@
+   else
+     assert(self.filename or abs_filename, "calling save on unnamed doc without absolute path")
+   end
+-  local fp = assert( io.open(filename, "wb") )
+-  for _, line in ipairs(self.lines) do
+-    if self.crlf then line = line:gsub("\n", "\r\n") end
+-    fp:write(line)
+-  end
+-  fp:close()
++  local contents = table.concat(self.lines)
++  if self.crlf then contents = contents:gsub("\n", "\r\n") end
++  system.lixin_save(filename, contents)
+   self:set_filename(filename, abs_filename)
+   self.new_file = false
+   self:clean()
+--- a/data/core/keymap.lua
++++ b/data/core/keymap.lua
+@@ -288,6 +288,7 @@
+ 
+ keymap.add_direct {
+   ["ctrl+shift+p"] = "core:find-command",
++  ["ctrl+e"] = "core:find-command",
+   ["ctrl+p"] = "core:find-file",
+   ["ctrl+o"] = "core:open-file",
+   ["ctrl+n"] = "core:new-doc",
+--- a/src/renderer.c
++++ b/src/renderer.c
+@@ -411,13 +411,56 @@
+ }
+ 
+ // based on https://github.com/libsdl-org/SDL_ttf/blob/2a094959055fba09f7deed6e1ffeb986188982ae/SDL_ttf.c#L1735
++/* FreeType faces of different sizes use separate streams but can share the
++ * same open font. The renderer reads synchronously at an explicit offset. */
++typedef struct FontFile {
++  struct FontFile *next;
++  SDL_IOStream *io;
++  unsigned long size;
++  unsigned int references;
++  char path[];
++} FontFile;
++
++static FontFile *font_files;
++
++static FontFile *font_file_open(const char *path) {
++  for (FontFile *resource = font_files; resource; resource = resource->next) {
++    if (!strcmp(resource->path, path)) {
++      resource->references++;
++      return resource;
++    }
++  }
++  SDL_IOStream *io = SDL_IOFromFile(path, "rb");
++  if (!io) return NULL;
++  Sint64 size = SDL_GetIOSize(io);
++  if (size < 0) {
++    SDL_CloseIO(io);
++    return NULL;
++  }
++  FontFile *resource = check_alloc(SDL_malloc(sizeof *resource + strlen(path) + 1));
++  *resource = (FontFile){ .next = font_files, .io = io, .size = size, .references = 1 };
++  strcpy(resource->path, path);
++  font_files = resource;
++  return resource;
++}
++
++static void font_file_release(FontFile *resource) {
++  if (--resource->references) return;
++  FontFile **entry = &font_files;
++  while (*entry != resource) entry = &(*entry)->next;
++  *entry = resource->next;
++  SDL_CloseIO(resource->io);
++  SDL_free(resource);
++}
++
+ static unsigned long font_file_read(FT_Stream stream, unsigned long offset, unsigned char *buffer, unsigned long count) {
+   uint64_t amount;
+-  SDL_IOStream *file = (SDL_IOStream *) stream->descriptor.pointer;
+-  SDL_SeekIO(file, (int) offset, SDL_IO_SEEK_SET);
++  FontFile *resource = stream->descriptor.pointer;
++  if (SDL_SeekIO(resource->io, offset, SDL_IO_SEEK_SET) < 0)
++    return count == 0 ? 1 : 0;
+   if (count == 0)
+     return 0;
+-  amount = SDL_ReadIO(file, buffer, sizeof(char) * count);
++  amount = SDL_ReadIO(resource->io, buffer, count);
+   if (amount <= 0)
+     return 0;
+   return (unsigned long) amount;
+@@ -425,7 +468,7 @@
+ 
+ static void font_file_close(FT_Stream stream) {
+   if (stream && stream->descriptor.pointer)
+-    SDL_CloseIO((SDL_IOStream *) stream->descriptor.pointer);
++    font_file_release(stream->descriptor.pointer);
+   SDL_free(stream);
+ }
+ 
+@@ -458,11 +501,11 @@
+ 
+ RenFont* ren_font_load(RenWindow *window_renderer, const char* path, float size, ERenFontAntialiasing antialiasing, ERenFontHinting hinting, unsigned char style) {
+   FT_Error err = FT_Err_Ok;
+-  SDL_IOStream *file = NULL; RenFont *font = NULL;
++  RenFont *font = NULL;
+   FT_Face face = NULL; FT_Stream stream = NULL;
+ 
+-  file = SDL_IOFromFile(path, "rb");
+-  if (!file) return NULL; // error set by SDL_IOFromFile
++  FontFile *file = font_file_open(path);
++  if (!file) return NULL;
+   
+   int len = strlen(path);
+   font = check_alloc(SDL_calloc(1, sizeof(RenFont) + len + 1));
+@@ -482,7 +525,7 @@
+   stream->close = &font_file_close;
+   stream->descriptor.pointer = file;
+   stream->pos = 0;
+-  stream->size = (unsigned long) SDL_GetIOSize(file);
++  stream->size = file->size;
+ 
+   if ((err = FT_Open_Face(library, &(FT_Open_Args) { .flags = FT_OPEN_STREAM, .stream = stream }, 0, &face)) != 0)
+     goto failure;
+@@ -491,7 +534,7 @@
+   return font;
+ 
+ stream_failure:
+-  if (file) SDL_CloseIO(file);
++  font_file_release(file);
+ failure:
+   if (err != FT_Err_Ok) SDL_SetError("%s", get_ft_error(err));
+   if (face) FT_Done_Face(face);

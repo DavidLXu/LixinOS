@@ -13,6 +13,10 @@ void uart_put(unsigned char c) {
 }
 int uart_poll(void) { return UART[0x18 / 4] & (1u << 4) ? -1 : (int)(UART[0] & 255); }
 void serial_put(u8 c) {
+    if (!display_output_visible()) {
+        display_byte(c);
+        return;
+    }
     if (ssh_mode())
         mux_write(c);
     else
@@ -51,7 +55,20 @@ void console_pump(void) {
         q->data[q->tail++ % 1024] = key;
     }
 }
+int console_interrupt(void) {
+    if (ssh_mode()) return mux_interrupt();
+    console_pump();
+    struct input *q = &inputs[process_pane()];
+    for (unsigned i = q->head; i != q->tail; i++) {
+        if (q->data[i % 1024] != 3) continue;
+        for (unsigned j=i+1; j!=q->tail; j++) q->data[(j-1)%1024] = q->data[j%1024];
+        q->tail--;
+        return 1;
+    }
+    return 0;
+}
 int console_ready(void) {
+    if (!popup_tab_input()) return 0;
     if (ssh_mode())
         return mux_ready();
     console_pump();
@@ -59,10 +76,12 @@ int console_ready(void) {
     return q->head != q->tail || popup_closed();
 }
 int console_key(void) {
+    if (!popup_tab_input()) return -1;
     if (ssh_mode())
         return mux_key();
     console_pump();
     struct input *q = &inputs[process_pane()];
+    popup_tab_paste();
     clipboard_poll();
     int pasted = clipboard_key();
     if (pasted >= 0)
@@ -70,12 +89,14 @@ int console_key(void) {
     if (q->head == q->tail)
         return -1;
     int key = q->data[q->head++ % 1024];
+    if (dismiss_edit_menu(key)) return -1;
     if (key == 258) {
+        if (display_editor_active()) return 3;
         selection_copy();
         return -1;
     }
     if (key == 259) {
-        clipboard_request(editing_file());
+        clipboard_request(canvas_clipboard_options() | editing_file());
         return -1;
     }
     return key;
@@ -83,7 +104,9 @@ int console_key(void) {
 int console_read(unsigned timeout_ms) {
     u64 start = clock_ticks(), duration = clock_hz() * timeout_ms / 1000;
     do {
+        if (task_stopped()) return 256;
         int key = popup_key(console_key());
+        if (key == 3 && interrupt_reader()) return 256;
         if (key >= 0)
             return key;
         display_idle_pointer();

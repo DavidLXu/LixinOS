@@ -18,7 +18,7 @@ done
 # targets Linux and must never take precedence over the guest's musl.
 args+=(-nostartfiles -static -Wl,--gc-sections,--build-id=none,-z,max-page-size=4096)
 if [[ ${LIXINOS_RUST_APP:-0} == 1 ]]; then
-    lib=$gcc/current-package/lib/gcc
+    lib=${LIXINOS_RUST_APP_CRT:-$gcc/current-package/lib/gcc}
     args=("$lib/crt0.o" "$lib/crt1.o" "${args[@]}" "-Wl,-T,$root/User/gcc/application.ld")
 else
     args+=("-Wl,-T,$root/User/cpython/program.ld" "$py/sysroot/lib/crt1.o")

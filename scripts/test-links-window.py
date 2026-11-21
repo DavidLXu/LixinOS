@@ -57,7 +57,7 @@ def exercise(guest, control, directory, screenshot, page_url=None, events=False)
 
     font = (here.parent / "Kernel/target/user-build/desktop.gray").read_bytes()
 
-    def title(pixel, text):
+    def title(pixel, text, ox=94, oy=23, light=True):
         for index, ch in enumerate(text):
             glyph = (ord(ch)-32)*18*22
             for y in range(22):
@@ -65,7 +65,7 @@ def exercise(guest, control, directory, screenshot, page_url=None, events=False)
                     alpha = font[glyph+y*18+x]
                     if 16 < alpha < 235:
                         continue
-                    if (pixel(12+82+index*9+x, 12+11+y)[0] > 140) != (alpha >= 235):
+                    if (pixel(ox+index*9+x, oy+y)[0] > 140) != ((alpha >= 235) == light):
                         return False
         return True
 
@@ -142,20 +142,22 @@ def exercise(guest, control, directory, screenshot, page_url=None, events=False)
         assert guest.vm.wait(timeout=10)==0
         return
 
-    desktop = lambda pixel: pixel(21, 113).hex() == "e8eee8"
+    desktop = lambda pixel: pixel(1,1).hex()=="281e2b"
     guest.send(b"desktop\r")
     wait(desktop)
-    click(46, 130)
-    width, _, pixels = wait(lambda pixel: title(pixel, "Links 2.30"))
+    width,height,_=frame()
+    bx,by=76+(width//2-76-850)//2, ((height-44)//2-540)//2
+    click(38, 110)
+    width, _, pixels = wait(lambda pixel: title(pixel, "Links 2.30",bx+14,by+11,False))
     # Locate the blue link underline below the toolbar.
     position = pixels.index(bytes.fromhex("185e93"), (44+96*2)*width*3)//3
     click((position % width)//2+1, (position//width-44)//2)
-    wait(lambda pixel: title(pixel, "Example Domain"))
+    wait(lambda pixel: title(pixel, "Example Domain",bx+14,by+11,False))
     if screenshot:
         subprocess.run(["sips", "-s", "format", "png", path, "--out", screenshot], check=True)
-    click(42, 73)
-    wait(lambda pixel: title(pixel, "Links 2.30"))
-    click(width//2-32, 34)
+    click(bx+40,by+61)
+    wait(lambda pixel: title(pixel, "Links 2.30",bx+14,by+11,False))
+    click(bx+850-21,by+22)
     wait(desktop)
     guest.send(b"\x1b")
     guest.until(harness["serial"]["SHELL"])

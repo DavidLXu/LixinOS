@@ -7,7 +7,11 @@ mod abi;
 use super::*;
 use crate::agent_tools::{COLOR_RESET, PREVIEW_LINES, PREVIEW_OMITTED, ToolReport, ToolStatus, preview_lines, print_tool};
 use crate::{user, utility};
-use core::{cell::{Cell, UnsafeCell}, fmt::Write};
+use core::{cell::{Cell, UnsafeCell}, fmt::Write, sync::atomic::{AtomicU8, Ordering}};
+
+#[path = "desktop_agent_host.rs"]
+mod desktop_agent_host;
+pub(crate) use desktop_agent_host::quiet_desktop_worker;
 
 const AGENT_OUTPUT_LIMIT: usize = 1536;
 const AGENT_ARGUMENT_PREVIEW_BYTES: usize = 240;
@@ -31,6 +35,7 @@ struct AgentConsole {
     cancelled: Rc<Cell<bool>>,
     timed_out: bool,
     needs_terminal: bool,
+    workspace: Option<String>,
 }
 struct AgentSlot(UnsafeCell<Option<AgentConsole>>);
 unsafe impl Sync for AgentSlot {}
@@ -116,11 +121,12 @@ pub(crate) fn agent_command(
     started: u64,
     args: Vec<String>,
     interactive: bool,
+    scoped: bool,
     progress: (usize, usize),
     approve: impl FnOnce(Option<&str>) -> Result<bool>,
 ) -> Result<ToolReport> {
     let services = Services {
-        agent_bridge: Rc::new(RefCell::new(None)),
+        agent_bridge: model_bridge(),
         volume,
         started,
         cwd: cwd.into(),
@@ -179,6 +185,7 @@ pub(crate) fn agent_command(
                     output: Vec::new(), truncated: false, console_lines: 0, console_truncated: false,
                     last_shown: None, deadline, cancelled: child_cancelled,
                     timed_out: false, needs_terminal: false,
+                    workspace: scoped.then(|| services.cwd.clone()),
                 });
                 ACTIVE_AGENT_CONSOLES += 1;
             }
@@ -194,7 +201,7 @@ pub(crate) fn agent_command(
     } else {
         loop {
             if let Some(status) = crate::scheduler::try_wait(pid) { break status; }
-            if matches!(crate::poll_byte(), Some(3 | 7)) {
+            if crate::scheduler::stopped() != 0 || matches!(crate::poll_byte(), Some(3 | 7)) {
                 cancelled.set(true);
             }
             crate::scheduler::sleep_ms(1);
@@ -251,6 +258,13 @@ pub(crate) fn agent_command(
     Ok(report)
 }
 
+pub(crate) fn agent_write_allowed(path: &str) -> bool {
+    let Some(slot) = agent_console_slot() else { return true; };
+    let console = unsafe { (*slot).as_ref().unwrap() };
+    console.workspace.as_deref().is_none_or(|root|
+        path.strip_prefix(root).is_some_and(|tail| tail.starts_with('/') && !tail.split('/').any(|part| part == ".git")))
+}
+
 pub(crate) fn agent_noninteractive() -> bool {
     agent_console_slot().is_some()
 }
@@ -260,7 +274,7 @@ pub(crate) fn agent_noninteractive() -> bool {
 pub(crate) fn spawn_program(cwd: String, volume: Rc<RefCell<Volume>>, streams: utility::Streams,
     path: String, args: Vec<String>) -> Result<usize> {
     let services = Services { cwd, volume, started: crate::monitor::ticks(),
-        agent_bridge: Rc::new(RefCell::new(None)) };
+        agent_bridge: model_bridge() };
     let image = services.executable_bytes(&path)?;
     let req = Spawn { path, args, flags: 0 };
     crate::scheduler::spawn(alloc::boxed::Box::new(move || {
@@ -279,7 +293,7 @@ pub(crate) fn python_system() -> u64 {
         let len = bytes.iter().position(|&byte| byte == 0).ok_or("command too long")?;
         let command = core::str::from_utf8(&bytes[..len]).map_err(|_| "invalid command")?;
         let services = Services { cwd, volume, started: crate::monitor::ticks(),
-            agent_bridge: Rc::new(RefCell::new(None)) };
+            agent_bridge: model_bridge() };
         let path = String::from("/bin/bash");
         let image = services.executable_bytes(&path)?;
         if !user::is_executable(&image) { return Err("expected /bin/bash in LXE format"); }
@@ -294,13 +308,16 @@ pub(crate) fn python_system() -> u64 {
 }
 
 #[unsafe(no_mangle)]
-pub(crate) extern "C" fn agent_command_interrupted() -> bool {
-    agent_console_slot().is_some_and(|slot| unsafe {
+pub(crate) extern "C" fn user_interrupt_status() -> u64 {
+    let stop = crate::scheduler::stopped();
+    if stop != 0 { return stop.into(); }
+    let expired = agent_console_slot().is_some_and(|slot| unsafe {
         (*slot).as_mut().is_some_and(|console| {
             console.timed_out |= crate::monitor::ticks() >= console.deadline;
             console.cancelled.get() || console.timed_out
         })
-    })
+    });
+    if expired { 124 } else { 0 }
 }
 
 struct Spawn {
@@ -362,6 +379,14 @@ impl Context {
     fn exec(&mut self, req: Spawn, image: &[u8]) -> Result<u8> {
         let mut args = req.args;
         if let Some(handler) = system_handler(image) {
+            if matches!(handler, "agent-io" | "agent-command") {
+                return self.desktop_helper(&req.path, handler, &args);
+            }
+            if handler == "agent" && req.path == "/bin/agent"
+                && args.get(1).is_some_and(|mode| matches!(mode.as_str(), "desktop" | "desktop-work" | "resume"))
+            {
+                return self.desktop_worker(args);
+            }
             args[0] = handler.into();
             if let Some(exe) = crate::utility::installed(handler) {
                 return self.utility(exe, &args);
@@ -379,8 +404,28 @@ impl Context {
                 ));
                 return result;
             }
+            if handler == "tcc" && agent_noninteractive()
+                && let [_, src, flag, dst] = &args[..] && flag == "-o"
+                && self.io.as_ref().is_some_and(|io| io.streams.output_pipe.is_some())
+            {
+                let streams = self.io.take().unwrap().streams;
+                let errors = streams.error_pipe.clone().or_else(|| streams.output_pipe.clone());
+                if let Err(error) = self.services.compile_lxe(src, dst, streams) {
+                    if let Some(errors) = errors {
+                        let detail = format!("tcc: error: {error}\n");
+                        let mut rest = detail.as_bytes();
+                        while !rest.is_empty() {
+                            let Some(n) = errors.write_from(rest) else { break; };
+                            rest = &rest[n..];
+                        }
+                    }
+                    return Ok(1);
+                }
+                return Ok(0);
+            }
             if self.io.as_ref().is_some_and(|io| io.streams.redirected())
-                && !(crate::scheduler::background() && handler=="tcc") {
+                && !(crate::scheduler::background() && handler=="tcc")
+            {
                 return Err("this command requires a foreground terminal");
             }
             self.stream.clear();
@@ -419,6 +464,7 @@ impl Context {
                 .or_else(|| (detached && self.pipe.is_none()).then(Vec::new)),
             file.is_some(),
         );
+        if let Some((_, _, parent)) = utility::command_context() { streams.environment = parent.environment; }
         let incoming = self.pipe.take();
         if req.flags & 1 == 0 {
             streams.input_pipe = incoming;
@@ -464,6 +510,8 @@ impl Context {
         let id = crate::scheduler::spawn(alloc::boxed::Box::new(run), crate::scheduler::pane())?;
         if detached {
             crate::scheduler::detach(id);
+        } else {
+            crate::scheduler::job(id);
         }
         Ok(id)
     }
@@ -637,12 +685,6 @@ pub(crate) fn exchange(value: u64) -> u64 {
     }
 }
 
-#[cfg_attr(not(feature = "retina"), allow(dead_code))]
-struct SavedShell {
-    ctx: Context,
-    image: Vec<u8>,
-    memory: user::ImageMemory,
-}
 pub(super) fn run(
     services: Services,
     history: VecDeque<String>,
@@ -651,7 +693,7 @@ pub(super) fn run(
 ) -> Result<u8> {
     let mut ctx = Context::new(services, history, handshake);
     ctx.login = true;
-    drive(ctx, image, None, false, &mut None, None)
+    drive(ctx, image, false, None)
 }
 
 fn run_child(
@@ -673,7 +715,7 @@ fn run_child(
     #[cfg(feature = "retina")]
     let io = {
         let mut io = io;
-        io.allow_canvas = !crate::scheduler::background() && !agent_noninteractive() && !crate::graphics::popup_active();
+        io.allow_canvas = !crate::scheduler::background() && !agent_noninteractive() && !crate::graphics::popup_active() && crate::graphics::tab_input_allowed();
         io
     };
     let saved = user::is_executable(&image);
@@ -686,7 +728,7 @@ fn run_child(
     ctx.io = Some(io);
     if saved || user::process_image(&image).is_some() {
         let args = saved.then(|| (req.args.len(), pack_args(&req.args)));
-        drive(ctx, image, None, false, &mut None, args)
+        drive(ctx, image, false, args)
     } else {
         // Redirections have been inherited by the child's descriptor context.
         ctx.exec(req, &image)
@@ -696,12 +738,10 @@ fn run_child(
 fn drive(
     mut ctx: Context,
     image: Vec<u8>,
-    mut restore: Option<user::ImageMemory>,
     popup: bool,
-    suspended: &mut Option<SavedShell>,
     mut arguments: Option<(usize, String)>,
 ) -> Result<u8> {
-    if arguments.is_none() && user::is_executable(&image) && restore.is_none() {
+    if arguments.is_none() && user::is_executable(&image) {
         ctx.io.get_or_insert_with(|| {
             utility::Context::new(
                 &ctx.services.cwd,
@@ -725,11 +765,10 @@ fn drive(
         unsafe {
             *slot = Some(ctx);
         }
-        let mut launch = || match (restore.take(), arguments.take()) {
-            (Some(mem), _) => user::resume_process(mem),
+        let mut launch = || match arguments.take() {
             _ if continuing => user::continue_process(),
-            (_, Some((argc, packed))) => user::start_saved(&image, argc, &packed, flags),
-            _ => user::start_process(&image, &cwd, flags),
+            Some((argc, packed)) => user::start_saved(&image, argc, &packed, flags),
+            None => user::start_process(&image, &cwd, flags),
         };
         let (io, result) = match io {
             Some(io) => {
@@ -750,14 +789,6 @@ fn drive(
             let desktop_io = ctx.io.take().unwrap();
             return desktop::resume(&ctx, &image, desktop_io);
         }
-        if popup && ctx.pending.is_none() && result == Ok(256) {
-            *suspended = Some(SavedShell {
-                ctx,
-                image,
-                memory: user::suspend_process(),
-            });
-            return Ok(0);
-        }
         if result != Ok(256) || ctx.pending.as_ref().is_none_or(|r| r.args.is_empty()) {
             return result.and_then(|v| u8::try_from(v).map_err(|_| "invalid spawn request"));
         }
@@ -772,6 +803,7 @@ fn drive(
                 alloc::boxed::Box::new(move || run_child(services, history, req, child, streams)),
                 crate::scheduler::pane(),
             )?;
+            crate::scheduler::job(child);
             let status = crate::scheduler::wait(child);
             if let Some(streams) = capture {
                 ctx.stream = streams.output()?;

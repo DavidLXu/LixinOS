@@ -5,15 +5,19 @@ use serde::Serialize;
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ToolStatus {
-    Ok, Failed, RequiresTerminal, TimedOut, Declined, Skipped, Paused,
+    Ok, Failed, Cancelled, RequiresTerminal, TimedOut, Declined, Skipped, Paused,
     NotFound, Staged, NeedsTests, TestPassed, TestFailed, Saved, Verified, Stale,
 }
 
+#[derive(Serialize)]
 pub(crate) struct ToolReport {
     pub(crate) status: ToolStatus,
     pub(crate) detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) exit_code: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     artifact: Option<Receipt>,
 }
 
@@ -159,7 +163,7 @@ impl RunTarget {
         let volume = project.volume.borrow();
         let bytes = volume.read_file(&path).ok()?;
         Some(Self { path, bytes, command: visible(&format!("{argv:?}"), 256),
-            generation: volume.disk.revision() })
+            generation: volume.agent_revision() })
     }
 }
 

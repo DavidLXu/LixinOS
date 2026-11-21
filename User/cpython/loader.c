@@ -13,6 +13,9 @@ struct piece {
 #include "layout.h"
 #define PHDR_ADDR (IMAGE_BASE + 64)
 #endif
+#ifdef LX_DEFLATE
+#include "inflate-image.h"
+#endif
 #ifndef LX_ARGV0
 #define LX_ARGV0 "/bin/python3"
 #endif
@@ -39,6 +42,9 @@ __attribute__((section(".text.start"), noreturn)) void _start(const char *cwd, c
     for (unsigned i = 0; i < sizeof(pieces) / sizeof(pieces[0]); i++) {
         const struct piece *p = &pieces[i];
         int fd = lx_open(p->path);
+#ifdef LX_DEFLATE
+        int valid = fd >= 0 && inflate_piece(fd, p);
+#else
         uint32_t hash = 2166136261U;
         unsigned offset = 0;
         while (fd >= 0 && offset < p->size) {
@@ -50,9 +56,11 @@ __attribute__((section(".text.start"), noreturn)) void _start(const char *cwd, c
                 hash = (hash ^ out[j]) * 16777619U;
             offset += n;
         }
+        int valid = offset == p->size && hash == p->checksum;
+#endif
         if (fd >= 0)
             lx_close(fd);
-        if (offset != p->size || hash != p->checksum)
+        if (!valid)
             fail(LX_ARGV0 ": missing or damaged program files\n");
     }
     if (console_call(46, TEXT_BYTES))
@@ -63,9 +71,16 @@ __attribute__((section(".text.start"), noreturn)) void _start(const char *cwd, c
     long env_result = console_call(53, 0);
     if (env_result > 8193) fail(LX_ARGV0 ": invalid environment\n");
     size_t env_len = env_result > 0 ? (size_t)env_result - 1 : 0;
-    char *env = strings - env_len;
-    for (size_t i = 0; i < env_len; i++) env[i] = ((const char *)0x443d8000)[i];
     const char *executable = LX_ARGV0;
+    char *env = strings - env_len;
+#ifdef LX_NODE
+    // libuv rewrites the contiguous argv strings when process.title changes.
+    char *argv0 = strings - sizeof(LX_ARGV0);
+    for (size_t i = 0; i < sizeof(LX_ARGV0); ++i) argv0[i] = LX_ARGV0[i];
+    executable = argv0;
+    env = argv0 - env_len;
+#endif
+    for (size_t i = 0; i < env_len; i++) env[i] = ((const char *)0x443d8000)[i];
     char *stack_low = env;
 #ifdef LX_APPLICATION
     long path_len = console_call(42, 5);
@@ -121,6 +136,10 @@ __attribute__((section(".text.start"), noreturn)) void _start(const char *cwd, c
     *v++ = (uintptr_t)"COMPILER_PATH=/lib/gcc/bin:/bin";
     *v++ = (uintptr_t)"PATH=/bin";
     *v++ = (uintptr_t)"TMPDIR=/tmp";
+#elif defined(LX_NODE)
+    *v++ = (uintptr_t)"PATH=/bin";
+    *v++ = (uintptr_t)"HOME=/";
+    *v++ = (uintptr_t)"TMPDIR=/tmp";
 #elif defined(LX_APPLICATION)
     *v++ = (uintptr_t)"HOME=/";
     *v++ = (uintptr_t)"PATH=/bin";
@@ -149,7 +168,11 @@ __attribute__((section(".text.start"), noreturn)) void _start(const char *cwd, c
     *v++ = 6;
     *v++ = 4096;
     *v++ = 31; // AT_EXECFN
+#ifdef LX_NODE
+    *v++ = (uintptr_t)LX_ARGV0;
+#else
     *v++ = (uintptr_t)executable;
+#endif
     *v++ = 25;
     *v++ = random;
     *v++ = 0;

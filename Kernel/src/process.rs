@@ -6,7 +6,7 @@ use crate::{
     print,
 };
 use alloc::{collections::VecDeque, format, string::String, vec::Vec};
-pub(crate) use io::{active, agent_command, agent_noninteractive, capture_agent_output, exchange, python_system, spawn_program};
+pub(crate) use io::{active, agent_command, agent_noninteractive, agent_write_allowed, capture_agent_output, exchange, python_system, quiet_desktop_worker, spawn_program};
 #[cfg(feature = "split")]
 pub(crate) use io::ready_on_read;
 
@@ -18,7 +18,7 @@ use crate::disk::{self, ENTRY_LIMIT, FILE_LIMIT, HISTORY_LIMIT};
 const COMMANDS: &[&str] = &[
     "agent", "cat", "cd", "cecho", "clear", "desktop", "echo", "git", "grep", "help", "htop", "kilo", "links", "links2", "ls",
     "head", "tail", "tee", "true", "false", "sleep", "date", "sort", "uniq", "find", "ps", "df", "stat", "tree", "du", "cmp", "diff", "nl", "cut", "tr", "sed", "seq", "basename", "dirname", "test", "printf",
-    "lust", "nano", "netinfo", "cpuinfo", "paint", "pwd", "python", "ssh", "shutdown", "sysinfo", "tcc", "uname", "wc",
+    "lust", "nano", "nxeyes", "stopwatch.win2", "netinfo", "cpuinfo", "paint", "pwd", "python", "sftp", "ssh", "shutdown", "sysinfo", "tcc", "uname", "wc",
 ];
 
 // A system launcher names a handler supplied by the running kernel.
@@ -26,6 +26,11 @@ const LAUNCHER_PREFIX: &[u8] = b"LXcmd1\n";
 
 fn system_handler(bytes: &[u8]) -> Option<&'static str> {
     let name = bytes.strip_prefix(LAUNCHER_PREFIX)?;
+    match name {
+        b"agent-io" => return Some("agent-io"),
+        b"agent-command" => return Some("agent-command"),
+        _ => (),
+    }
     COMMANDS.iter().copied().find(|cmd| cmd.as_bytes() == name)
 }
 
@@ -62,6 +67,7 @@ pub(crate) struct Volume {
     pub(crate) disk: crate::disk::Disk,
     pub(crate) files: crate::disk::Files,
     pub(crate) versions: Versions,
+    agent_trace_writes: u64,
 }
 
 pub(crate) enum Entry<'a> {
@@ -81,6 +87,18 @@ impl Entry<'_> {
 }
 
 impl Volume {
+    // Trace persistence changes the disk generation but cannot change staged
+    // source files, verification evidence or a repeated command's inputs.
+    pub(crate) fn agent_revision(&self) -> u64 {
+        self.disk.revision().wrapping_sub(self.agent_trace_writes)
+    }
+
+    pub(crate) fn commit_agent_trace(&mut self, path: String, bytes: Vec<u8>) -> Result<()> {
+        self.commit(path, Some(Some(bytes)), None)?;
+        self.agent_trace_writes = self.agent_trace_writes.wrapping_add(1);
+        Ok(())
+    }
+
     fn proc_mounted(&self) -> bool {
         !self.files.contains_key(crate::procfs::ROOT)
     }
@@ -90,6 +108,7 @@ impl Volume {
     }
 
     pub(crate) fn require_writable(&self, path: &str) -> Result<()> {
+        if !agent_write_allowed(path) { return Err("write outside the agent project"); }
         if self.is_virtual_proc(path) { Err("read-only filesystem") } else { Ok(()) }
     }
 
@@ -145,6 +164,7 @@ impl Volume {
         let mut parents = alloc::collections::BTreeSet::new();
         let mut scratch_only = true;
         for (path, existed) in changes {
+            self.disk.invalidate_body(path);
             scratch_only &= self.disk.scratch_path(path) && !self.versions.contains_key(path);
             let present = self.files.contains_key(path);
             let previous = self.disk.times.get(path).copied();
@@ -256,6 +276,16 @@ struct Services {
     started: u64,
     cwd: String,
 }
+
+type AgentBridge = Rc<RefCell<Option<crate::agent::Bridge>>>;
+struct BridgeCell(core::cell::UnsafeCell<Option<AgentBridge>>);
+// Accessed on one CPU without yielding while cloning the slot.
+unsafe impl Sync for BridgeCell {}
+static MODEL_BRIDGE: BridgeCell = BridgeCell(core::cell::UnsafeCell::new(None));
+
+fn model_bridge() -> AgentBridge {
+    unsafe { (&mut *MODEL_BRIDGE.0.get()).get_or_insert_with(|| Rc::new(RefCell::new(None))).clone() }
+}
 fn pack_args(args: &[String]) -> String {
     let mut packed = String::new();
     for arg in args {
@@ -276,6 +306,20 @@ impl Services {
 
     fn file(&self, name: &str) -> Result<String> {
         String::from_utf8(self.bytes(name)?).map_err(|_| "binary file")
+    }
+
+    fn compile_lxe(&mut self, src: &str, dst: &str, streams: crate::utility::Streams) -> Result<()> {
+        let dest = self.path(dst)?;
+        if self.volume.borrow().files.get(&dest) == Some(&None) {
+            return Err("is a directory");
+        }
+        if dest == self.path(src)? {
+            return Err("output is the source file");
+        }
+        let source = self.file(src)?;
+        let io = crate::utility::Context::new(&self.cwd, self.volume.clone(), streams);
+        let (_, image) = io.enter(|| crate::user::compile(src, &source));
+        self.store_bytes(dest, Some(image?))
     }
 
     fn with_agent<T>(
@@ -413,7 +457,7 @@ impl Services {
             {
                 let mut volume = self.volume.borrow_mut();
                 if volume.disk.scratch_dirty {
-                    let Volume { disk, files, versions } = &mut *volume;
+                    let Volume { disk, files, versions, .. } = &mut *volume;
                     disk.save(files, versions)?;
                 }
             }
@@ -502,6 +546,14 @@ impl Services {
                         return crate::agent_tools::chat(
                             &root, self.volume.clone(), self.agent_bridge.clone(), self.started,
                         );
+                    }
+                    "trace" => {
+                        let root = match &tokens[2..] {
+                            [] => self.cwd.clone(),
+                            [path] => self.path(path)?,
+                            _ => return Err("usage: agent trace [PROJECT]"),
+                        };
+                        return crate::agent_tools::list_traces(&root, &self.volume.borrow());
                     }
                     "run" => {
                         let [_, _, project, task] = &tokens[..] else {
@@ -655,19 +707,7 @@ impl Services {
                     return Ok(());
                 }
                 [_, src, flag, dst] if flag == "-o" => {
-                    let dest = self.path(dst)?;
-                    if self.volume.borrow().files.get(&dest) == Some(&None) {
-                        return Err("is a directory");
-                    }
-                    if dest == self.path(src)? {
-                        return Err("output is the source file");
-                    }
-                    let source = self.file(src)?;
-                    let streams = crate::utility::Streams::new(None, false);
-                    let io = crate::utility::Context::new(&self.cwd, self.volume.clone(), streams);
-                    let (_, image) = io.enter(|| crate::user::compile(src, &source));
-                    let image = image?;
-                    return self.store_bytes(dest, Some(image));
+                    return self.compile_lxe(src, dst, crate::utility::Streams::default());
                 }
                 _ => return Err("usage: tcc -run source.c | tcc source.c -o output"),
             }
@@ -698,24 +738,42 @@ fn install_sources(volume: &mut Volume) -> Result<()> {
                     return Err("source path conflicts with an existing entry");
                 }
                 let upgrade = existing.as_deref().is_some_and(|bytes| match path {
+                    "/lib/git.elf" => (bytes.len(), disk::checksum(bytes)) == (672928, 0x26d8dade),
+                    "/src/git/platform.c" => (bytes.len(), disk::checksum(bytes)) == (10427, 0x80d9f358),
+                    "/src/kernel/files.c" => matches!((bytes.len(), disk::checksum(bytes)), (6340, 0xb39ddf09) | (7226, 0xb74cbafd)),
                     "/src/kernel/el1.S" => matches!((bytes.len(), disk::checksum(bytes)),
-                        (6781, 0x1550_5ac6) | (6935, 0xfea1_f971)),
-                    "/src/kernel/input.c" => (bytes.len(), disk::checksum(bytes)) == (5834, 0x48dc_d6bf),
+                        (7195, 0xde9cf0cf) | (6781, 0x1550_5ac6) | (6935, 0xfea1_f971)),
+                    "/src/kernel/agent-service.h" => (bytes.len(), disk::checksum(bytes)) == (5350, 0x73816c07),
+                    "/src/kernel/mux.c" => (bytes.len(), disk::checksum(bytes)) == (3202, 0xb9614109),
+                    "/src/kernel/stream.c" => (bytes.len(), disk::checksum(bytes)) == (1788, 0xb54adfb7),
+                    "/src/gui/text-clipboard.h" => matches!((bytes.len(), disk::checksum(bytes)), (554, 0x4390c1c2) | (574, 0xc60846e9)),
+                    "/src/gui/lixin-gui.h" => matches!((bytes.len(), disk::checksum(bytes)), (5983, 0x48ffa263) | (6955, 0x7ea945b1)),
+                    "/src/gui/han-font.c" => matches!((bytes.len(), disk::checksum(bytes)), (3460, 0xed2a1b7c)),
+                    "/src/gui/file-dialog.h" => matches!((bytes.len(), disk::checksum(bytes)), (8026, 0x7619e968) | (8128, 0x740cf8d3) | (8141, 0x932637e3)),
+                    "/src/gui/file-path.h" => matches!((bytes.len(), disk::checksum(bytes)), (881, 0x9c550f55)),
+                    "/src/desktop/window-widgets.h" => matches!((bytes.len(), disk::checksum(bytes)), (4056, 0xd801c4d5)),
+                    "/src/desktop/widgets-demo.c" => matches!((bytes.len(), disk::checksum(bytes)), (1453, 0x3a71bd6e)),
+                    "/src/gui/widgets.h" => matches!((bytes.len(), disk::checksum(bytes)), (4050, 0xf3f3a912)),
+                    "/src/gui/text-editor.c" => matches!((bytes.len(), disk::checksum(bytes)), (12771, 0xac06779f) | (7684, 0xe1836cd7) | (9342, 0xa0428e2a)),
+                    "/src/desktop/settings.c" => matches!((bytes.len(), disk::checksum(bytes)), (14296, 0xa905ee68) | (24677, 0xfaf7a280) | (25675, 0x2ec6825d) | (25749, 0xd2ec18f2)),
+                    "/src/desktop/window-app.h" => matches!((bytes.len(), disk::checksum(bytes)), (3648, 0x8f30269f) | (3705, 0x9989efc7) | (4348, 0x8876d233)),
+                    "/src/gui/mouse-cursor.h" => matches!((bytes.len(), disk::checksum(bytes)), (1327, 0x5072f402)),
+                    "/src/kernel/input.c" => matches!((bytes.len(), disk::checksum(bytes)), (5834, 0x48dcd6bf) | (6623, 0x0ee8cd99) | (6914, 0xe9073641)),
                     "/src/kernel/loader-sources" => (bytes.len(), disk::checksum(bytes)) == (80, 0x7534928c),
                     "/src/kernel/sources" => (bytes.len(), disk::checksum(bytes)) == (1080, 0x2cdd_da4a),
                     "/src/kernel/process.c" => matches!((bytes.len(), disk::checksum(bytes)),
-                        (13400, 0x0898_6dcc) | (45380, 0x5748_cd25) | (45801, 0x0a75_b6e9) | (52797, 0x254e_c10a) | (58020, 0x29ef_4f7f) | (58028, 0x44859e47)),
+                        (66757, 0x0f788aa2) | (63989, 0x6d114b70) | (64480, 0x3ff4e081) | (64518, 0x34819eec) | (65851, 0x67f4783b) | (66460, 0x267f4e60) | (67371, 0x3aa2b0e0) | (13400, 0x0898_6dcc) | (45380, 0x5748_cd25) | (45801, 0x0a75_b6e9) | (52797, 0x254e_c10a) | (58020, 0x29ef_4f7f) | (58028, 0x44859e47) | (70123, 0x07cd_b98b)),
                     "/src/kernel/net.c" => (bytes.len(), disk::checksum(bytes)) == (8078, 0xfdb2_d249),
-                    "/src/kernel/task.c" => matches!((bytes.len(), disk::checksum(bytes)), (5587, 0xb041_d7c8) | (5698, 0x6ff2_a8b3)),
+                    "/src/kernel/task.c" => matches!((bytes.len(), disk::checksum(bytes)), (5822, 0x31fc4674) | (5587, 0xb041_d7c8) | (5698, 0x6ff2_a8b3) | (8251, 0x183c59e7)),
                     "/src/kernel/disk.c" => matches!((bytes.len(), disk::checksum(bytes)),
                         (8700, 0xa8ba_c0e5) | (20901, 0xf5e0_c618) | (20999, 0x7f64_447e)),
                     "/src/kernel/native.h" => matches!((bytes.len(), disk::checksum(bytes)),
-                        (999, 0x055d_fc37) | (4091, 0xf3f4_5034) | (4367, 0x5e65_fa6c)),
+                        (5232, 0x65cbabc4) | (999, 0x055d_fc37) | (4091, 0xf3f4_5034) | (4367, 0x5e65_fa6c)),
                     "/src/kernel/display.c" => matches!((bytes.len(), disk::checksum(bytes)),
-                        (4726, 0x739a_83ce) | (25975, 0xc6a3_fe7b) | (27711, 0x4571_61b1)),
+                        (35720, 0x1ed640d3) | (4726, 0x739a_83ce) | (25975, 0xc6a3_fe7b) | (27711, 0x4571_61b1) | (35309, 0xb11c_5e77)),
                     "/src/kernel/proc.c" => matches!((bytes.len(), disk::checksum(bytes)), (3080, 0x5026_f57d) | (3094, 0x934c_4a47) | (3085, 0xcd825883)),
                     "/src/kernel/kernel.c" => matches!((bytes.len(), disk::checksum(bytes)),
-                        (1090, 0x4f0a_818c) | (2768, 0x69ee_92b2) | (2768, 0x7556_94ab)),
+                        (2937, 0xe0c9f33e) | (1090, 0x4f0a_818c) | (2768, 0x69ee_92b2) | (2768, 0x7556_94ab)),
                     "/src/console.h" => matches!((bytes.len(), disk::checksum(bytes)), (569, 0x5646a81d)),
                     "/src/build/rebuild.c" => matches!((bytes.len(), disk::checksum(bytes)), (2668, 0xc7f2_1369) | (2761, 0x22fe_f9c0) | (2951, 0x9183_7f72) | (3094, 0x49c8_a199)),
                     "/src/core/text.h" => matches!((bytes.len(), disk::checksum(bytes)),
@@ -726,27 +784,44 @@ fn install_sources(volume: &mut Volume) -> Result<()> {
                     "/src/tinycc/port.c" => matches!((bytes.len(), disk::checksum(bytes)), (8781, 0x182ee5f9) | (9991, 0xad0fa92c)),
                     "/src/tcc/port.c" => matches!((bytes.len(), disk::checksum(bytes)), (8781, 0x182ee5f9) | (9991, 0xad0fa92c)),
                     "/src/tinycc/slots.def" => matches!((bytes.len(), disk::checksum(bytes)), (2584, 0xc7c619ee)),
-                    "/src/bash/bash.c" => matches!((bytes.len(), disk::checksum(bytes)),(21087, 0x5a27_2604)|(21217,0xd799627c)|(23905,0xf0d95640)|(24657,0x960d3663)|(28403,0x43e717dd)|(28478,0x1f9c15f8)|(28486,0x775d056a)),
+                    "/src/bash/bash.c" => matches!((bytes.len(), disk::checksum(bytes)),(28822, 0x931e3765) | (32111, 0x6ce062f4) | (21087, 0x5a27_2604)|(21217,0xd799627c)|(23905,0xf0d95640)|(24657,0x960d3663)|(28403,0x43e717dd)|(28478,0x1f9c15f8)|(28486,0x775d056a)),
                     "/src/ls/ls.c" => old_stock_ls_source(bytes),
                     "/src/core/discovery.h" => (bytes.len(), disk::checksum(bytes)) == (5547, 0x2cff_7a65),
                     "/src/links/config.h" => (bytes.len(), disk::checksum(bytes)) == (1058, 0xeca2a4c8),
                     "/src/links/load.h" => (bytes.len(), disk::checksum(bytes)) == (293, 0xec3d052c),
                     "/src/links/platform.c" => (bytes.len(), disk::checksum(bytes)) == (1612, 0xce9afe83),
                     "/src/links/prepare.py" => (bytes.len(), disk::checksum(bytes)) == (2504, 0x1c44bb5a),
-                    "/src/links/window.c" => (bytes.len(), disk::checksum(bytes)) == (2372, 0x3f7daa1f),
-                    "/src/links/Makefile" => matches!((bytes.len(), disk::checksum(bytes)), (1208, 0xc0a53c5c) | (1658,0x37e74e62)),
+                    "/src/links/window.c" => matches!((bytes.len(), disk::checksum(bytes)), (2372, 0x3f7daa1f) | (3315, 0x9b41_4dd9)),
+                    "/src/links/window.h" => (bytes.len(), disk::checksum(bytes)) == (510, 0x8da8_5f29),
+                    "/src/desktop/Makefile" => matches!((bytes.len(), disk::checksum(bytes)), (670, 0x1854_d8c8) | (644, 0x3ce7_0dd2)),
+                    "/src/gui/calculator.c" => (bytes.len(), disk::checksum(bytes)) == (4723, 0xebc3_db1a),
+                    "/src/links/Makefile" => matches!((bytes.len(), disk::checksum(bytes)), (1208, 0xc0a53c5c) | (1658, 0x37e74e62) | (2157, 0x37179398) | (2422, 0x5721d2f4) | (2481, 0xd410c763) | (2557, 0x58f91ab4) | (2572, 0x9ad654f5) | (2589, 0xe1f55ea7) | (2608, 0xa1785272) | (2655, 0xc0a6fa52)),
                     "/src/links/load.c" => matches!((bytes.len(), disk::checksum(bytes)), (6339, 0x199e4863) | (7009,0x36785356)),
-                    "/src/links/port.c" => matches!((bytes.len(), disk::checksum(bytes)), (8914, 0x97f620b0) | (12503,0x0abe84af)),
+                    "/src/links/port.c" => matches!((bytes.len(), disk::checksum(bytes)), (8914, 0x97f620b0) | (12503,0x0abe84af) | (17771, 0xe2c7_3fd0)),
                     "/src/links/COPYING" => matches!((bytes.len(), disk::checksum(bytes)), (18719, 0x0f0b0cd4) | (19830,0x8eaa86ec)),
-                    "/src/ssh/port.c" => (bytes.len(), disk::checksum(bytes)) == (1810, 0xc6d26543),
-                    "/src/ssh/src/lib.rs" => (bytes.len(), disk::checksum(bytes)) == (11370, 0x81c5b726),
-                    "/src/desktop/desktop.c" => matches!((bytes.len(), disk::checksum(bytes)), (9781,0x5daec732) | (13586,0xb482580b) | (15502,0xa0d13781)),
+                    "/src/ssh/Makefile" => matches!((bytes.len(), disk::checksum(bytes)), (1131, 0xf2ed6e21) | (1234, 0xe7c4f654)),
+                    "/src/ssh/src/sftp.rs" => (bytes.len(), disk::checksum(bytes)) == (18734, 0x87ba63dd),
+                    "/src/ssh/port.c" => matches!((bytes.len(), disk::checksum(bytes)), (1810, 0xc6d26543) | (2380, 0xba9d8ff5)),
+                    "/src/ssh/src/lib.rs" => matches!((bytes.len(), disk::checksum(bytes)), (11370, 0x81c5b726) | (15613, 0x276b3d15)),
+                    "/src/desktop/desktop.c" => matches!((bytes.len(), disk::checksum(bytes)), (13586, 0xb482580b) | (15502, 0xa0d13781) | (17767, 0x7fc65414) | (27008, 0x710e8655) | (31136, 0x0c2a4e1d) | (38720, 0x5490a6f8) | (41064, 0x15d7bcb7) | (42006, 0xff99e8d9) | (42192, 0x64ea1e04) | (58688, 0x027546d7) | (64603, 0xf68b6587) | (65590, 0x596da4aa) | (65793, 0x08f47430) | (66112, 0x7e896c25) | (66202, 0x7df78228) | (69118, 0xb2cf597a) | (69129, 0x27c89e82) | (70754, 0x821c6822) | (71535, 0x8b43d1c3) | (71535, 0xac529004) | (9781, 0x5daec732)),
+                    "/src/desktop/window-client.h" => matches!((bytes.len(), disk::checksum(bytes)), (442, 0x1881d856) | (527, 0xe99b_c843) | (896, 0xb7febea3) | (1299, 0x63c0ceb3) | (1358, 0x88bcb7d0)),
+                    "/src/desktop/window-client-host.h" => matches!((bytes.len(), disk::checksum(bytes)), (7009, 0xc90249d1) | (2979, 0x8082_8916) | (3666, 0xb572_7954) | (7416, 0x92fe5a8b) | (8411, 0x2a0c9169) | (10292, 0xfdea4f71)),
+                    "/src/desktop/README.md" => matches!((bytes.len(), disk::checksum(bytes)), (10213, 0x2943ae71) | (10635, 0xd3ab206d) | (11599, 0xd16763b0) | (11873, 0x4faf09cd) | (12196, 0x97b20e61) | (13031, 0x0647302c) | (1615, 0x0c62067e) | (3469, 0x1c0f3687) | (6363, 0xda6d6a91) | (7025, 0xdeb37807) | (962, 0x923c2f17) | (13458, 0xddd2_c35b)),
                     "/src/desktop/font.swift" => (bytes.len(), disk::checksum(bytes)) == (1126,0xda7679a1),
                     "/src/foreground/nano.rs" => matches!((bytes.len(), disk::checksum(bytes)),
                         (8519, 0xc23c_73b8) | (15861, 0xea0a_62d3)),
                     "/src/agent/run.c" => old_stock_agent_source(bytes),
+                    "/src/agent/native.py" => matches!((bytes.len(), disk::checksum(bytes)),
+                        (43529, 0x8602_3976) | (44798, 0x74a6_3448) | (51749, 0x4b7e_44aa) | (52593, 0xe29d_185d)
+                        | (55005, 0xe4a1_d5c6) | (56717, 0xf1b5_d303) | (57305, 0x30c4_b446) | (57774, 0xd085_d9bb)
+                        | (58718, 0xeedd_835f)),
+                    "/src/agent/desktop.py" => matches!((bytes.len(), disk::checksum(bytes)),
+                        (16576, 0x4c1d_cde8) | (23595, 0x60ca4ec3) | (24673, 0xc951_f5ac) | (28949, 0xf838_f220) | (29500, 0xa0f7_db02)),
+                    "/src/agent/desktop.md" => matches!((bytes.len(), disk::checksum(bytes)),
+                        (2159, 0x9483_879f) | (2615, 0x7efc_5c65) | (2913, 0x7343_1a7f) | (3095, 0xfcdb_075f)),
                     "/src/agent/README.md" => matches!((bytes.len(), disk::checksum(bytes)),
-                        (1095, 0x0ddc_f2cf) | (1620, 0x2823_d007) | (1972, 0xc2ed_6bdd) | (2114, 0x1dcb_e514)),
+                        (1095, 0x0ddc_f2cf) | (1620, 0x2823_d007) | (1972, 0xc2ed_6bdd) | (2114, 0x1dcb_e514)
+                        | (2180, 0xe59b_f15f) | (3087, 0x09b0_6b09)),
                     "/src/agent/chat.md" => matches!((bytes.len(), disk::checksum(bytes)),
                         (1897, 0xaa32_1408) | (2681, 0x3bd1_dea5) | (3164, 0x868a_4295)
                         | (3268, 0x8140_54a4) | (3382, 0x97a7_59b4) | (4013, 0xc84e_5efc)
@@ -773,7 +848,7 @@ fn install_sources(volume: &mut Volume) -> Result<()> {
                     "/src/sh/abi.rs" => (bytes.len(), disk::checksum(bytes)) == (530, 0x1613_cdd9) || (bytes.len(),disk::checksum(bytes))==(601,0x623df15f),
                     _ => false,
                 });
-                if upgrade {
+                if upgrade && existing.as_deref() != contents {
                     let old = volume.files.insert(path.into(), contents.map(<[u8]>::to_vec));
                     changed.push((path, old));
                 }
@@ -830,6 +905,7 @@ pub fn run() -> ! {
         disk,
         files,
         versions,
+        agent_trace_writes: 0,
     };
     match volume.files.get("/bin") {
         None => {
@@ -842,7 +918,7 @@ pub fn run() -> ! {
     }
     if volume.files.get("/bin") == Some(&None) {
         let old_bash = volume.files.get("/bin/bash").and_then(Option::as_deref)
-            .is_some_and(|b| matches!((b.len(), disk::checksum(b)), (23720, 0xb2ca_0c34) | (23776, 0x77f085b2) | (26928, 0x8968_5afc) | (27976, 0x7c17_a489) | (31528, 0xd918_f074) | (31600, 0x89a2_a041) | (31608, 0x9d07_19bc)));
+            .is_some_and(|b| matches!((b.len(), disk::checksum(b)), (23720, 0xb2ca_0c34) | (23776, 0x77f085b2) | (26928, 0x8968_5afc) | (27976, 0x7c17_a489) | (31528, 0xd918_f074) | (31600, 0x89a2_a041) | (31608, 0x9d07_19bc) | (31800, 0xc1129718) | (35696, 0x5d5f6f59)));
         if !volume.files.contains_key("/bin/bash") || old_bash {
             // Bootstrap the C shell with the same guest compiler users invoke.
             let built = crate::user::compile("/src/bash/bash.c", include_str!("../../User/bash/bash.c"))
@@ -914,14 +990,16 @@ pub fn run() -> ! {
             });
             if old.is_none()
                 || (native.is_some() && old.and_then(Option::as_deref) == Some(legacy.as_slice()))
+                || (*name == "sftp" && old.and_then(Option::as_deref).is_some_and(|b|
+                    (b.len(), disk::checksum(b)) == (167368, 0x35558d40)))
                 || (*name == "ssh" && old.and_then(Option::as_deref).is_some_and(|b|
-                    matches!((b.len(), disk::checksum(b)), (134744, 0xe7907f77) | (142400, 0x8dfb7311))))
+                    matches!((b.len(), disk::checksum(b)), (134744, 0xe7907f77) | (142400, 0x8dfb7311) | (167368, 0xd5198a99))))
                 || (*name == "links" && old.and_then(Option::as_deref).is_some_and(|b|
-                    matches!((b.len(), disk::checksum(b)), (316056, 0x03004fc3) | (532008, 0x2514945e) | (801016, 0xe7615558))))
+                    matches!((b.len(), disk::checksum(b)), (316056, 0x03004fc3) | (532008, 0x2514945e) | (801016, 0xe7615558) | (841528, 0xf20e_d920))))
                 || (*name == "stat" && old.and_then(Option::as_deref).is_some_and(|b|
                     (b.len(), disk::checksum(b)) == (20328, 0x61e3_c36a)))
                 || old_core || old_ls || old_lust || (*name == "desktop" && old.and_then(Option::as_deref).is_some_and(|b|
-                    matches!((b.len(), disk::checksum(b)), (55296, 0x9c478e70) | (59752, 0xb2dd3ede) | (60360, 0x5fc9_765f) | (60400, 0x50bc28a4) | (61176, 0x1ddd_ee18))))
+                    matches!((b.len(), disk::checksum(b)), (55296, 0x9c478e70) | (59752, 0xb2dd3ede) | (60360, 0x5fc9_765f) | (60400, 0x50bc28a4) | (61176, 0x1ddd_ee18) | (61120, 0xcf10_d7c0) | (852104, 0x7791_59a7) | (854120, 0xd486_8cbd) | (857160, 0x35b9_cd0f) | (859240, 0xa424_015a) | (868568, 0x4b92cc1c) | (871976, 0x2f2d7c77) | (873464, 0x1eb38c5b) | (874184, 0x96316ca2) | (875336, 0x1b61ca3e) | (875400, 0x5932489f) | (880008, 0x6cb7_29ce) | (880456, 0x01ce6f9b) | (880456, 0x1944a089))))
             {
                 let launcher = if *name == "links2" { LINKS_ALIAS.to_vec() } else { native.map_or(legacy, <[u8]>::to_vec) };
                 if let Err(error) = volume.commit(path, Some(Some(launcher)), None) {
@@ -939,11 +1017,22 @@ pub fn run() -> ! {
     }
     let services = Services {
         volume: Rc::new(RefCell::new(volume)),
-        agent_bridge: Rc::new(RefCell::new(None)),
+        agent_bridge: model_bridge(),
         started,
         cwd: "/".into(),
     };
     crate::scheduler::init();
+    let install_editor = services.volume.borrow().files.get("/bin/text-editor").is_none_or(|entry|
+        entry.as_deref().is_some_and(|bytes| matches!((bytes.len(), disk::checksum(bytes)), (276392, 0x1eb439d2) | (276496, 0x085f21f5) | (278400, 0xdb0261bf))));
+    if install_editor {
+        let io = crate::utility::Context::new("/", services.volume.clone(), crate::utility::Streams::default());
+        let (_, built) = io.enter(|| crate::user::compile("/src/gui/text-editor.c",
+            include_str!("../../User/gui/text-editor.c")));
+        if let Err(error) = built.and_then(|image| services.volume.borrow_mut()
+            .commit("/bin/text-editor".into(), Some(Some(image)), None)) {
+            print(&format!("Could not install graphical text editor: {error}\n"));
+        }
+    }
     #[cfg(feature = "split")]
     {
         let other = services.clone();

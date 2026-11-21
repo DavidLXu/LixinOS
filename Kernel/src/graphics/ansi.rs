@@ -1,5 +1,5 @@
 //! Terminal controls used by local editors and remote xterm applications.
-use super::{BG, CH, CW, FG, Terminal, W};
+use super::{BG, CH, CW, FG, Terminal};
 
 #[derive(Clone, Copy)]
 pub(super) enum Parser {
@@ -23,7 +23,7 @@ impl Terminal {
             self.background
         };
         for py in row * CH..(row + 1) * CH {
-            fb[py * W + start * CW..py * W + end * CW].fill(background);
+            fb[py * self.stride + start * CW..py * self.stride + end * CW].fill(background);
         }
         self.cells[row * self.cols + start..row * self.cols + end].fill(b' ');
         self.styles[row*self.cols+start..row*self.cols+end].fill((self.color,background));
@@ -62,8 +62,8 @@ impl Terminal {
             let src = first + row + if down { 0 } else { count };
             let dst = first + row + if down { count } else { 0 };
             for y in 0..CH {
-                let start = (src * CH + y) * W;
-                fb.copy_within(start..start + self.cols * CW, (dst * CH + y) * W);
+                let start = (src * CH + y) * self.stride;
+                fb.copy_within(start..start + self.cols * CW, (dst * CH + y) * self.stride);
             }
             self.cells
                 .copy_within(src * self.cols..(src + 1) * self.cols, dst * self.cols);
@@ -93,8 +93,8 @@ impl Terminal {
         let dst = self.x + if right { count } else { 0 };
         let remaining = self.cols - self.x - count;
         for y in self.y * CH..(self.y + 1) * CH {
-            let start = y * W + src * CW;
-            fb.copy_within(start..start + remaining * CW, y * W + dst * CW);
+            let start = y * self.stride + src * CW;
+            fb.copy_within(start..start + remaining * CW, y * self.stride + dst * CW);
         }
         let line = self.y * self.cols;
         self.cells

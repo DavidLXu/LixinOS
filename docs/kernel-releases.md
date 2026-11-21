@@ -22,6 +22,25 @@ Rust 的串口、SSH、终端、窗口和分屏二进制分别归档。TCC 的 E
 python3 scripts/kernel-release.py publish --tcc-source-disk data/tcc-os/system.img
 ```
 
+从项目主目录运行 `./scripts/run-kernel.sh` 时，选择器显示最新的本地成对发布标签。
+Rust 和 TCC 都会用该标签的 ELF 启动。启动器校验并按需缓存二进制。已初始化的「我的工作盘」优先；尚未初始化时才寻找
+`data/shared.img` 和项目自带的磁盘。TCC 的发布模式直接加载发布的 ELF，盘内
+`/boot/kernel.elf` 仍供自举模式使用。
+
+尚未设置工作盘时，如果 macOS 把共享盘移到了 iCloud，图形选择器会列出可用的本地桌面盘名称。
+点击「启动本地桌面盘」后，本次使用该盘自己的文件和历史。要继续使用共享盘，
+请在 Finder 中对 `data/shared.img` 选择「立即下载」，等下载完成后重新启动。
+显式指定 `LIXINOS_DISK` 的命令始终使用指定的路径。
+
+```sh
+./scripts/run-kernel.sh --kernel tcc --source
+LIXINOS_DISK=/path/to/copy.img ./scripts/run-kernel.sh --kernel rust --release latest --serial
+```
+
+`--source` 使用源码构建的 Rust 内核，或用引导程序加载盘内的 TCC 内核。
+指定其他镜像时，可以加 `--release latest` 或 `--release TAG` 选择发布内核。
+恢复目录默认使用该目录归档的一对内核。
+
 回滚到一个新的目录，把示例标签替换为要运行的版本。
 
 ```sh

@@ -123,10 +123,25 @@ long lx_sigmask(int how, const uint64_t *set, uint64_t *old) {
         *old = previous;
     return 0;
 }
-long lx_futex(int *word, int op, int val, const struct timespec *ts) {
+long lx_futex(int *word, int op, int val, const struct timespec *ts, int *target, int expected) {
     int cmd = op & 127;
     if (cmd == 1)
         return wake(word, val);
+    if (cmd == 3 || cmd == 4) { // FUTEX_REQUEUE and FUTEX_CMP_REQUEUE
+        int count = (int)(uintptr_t)ts;
+        if (val < 0 || count < 0 || !target || word == target) return -EINVAL;
+        if (cmd == 4 && *word != expected) return -EAGAIN;
+        int woken = wake(word, val);
+        int moved = 0;
+        // musl hands condition-variable waiters to the associated mutex.
+        for (unsigned i = 0; i < 64 && moved < count; ++i) {
+            if (threads[i].id && threads[i].wait_word == word) {
+                threads[i].wait_word = target;
+                ++moved;
+            }
+        }
+        return woken + moved;
+    }
     if (cmd != 0 && cmd != 9)
         return -ENOSYS;
     if (*word != val)

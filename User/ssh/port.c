@@ -6,7 +6,7 @@
 #define MAIL ((void *)0x443d7000)
 #define DATA ((void *)0x443d8000)
 extern char __data_image[], __data_begin[], __data_end[];
-extern int ssh_main(const unsigned char *args, size_t len);
+extern int ssh_main(const unsigned char *args, size_t len, int transfer);
 
 // The protocol runner needs more stack than the region above the argument mailbox.
 // The kernel zeroes the complete writable region on every utility launch.
@@ -19,7 +19,7 @@ void ssh_start(const char *cwd, const unsigned char *args, size_t len) {
         lx_error("ssh requires an interactive terminal\n");
         finish(1);
     }
-    finish(ssh_main(args, len));
+    finish(ssh_main(args, len, TRANSFER));
 }
 int ssh_key(unsigned ms) { return console_call(14, ms); }
 void ssh_output(const unsigned char *data, size_t len) {
@@ -63,4 +63,20 @@ int ssh_create_seed(const unsigned char *key) {
     long result = console_call(31, 32);
     explicit_bzero(DATA, 32);
     return result;
+}
+
+void *_sbrk(ptrdiff_t increment) {
+    static size_t used;
+    if (increment < 0 || (size_t)increment > 128 * 1024 * 1024 - used)
+        return (void *)-1;
+    long base = console_call(37, used + increment);
+    if (base < 0) return (void *)-1;
+    void *p = (void *)(base + used);
+    used += increment;
+    return p;
+}
+
+int ssh_mkdir(const char *path) {
+    strcpy(MAIL, path);
+    return console_call(42, 2);
 }

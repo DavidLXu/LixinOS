@@ -1,0 +1,124 @@
+// SPDX-License-Identifier: GPL-3.0-only
+export component Settings inherits Window {
+    in-out property <bool> accent-enabled: false;
+    callback close-requested();
+    background: #121b29;
+    preferred-width: 620px;
+    preferred-height: 390px;
+
+    Rectangle {
+        x: (root.width - self.width) / 2;
+        y: max(0px, (root.height - self.height) / 2);
+        width: min(480px, max(0px, root.width - 28px));
+        height: 254px;
+        background: #1d2a3b;
+        border-color: #34465c;
+        border-width: 1px;
+        border-radius: 20px;
+        clip: true;
+
+        Text {
+            x: 26px;
+            y: 25px;
+            text: "Settings";
+            color: #edf5ff;
+            font-size: 30px;
+            font-weight: 700;
+        }
+
+        Rectangle {
+            x: parent.width - 58px;
+            y: 24px;
+            width: 34px;
+            height: 34px;
+            border-radius: 9px;
+            background: close-area.has-hover ? #4a5264 : #304259;
+            Text {
+                text: "×";
+                color: #edf5ff;
+                font-size: 23px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            close-area := TouchArea { clicked => { root.close-requested(); } }
+        }
+
+        Text {
+            x: 27px;
+            y: 79px;
+            text: "Appearance";
+            color: #a8bcd3;
+            font-size: 14px;
+        }
+
+        Rectangle {
+            x: 24px;
+            y: 111px;
+            width: parent.width - 48px;
+            height: 85px;
+            border-radius: 13px;
+            background: #26364a;
+
+            Text {
+                x: 17px;
+                y: 14px;
+                width: max(0px, parent.width - 85px);
+                overflow: elide;
+                text: "Vivid accent";
+                color: #edf5ff;
+                font-size: 18px;
+            }
+
+            Text {
+                x: 17px;
+                y: 45px;
+                width: max(0px, parent.width - 85px);
+                overflow: elide;
+                text: root.accent-enabled ? "On" : "Off";
+                color: root.accent-enabled ? #72e2c6 : #a8bcd3;
+                font-size: 14px;
+            }
+
+            Rectangle {
+                x: parent.width - 68px;
+                y: 26px;
+                width: 52px;
+                height: 32px;
+                border-radius: 16px;
+                background: root.accent-enabled ? #32bf9b : #576982;
+                animate background { duration: 420ms; easing: ease-in-out; }
+
+                Rectangle {
+                    x: root.accent-enabled ? parent.width - self.width - 4px : 4px;
+                    y: 4px;
+                    width: 24px;
+                    height: 24px;
+                    border-radius: 12px;
+                    background: #f4f8fd;
+                    animate x { duration: 420ms; easing: ease-in-out; }
+                }
+            }
+
+            FocusScope {
+                key-pressed(event) => {
+                    if (event.text == " " || event.text == Key.Return) {
+                        root.accent-enabled = !root.accent-enabled;
+                        return accept;
+                    }
+                    return reject;
+                }
+            }
+            TouchArea { clicked => { root.accent-enabled = !root.accent-enabled; } }
+        }
+
+        Text {
+            x: 26px;
+            y: 217px;
+            text: "Esc to close";
+            color: #a8bcd3;
+            font-size: 13px;
+        }
+    }
+}
+
+export { Editor } from "editor.slint";

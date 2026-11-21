@@ -43,7 +43,7 @@ impl Reader {
                 }
                 return n;
             }
-            if !buf.writer {
+            if !buf.writer || crate::scheduler::stopped() != 0 {
                 return 0;
             }
             drop(buf);
@@ -66,7 +66,7 @@ impl Writer {
         let channel = Rc::as_ptr(&self.0) as usize;
         loop {
             let mut buf = self.0.borrow_mut();
-            if !buf.reader {
+            if !buf.reader || crate::scheduler::stopped() != 0 {
                 return None;
             }
             let n = data.len().min(4096 - buf.bytes.len());

@@ -1,0 +1,13 @@
+--- a/libhubbub/src/treebuilder/in_body.c
++++ b/libhubbub/src/treebuilder/in_body.c
+@@ -325,7 +325,9 @@
+ 	} else if (type == AREA || type == BASEFONT || 
+ 			type == BGSOUND || type == BR || 
+ 			type == EMBED || type == IMG || type == INPUT ||
+-			type == PARAM || type == SPACER || type == WBR) {
++			type == PARAM || type == SPACER || type == WBR ||
++            (token->data.tag.name.len == 6 &&
++             memcmp(token->data.tag.name.ptr, "source", 6) == 0)) {
+ 		err = reconstruct_active_formatting_list(treebuilder);
+ 		if (err != HUBBUB_OK)
+ 			return err;

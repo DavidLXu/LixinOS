@@ -79,9 +79,9 @@ fn previous_release(path: &str, bytes: &[u8]) -> bool {
     let signature = (bytes.len(), disk::checksum(bytes));
     match path {
         "/bin/python3" => matches!(signature,
-            (6056, 0xfc56f810) | (6312, 0x7d2ee280) | (6312, 0x3956f4ff)),
+            (6056, 0xfc56f810) | (6312, 0x7d2ee280) | (6312, 0x3956f4ff) | (6968, 0x547b_29fb)),
         "/bin/pip" | "/bin/pip3" => matches!(signature,
-            (6336, 0x29d949c6) | (6336, 0xcf019ea3)),
+            (6336, 0x29d949c6) | (6336, 0xcf019ea3) | (6992, 0x49af_8c3f)),
         "/lib/python3.14/subprocess.py" => signature == (90732, 0xb73b5f73),
         _ => false,
     }

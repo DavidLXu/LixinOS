@@ -1,5 +1,6 @@
 """Check that host window dimensions reflow the guest's fixed-size terminal cells."""
 import argparse
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from unittest.mock import patch
 
 harness = runpy.run_path(str(Path(__file__).with_name("test-panes.py")))
 
@@ -202,10 +204,8 @@ def exercise(guest, control, directory, split):
     assert guest.vm.wait(timeout=10) == 0
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--split", action="store_true")
-    args = parser.parse_args()
+@contextmanager
+def resize_source():
     with tempfile.TemporaryDirectory() as temporary:
         directory = Path(temporary)
         swift = shutil.which("swift")
@@ -229,9 +229,19 @@ while True:
     time.sleep(0.03)
 """)
         wrapper.chmod(0o700)
-        os.environ["LIXINOS_TEST_SWIFT"] = swift
-        os.environ["LIXINOS_TEST_WINDOW_SIZE"] = str(source)
-        os.environ["PATH"] = f"{directory}:{os.environ['PATH']}"
+        with patch.dict(os.environ, {
+            "LIXINOS_TEST_SWIFT": swift,
+            "LIXINOS_TEST_WINDOW_SIZE": str(source),
+            "PATH": f"{directory}:{os.environ['PATH']}",
+        }):
+            yield source
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--split", action="store_true")
+    args = parser.parse_args()
+    with resize_source():
         harness["test"](lambda guest, control, directory: exercise(guest, control, directory, args.split),
                         mode="--split" if args.split else "--window")
     print("Verified the live clock, resize, Nano layout and save, pinned Agent header, and identical 22×44 glyphs.")

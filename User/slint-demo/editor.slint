@@ -1,0 +1,59 @@
+// SPDX-License-Identifier: GPL-3.0-only
+import { Button, TextEdit, VerticalBox, HorizontalBox } from "std-widgets.slint";
+
+export component Editor inherits Window {
+    in-out property <string> document <=> editor.text;
+    in property <string> filename;
+    in property <string> status;
+    in property <bool> dirty;
+    in property <bool> confirm-close;
+    callback save-requested();
+    callback close-requested();
+    callback discard-requested();
+    callback document-edited();
+
+    preferred-width: 720px;
+    preferred-height: 480px;
+    background: #eef1f4;
+    forward-focus: editor;
+    init => { editor.focus(); }
+
+    VerticalBox {
+        padding: 12px;
+        spacing: 10px;
+
+        HorizontalBox {
+            padding: 0;
+            spacing: 8px;
+            min-height: 34px;
+            Text {
+                text: root.filename + (root.dirty ? " *" : "");
+                overflow: elide;
+                vertical-alignment: center;
+                font-weight: 700;
+                horizontal-stretch: 1;
+                color: #202b35;
+            }
+            if root.confirm-close : Button {
+                text: "Discard";
+                clicked => { root.discard-requested(); }
+            }
+            Button { text: "Save"; clicked => { root.save-requested(); } }
+            Button { text: "×"; clicked => { root.close-requested(); } }
+        }
+
+        editor := TextEdit {
+            vertical-stretch: 1;
+            wrap: word-wrap;
+            font-size: 16px;
+            edited => { root.document-edited(); }
+        }
+
+        Text {
+            text: root.status;
+            color: #485565;
+            font-size: 13px;
+            overflow: elide;
+        }
+    }
+}

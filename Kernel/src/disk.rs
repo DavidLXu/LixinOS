@@ -24,6 +24,7 @@ pub(crate) struct FileTime {
 type Result<T> = core::result::Result<T, &'static str>;
 const LARGE_SLOT: usize = 192 * 1024 * 1024 / 512;
 const BUILD_SLOT: usize = (4usize << 30) / 512;
+const LARGE_BODY: usize = 64 * 1024;
 const IO_CHUNK: usize = 1024 * 1024;
 const SNAPSHOT_BASE: usize = 1; // Sector zero identifies the disk layout.
 // Leave room for directories and system files alongside one million user files.
@@ -77,6 +78,7 @@ pub struct Disk {
     live_bytes: usize,
     revision: u64,
     scratch_records: BTreeMap<String, usize>,
+    bodies: BTreeMap<String, CachedBody>,
     generation: u64,
     snapshot_bytes: usize,
     history_sequence: Option<u64>,
@@ -148,16 +150,69 @@ pub(crate) fn checksum(bytes: &[u8]) -> u32 {
     hash_bytes(2166136261, bytes)
 }
 
+// Only metadata is cached. An offset certifies that this exact, unmodified file
+// body occupies that position in the corresponding physical snapshot slot.
+#[derive(Default)]
+struct CachedBody {
+    offsets: [Option<usize>; 2],
+    hash: Option<(u32, u32)>,
+}
+impl CachedBody {
+    fn hash(&mut self, initial: u32, bytes: &[u8]) -> u32 {
+        if let Some((start, end)) = self.hash {
+            if initial == start { return end; }
+        }
+        let end = hash_bytes(initial, bytes);
+        self.hash = Some((initial, end));
+        end
+    }
+}
+
+// All directories come first in lexical (parent-first) order. Large bodies
+// precede small files so editing a source line keeps the large FNV prefix valid.
+fn snapshot_entries(files: &Files) -> impl Iterator<Item = (&String, &Option<Vec<u8>>)> {
+    // The launcher reads this hint with a bounded scan on million-entry disks.
+    let hint = "/.desktop-boot";
+    files.get_key_value("/").into_iter()
+        .chain(files.get_key_value(hint))
+        .chain(files.iter().filter(move |(k, v)| v.is_none() && k.as_str() != "/" && k.as_str() != hint))
+        .chain(files.iter().filter(move |(k, v)| k.as_str() != hint && v.as_ref().is_some_and(|b| b.len() >= LARGE_BODY)))
+        .chain(files.iter().filter(move |(k, v)| k.as_str() != hint && v.as_ref().is_some_and(|b| b.len() < LARGE_BODY)))
+}
+
 struct SnapshotWriter<'a> {
     device: &'a mut VirtIOBlk<Dma, MmioTransport<'static>>,
     sector: usize,
+    origin: usize,
     chunk: Vec<u8>,
     hash: u32,
 }
 
 impl SnapshotWriter<'_> {
-    fn push(&mut self, mut bytes: &[u8]) -> Result<()> {
+    fn push(&mut self, bytes: &[u8]) -> Result<()> {
         self.hash = hash_bytes(self.hash, bytes);
+        self.append(bytes)
+    }
+
+    fn body(&mut self, bytes: &[u8], cached: &mut CachedBody, slot: usize) -> Result<()> {
+        let offset = (self.sector - self.origin) * 512 + self.chunk.len();
+        self.hash = cached.hash(self.hash, bytes);
+        if cached.offsets[slot] == Some(offset) {
+            // Boundary sectors also contain a neighbouring pathname or timestamp.
+            let prefix = (512 - offset % 512) % 512;
+            self.append(&bytes[..prefix])?;
+            self.flush_chunk()?;
+            let sectors = (bytes.len() - prefix) / 512;
+            self.sector += sectors;
+            self.append(&bytes[prefix + sectors * 512..])?;
+        } else {
+            self.append(bytes)?;
+            cached.offsets[slot] = Some(offset);
+        }
+        Ok(())
+    }
+
+    fn append(&mut self, mut bytes: &[u8]) -> Result<()> {
         while !bytes.is_empty() {
             let count = bytes.len().min(IO_CHUNK - self.chunk.len());
             let (part, remaining) = bytes.split_at(count);
@@ -267,6 +322,7 @@ impl Disk {
         if end > self.file_limit() || self.live_bytes + additional > self.capacity_bytes() {
             return Err("filesystem full");
         }
+        self.invalidate_body(path);
         let record = self.scratch_records.get_mut(path).ok_or("missing scratch file")?;
         file.try_reserve(additional).map_err(|_| "not enough memory")?;
         file.resize(file.len() + additional, 0);
@@ -323,8 +379,8 @@ impl Disk {
         (self.dev.capacity(), self.generation)
     }
 
-    // The mounted tree is ordered exactly like the snapshot. Read the selected
-    // record back from the device without reloading the rest of the volume.
+    // Native kernels, host tooling and Rust can serialize the same tree in
+    // different orders. Walk physical record headers, skipping file bodies.
     pub(crate) fn verify_file(&mut self, files: &Files, path: &str) -> Result<u64> {
         let bytes = files.get(path).and_then(Option::as_deref).ok_or("saved file not found")?;
         let base = SNAPSHOT_BASE + (self.generation as usize % 2) * self.slot_sectors;
@@ -342,9 +398,42 @@ impl Disk {
             _ => return Err("invalid snapshot format"),
         };
         if self.scratch_dirty { return Err("build filesystem has pending writes"); }
-        let offset = 4 + files.iter().take_while(|(name, _)| name.as_str() < path)
-            .map(|(name, entry)| record_header + name.len() + entry.as_ref().map_or(0, Vec::len))
-            .sum::<usize>();
+        let mut page = [0u8; 4096];
+        let mut page_start = usize::MAX;
+        let mut read = |mut at: usize, mut dst: &mut [u8]| -> Result<()> {
+            if at + dst.len() > self.snapshot_bytes { return Err("truncated file record"); }
+            while !dst.is_empty() {
+                let page_at = at / page.len() * page.len();
+                if page_at != page_start {
+                    let n = page.len().min((self.snapshot_bytes-page_at).next_multiple_of(512));
+                    self.dev.read_blocks(base + 1 + page_at/512, &mut page[..n])
+                        .map_err(|_| "snapshot record read failed")?;
+                    page_start = page_at;
+                }
+                let within = at-page_at;
+                let n = dst.len().min(page.len()-within);
+                dst[..n].copy_from_slice(&page[within..within+n]);
+                dst = &mut dst[n..];
+                at += n;
+            }
+            Ok(())
+        };
+        let mut offset = 4;
+        let mut found = false;
+        for _ in 0..files.len() {
+            let mut fields = [0u8; 8];
+            read(offset, &mut fields)?;
+            let name_len = u32::from_le_bytes(fields[..4].try_into().unwrap()) as usize;
+            let size = u32::from_le_bytes(fields[4..].try_into().unwrap());
+            if name_len > 512 { return Err("invalid record pathname"); }
+            if name_len == path.len() && size as usize == bytes.len() {
+                let mut name = [0u8; 512];
+                read(offset + record_header, &mut name[..name_len])?;
+                if &name[..name_len] == path.as_bytes() { found = true; break; }
+            }
+            offset += record_header + name_len + if size == u32::MAX { 0 } else { size as usize };
+        }
+        if !found { return Err("file missing from committed snapshot"); }
         let end = offset + record_header + path.len() + bytes.len();
         if end > self.snapshot_bytes { return Err("file record is outside the committed snapshot"); }
         let start = offset / 512 * 512;
@@ -395,7 +484,7 @@ impl Disk {
             || layout[8..].iter().any(|b| *b != 0) {
             return Err("unsupported disk layout");
         }
-        let mut disk = Self { dev, slot_sectors, scratch_dirty: false, scratch_records: BTreeMap::new(), live_bytes: 0, revision: 0, generation: 0, snapshot_bytes: 0, history_sequence: None, times: Times::new() };
+        let mut disk = Self { dev, slot_sectors, bodies: BTreeMap::new(), scratch_dirty: false, scratch_records: BTreeMap::new(), live_bytes: 0, revision: 0, generation: 0, snapshot_bytes: 0, history_sequence: None, times: Times::new() };
         if let Some((files, versions)) = disk.read_pair()? {
             return Ok((disk, files, versions));
         }
@@ -508,7 +597,21 @@ impl Disk {
         Ok(())
     }
 
+    pub(crate) fn invalidate_body(&mut self, path: &str) {
+        self.bodies.remove(path);
+    }
+
     pub fn save(&mut self, files: &Files, versions: &Versions) -> Result<()> {
+        let result = self.write_snapshot(files, versions);
+        if result.is_err() {
+            // A partially written inactive slot and a rolled-back VFS edit
+            // invalidate both offset and hash information learned during this save.
+            self.bodies.clear();
+        }
+        result
+    }
+
+    fn write_snapshot(&mut self, files: &Files, versions: &Versions) -> Result<()> {
         let version_data = if versions.is_empty() {
             Vec::new()
         } else {
@@ -530,19 +633,15 @@ impl Disk {
         let mut writer = SnapshotWriter {
             device: &mut self.dev,
             sector: base + 1,
+            origin: base + 1,
             chunk: Vec::new(),
             hash: checksum(&[]),
         };
         writer.chunk.try_reserve_exact(len.next_multiple_of(512).min(IO_CHUNK))
             .map_err(|_| "not enough snapshot memory")?;
         writer.push(&(count as u32).to_le_bytes())?;
-        let mut timestamps = self.times.iter().peekable();
-        for (path, contents) in files {
-            let time = if timestamps.peek().is_some_and(|(name, _)| *name == path) {
-                *timestamps.next().unwrap().1
-            } else {
-                FileTime::default()
-            };
+        for (path, contents) in snapshot_entries(files) {
+            let time = self.times.get(path).copied().unwrap_or_default();
             let mut record = [0; 16];
             record[..4].copy_from_slice(&(path.len() as u32).to_le_bytes());
             record[4..8].copy_from_slice(&contents.as_ref().map_or(u32::MAX, |bytes| bytes.len() as u32).to_le_bytes());
@@ -550,7 +649,16 @@ impl Disk {
             record[12..].copy_from_slice(&time.modified.to_le_bytes());
             writer.push(&record)?;
             writer.push(path.as_bytes())?;
-            if let Some(bytes) = contents { writer.push(bytes)?; }
+            if let Some(bytes) = contents {
+                if bytes.len() >= LARGE_BODY {
+                    if !self.bodies.contains_key(path) {
+                        self.bodies.insert(path.clone(), CachedBody::default());
+                    }
+                    writer.body(bytes, self.bodies.get_mut(path).unwrap(), gen_id as usize % 2)?;
+                } else {
+                    writer.push(bytes)?;
+                }
+            }
         }
         writer.push(&version_data)?;
         writer.flush_chunk()?;

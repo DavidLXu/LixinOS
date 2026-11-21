@@ -2,10 +2,13 @@
 import argparse
 import fcntl
 import os
+import re
 from pathlib import Path
+import shlex
 import stat
 import struct
 import subprocess
+import sys
 import tempfile
 
 SECTOR = 512
@@ -22,6 +25,38 @@ HISTORY = SECTOR + 2 * SLOT
 IMAGE_SIZE = HISTORY + HISTORY_BYTES
 OLD_SLOT = 4 << 20
 OLD_HISTORY = 2 * OLD_SLOT - HISTORY_BYTES
+
+
+def cloud_only(info):
+    # Darwin's SF_DATALESS is metadata-only. Sparse local images can also
+    # have few or no allocated blocks and must remain usable.
+    return sys.platform == "darwin" and bool(info.st_flags & getattr(stat, "SF_DATALESS", 0x40000000))
+
+
+def local_desktop(path):
+    if not path.is_file() or not cloud_only(path.stat()):
+        return None
+    candidates = []
+    for image in path.parent.glob("desktop-*.img"):
+        try:
+            info = image.stat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISREG(info.st_mode) and info.st_size and not cloud_only(info):
+            candidates.append((info.st_mtime_ns, image))
+    return max(candidates)[1] if candidates else None
+
+
+def require_local(path, info):
+    if cloud_only(info):
+        message = (f"{path} 的内容尚未下载到本机。请在 Finder 中选择「立即下载」后重试，"
+                   f"或运行 brctl download {shlex.quote(str(path))}。")
+        alternative = local_desktop(path)
+        if alternative:
+            message += (f"\n要启动另一块有独立文件和历史的本地桌面盘，可在项目根目录运行\n"
+                        f"LIXINOS_DISK={shlex.quote(str(alternative))} "
+                        "./scripts/run-kernel.sh --kernel rust --release latest --window")
+        raise OSError(message)
 
 
 def checksum(data):
@@ -107,15 +142,152 @@ def migrate(source, target):
         raise OSError("history migration verification failed")
 
 
+def disk_entries(seed):
+    # Read an APFS clone or an idle image, never write to the source volume.
+    with seed.open("rb") as src:
+        headers = snapshot_headers(src)
+        if not headers:
+            raise ValueError(f"{seed}: no filesystem snapshot")
+        _, base, size, digest, hdr = headers[0]
+        src.seek(base + SECTOR)
+        body = src.read(size)
+    if hdr[:8] != b"LIXINFS3" or checksum(body) != digest:
+        raise ValueError(f"{seed}: expected a checksummed LIXINFS3 snapshot")
+    rows = {}
+    pos = 4
+    for _ in range(struct.unpack_from("<I", body)[0]):
+        n, size = struct.unpack_from("<II", body, pos)
+        time = body[pos+8:pos+16]
+        pos += 16
+        name = body[pos:pos+n].decode()
+        pos += n
+        data = None
+        if size != 0xffffffff:
+            data = memoryview(body)[pos:pos+size]
+            pos += size
+        if pos > len(body) or name in rows:
+            raise ValueError(f"{seed}: invalid filesystem records")
+        rows[name] = time, data
+    return rows, body[pos:]
+
+
+def boot_preferences(image):
+    """Read a bounded launcher hint without loading a multi-GiB guest volume."""
+    default = "window Asia/Shanghai rust 2222 auto"
+    key = b"/.desktop-boot"
+    if not image.is_file() or cloud_only(image.stat()):
+        return default
+    with image.open("rb") as source:
+        headers = snapshot_headers(source)
+        if not headers or headers[0][4][:8] != b"LIXINFS3":
+            return default
+        _, base, size, _, _ = headers[0]
+        source.seek(base + SECTOR)
+        end = source.tell() + size
+        count, = struct.unpack("<I", source.read(4))
+        # Skip file payloads and validate each preference before passing it to the launcher.
+        for _ in range(min(count, 65536)):
+            if source.tell() + 16 > end:
+                break
+            length, data_size, _, _ = struct.unpack("<IIII", source.read(16))
+            n = 0 if data_size == 0xffffffff else data_size
+            if not 0 < length <= 512 or source.tell() + length + n > end:
+                break
+            path = source.read(length)
+            if path == key:
+                if n > 192:
+                    break
+                parts = source.read(n).split()
+                if len(parts) != 5:
+                    break
+                mode, zone, kernel, port, model = parts
+                if (mode not in (b"window", b"split") or kernel not in (b"rust", b"tcc")
+                        or not re.fullmatch(rb"[0-9]{1,5}", port) or int(port) > 65535
+                        or not re.fullmatch(rb"[a-zA-Z0-9._-]{1,63}", model)
+                        or not re.fullmatch(rb"[a-zA-Z0-9_+-]+(?:/[a-zA-Z0-9_+-]+)*", zone)
+                        or len(zone) > 63 or not (Path("/usr/share/zoneinfo") / zone.decode()).is_file()):
+                    break
+                return b" ".join(parts).decode("ascii")
+            source.seek(n, os.SEEK_CUR)
+    return default
+
+
+def edit_files(disk, edit):
+    """Apply a file-table change offline, preserving history and opaque version records."""
+    require_local(disk, disk.stat())
+    with disk.open("r+b") as f:
+        fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        owners = subprocess.run(["lsof","-t","--",str(disk)],capture_output=True)
+        if owners.returncode not in (0,1) or owners.stderr or any(int(p)!=os.getpid() for p in owners.stdout.split()):
+            raise ValueError(f"{disk} may be in use")
+        layout = f.read(SECTOR)
+        slot_size = build_slot(os.fstat(f.fileno()).st_size) if layout == BUILD_HEADER else {HEADER: SLOT}.get(layout)
+        if slot_size is None:
+            raise ValueError("requires a LIXDISK4 or LIXBLD01 volume")
+        headers = snapshot_headers(f)
+        if not headers:
+            raise ValueError(f"{disk}: no filesystem snapshot")
+        gen, base, n, digest, header = headers[0]
+        f.seek(base+SECTOR)
+        data = f.read(n)
+        if header[:8] != b"LIXINFS3" or checksum(data) != digest:
+            raise ValueError("invalid source snapshot")
+        count, = struct.unpack_from("<I",data)
+        offset = 4
+        rows = {}
+        for _ in range(count):
+            length,size = struct.unpack_from("<II", data, offset)
+            times = data[offset+8:offset+16]
+            path = data[offset+16:offset+16+length]
+            offset += 16+length
+            value = None if size == 0xffffffff else data[offset:offset+size]
+            if value is not None:
+                offset += size
+            if offset>n or path in rows:
+                raise ValueError("damaged filesystem records")
+            rows[path] = times,value
+        tail = data[offset:]
+        edit(rows)
+        body = bytearray(struct.pack("<I",len(rows)))
+        for path,(times,value) in sorted(rows.items()):
+            body += struct.pack("<II",len(path),0xffffffff if value is None else len(value))+times+path
+            if value is not None:
+                body += value
+        body += tail
+        if body == data:
+            return gen
+        if len(body)>slot_size-SECTOR:
+            raise ValueError("insufficient snapshot capacity")
+        target = SECTOR + ((gen+1)%2)*slot_size
+        if target == base:
+            raise ValueError("invalid snapshot parity")
+        commit = b"LIXINFS3"+struct.pack("<QII",gen+1,len(body),checksum(body))
+        commit = (commit+struct.pack("<I",checksum(commit))).ljust(SECTOR,b"\0")
+        f.seek(target+SECTOR)
+        f.write(body)
+        f.flush()
+        os.fsync(f.fileno())
+        f.seek(target+SECTOR)
+        if f.read(len(body)) != body:
+            raise IOError("failed to verify snapshot before commit")
+        f.seek(target)
+        f.write(commit)
+        f.flush()
+        os.fsync(f.fileno())
+        return gen + 1
+
+
 def prepare(path, previous_layout=False):
     path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
+        require_local(path, path.stat())
         source = path.open("r+b")
     except FileNotFoundError:
         source = None
     try:
         if source:
+            require_local(path, os.fstat(source.fileno()))
             header = source.read(SECTOR)
             if header == BUILD_HEADER:
                 build_slot(os.fstat(source.fileno()).st_size)
@@ -174,9 +346,20 @@ def prepare(path, previous_layout=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image", type=Path)
-    parser.add_argument("--previous-layout", action="store_true")
+    options = parser.add_mutually_exclusive_group()
+    options.add_argument("--boot-preferences", action="store_true")
+    options.add_argument("--previous-layout", action="store_true")
+    options.add_argument("--local-alternative", action="store_true",
+                         help="print a resident desktop disk if the requested disk is cloud-only")
     args = parser.parse_args()
     try:
-        prepare(args.image, args.previous_layout)
+        if args.boot_preferences:
+            print(boot_preferences(args.image))
+        elif args.local_alternative:
+            print(local_desktop(args.image.resolve()) or "")
+        else:
+            prepare(args.image, args.previous_layout)
+    except KeyboardInterrupt:
+        parser.exit(130, "已中断磁盘准备。\n")
     except (OSError, ValueError) as exc:
         parser.exit(1, f"Cannot prepare LixinOS disk: {exc}\n")

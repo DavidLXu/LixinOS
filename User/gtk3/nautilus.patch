@@ -1,0 +1,657 @@
+--- a/eel/eel-gdk-extensions.c
++++ b/eel/eel-gdk-extensions.c
+@@ -28,7 +28,6 @@
+ #include "eel-string.h"
+ #include <gdk-pixbuf/gdk-pixbuf.h>
+ #include <gdk/gdk.h>
+-#include <gdk/gdkx.h>
+ #include <stdlib.h>
+ #include <pango/pango.h>
+ 
+@@ -39,43 +38,40 @@
+                         guint      *width_return,
+                         guint      *height_return)
+ {
+-    int x11_flags;
+-    EelGdkGeometryFlags gdk_flags;
++    EelGdkGeometryFlags flags = EEL_GDK_NO_VALUE;
++    const char *at = string;
++    char *end;
+ 
+-    g_return_val_if_fail (string != NULL, EEL_GDK_NO_VALUE);
+-    g_return_val_if_fail (x_return != NULL, EEL_GDK_NO_VALUE);
+-    g_return_val_if_fail (y_return != NULL, EEL_GDK_NO_VALUE);
+-    g_return_val_if_fail (width_return != NULL, EEL_GDK_NO_VALUE);
+-    g_return_val_if_fail (height_return != NULL, EEL_GDK_NO_VALUE);
+-
+-    x11_flags = XParseGeometry (string, x_return, y_return,
+-                                width_return, height_return);
+-
+-    gdk_flags = EEL_GDK_NO_VALUE;
+-    if (x11_flags & XValue)
++    if (!at || !x_return || !y_return || !width_return || !height_return)
++        return EEL_GDK_NO_VALUE;
++    if (*at == '=')
++        at++;
++    if (g_ascii_isdigit (*at))
+     {
+-        gdk_flags |= EEL_GDK_X_VALUE;
++        guint64 width = g_ascii_strtoull (at, &end, 10);
++        if ((*end != 'x' && *end != 'X') || !g_ascii_isdigit (end[1]))
++            return EEL_GDK_NO_VALUE;
++        guint64 height = g_ascii_strtoull (end + 1, &end, 10);
++        if (width > G_MAXUINT || height > G_MAXUINT)
++            return EEL_GDK_NO_VALUE;
++        *width_return = width;
++        *height_return = height;
++        flags |= EEL_GDK_WIDTH_VALUE | EEL_GDK_HEIGHT_VALUE;
++        at = end;
+     }
+-    if (x11_flags & YValue)
++    int *positions[] = {x_return, y_return};
++    const EelGdkGeometryFlags position_flags[] = {EEL_GDK_X_VALUE, EEL_GDK_Y_VALUE};
++    const EelGdkGeometryFlags negative_flags[] = {EEL_GDK_X_NEGATIVE, EEL_GDK_Y_NEGATIVE};
++    for (guint i = 0; i < G_N_ELEMENTS (positions) && (*at == '+' || *at == '-'); i++)
+     {
+-        gdk_flags |= EEL_GDK_Y_VALUE;
++        gint64 position = g_ascii_strtoll (at, &end, 10);
++        if (end == at || position > G_MAXINT || position < G_MININT)
++            return EEL_GDK_NO_VALUE;
++        *positions[i] = position;
++        flags |= position_flags[i];
++        if (*at == '-')
++            flags |= negative_flags[i];
++        at = end;
+     }
+-    if (x11_flags & WidthValue)
+-    {
+-        gdk_flags |= EEL_GDK_WIDTH_VALUE;
+-    }
+-    if (x11_flags & HeightValue)
+-    {
+-        gdk_flags |= EEL_GDK_HEIGHT_VALUE;
+-    }
+-    if (x11_flags & XNegative)
+-    {
+-        gdk_flags |= EEL_GDK_X_NEGATIVE;
+-    }
+-    if (x11_flags & YNegative)
+-    {
+-        gdk_flags |= EEL_GDK_Y_NEGATIVE;
+-    }
+-
+-    return gdk_flags;
++    return *at ? EEL_GDK_NO_VALUE : flags;
+ }
+--- a/eel/eel-gtk-extensions.c
++++ b/eel/eel-gtk-extensions.c
+@@ -30,11 +30,8 @@
+ #include "eel-gnome-extensions.h"
+ #include "eel-string.h"
+ 
+-#include <X11/Xlib.h>
+-#include <X11/Xatom.h>
+ #include <gdk/gdk.h>
+ #include <gdk/gdkprivate.h>
+-#include <gdk/gdkx.h>
+ #include <gtk/gtk.h>
+ #include <glib/gi18n-lib.h>
+ #include <math.h>
+--- a/eel/meson.build
++++ b/eel/meson.build
+@@ -30,7 +30,7 @@
+     'eel-lib-self-check-functions.c',
+ ]
+ 
+-libeel_2_deps = [glib, gtk, gail, libm, x11]
++libeel_2_deps = [glib, gtk, gail, libm]
+ 
+ libeel_2 = static_library ('eel-2', libeel_2_sources,
+                            dependencies: libeel_2_deps,
+@@ -40,8 +40,3 @@
+                             include_directories: nautilus_include_dirs,
+                             dependencies: libeel_2_deps)
+ 
+-check_eel = executable ('check-eel',
+-                        'check-program.c',
+-                        dependencies: [eel_2, xml])
+-
+-test ('check-eel', check_eel)
+--- a/libnautilus-extension/meson.build
++++ b/libnautilus-extension/meson.build
+@@ -34,19 +34,11 @@
+ 
+ libnautilus_extension_deps = [glib, gtk]
+ 
+-libnautilus_extension = shared_library ('nautilus-extension',
++libnautilus_extension = static_library ('nautilus-extension',
+                                         libnautilus_extension_sources,
+                                         dependencies: libnautilus_extension_deps,
+                                         include_directories: nautilus_include_dirs,
+-                                        version: nautilus_extension_version,
+                                         install: true)
+-
+-gnome.generate_gir (libnautilus_extension,
+-                    sources: libnautilus_extension_headers + libnautilus_extension_sources,
+-                    nsversion: '3.0',
+-                    namespace: 'Nautilus',
+-                    includes: ['Gtk-3.0', 'Gio-2.0', 'GLib-2.0'],
+-                    install: true)
+ 
+ nautilus_extension = declare_dependency (link_with: libnautilus_extension,
+                                          dependencies: libnautilus_extension_deps,
+--- a/meson.build
++++ b/meson.build
+@@ -21,7 +21,6 @@
+ sysconfdir = get_option ('sysconfdir')
+ 
+ glib_ver = '>=2.51.2'
+-gnome_desktop_ver = '>=3.0.0'
+ pango_ver = '1.28.3'
+ gtk_ver = '>=3.21.6'
+ xml_ver = '>=2.7.8'
+@@ -38,22 +37,19 @@
+ i18n = import ('i18n')
+ 
+ glib = dependency ('glib-2.0', version: glib_ver)
+-gtk = dependency ('gtk+-3.0', version: gtk_ver)
++gtk = dependency ('gtk+-3.0', version: gtk_ver, static: true)
++epoxy = dependency ('epoxy', static: true)
+ autoar = dependency ('gnome-autoar-0', version: autoar_ver)
+ 
+ gail = dependency ('gail-3.0')
+-gnome_desktop = dependency ('gnome-desktop-3.0', version: gnome_desktop_ver)
+ xml = dependency ('libxml-2.0', version: xml_ver)
+-x11 = dependency ('x11')
+ 
+ gthread = dependency ('gthread-2.0', version: glib_ver)
+ gmodule_no_export = dependency ('gmodule-no-export-2.0', version: glib_ver)
+ gio = dependency ('gio-2.0', version: glib_ver)
+ gio_unix = dependency ('gio-unix-2.0', version: glib_ver)
+-gsettings_desktop_schemas = dependency ('gsettings-desktop-schemas',
+-                                        version: schemas_ver)
+ 
+-libm = cc.find_library ('libm')
++libm = cc.find_library ('m')
+ 
+ conf = configuration_data ()
+ conf.set_quoted ('VERSION', meson.project_version ())
+@@ -101,7 +97,6 @@
+ subdir ('libnautilus-extension')
+ 
+ message ('Checking for libgd…')
+-run_command ('build-scripts/check_libgd.sh')
+ 
+ libgd_options = ['static=true',
+                  'with-gtk-hacks=true',
+@@ -111,9 +106,6 @@
+ libgd_dep = libgd.get_variable ('libgd_dep')
+ 
+ subdir ('src')
+-subdir ('test')
+-subdir ('data')
+-subdir ('po')
+ 
+ if get_option ('enable-gtk-doc')
+     subdir ('docs')
+@@ -128,4 +120,3 @@
+ endif
+ 
+ # Compile GSettings schemas when installing from source.
+-meson.add_install_script ('build-scripts/compile_gschemas.sh')
+--- a/src/gtk/nautilusgtkplacesview.c
++++ b/src/gtk/nautilusgtkplacesview.c
+@@ -135,7 +135,7 @@
+   LAST_SIGNAL
+ };
+ 
+-const gchar *unsupported_protocols [] =
++static const gchar *unsupported_protocols [] =
+ {
+   "file", "afc", "obex", "http",
+   "trash", "burn", "computer",
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -239,7 +239,7 @@
+     'nautilus-signaller.h',
+     'nautilus-signaller.c',
+     'nautilus-query.c',
+-    'nautilus-thumbnails.c',
++    'nautilus-lixinos-thumbnails.c',
+     'nautilus-thumbnails.h',
+     'nautilus-trash-monitor.c',
+     'nautilus-trash-monitor.h',
+@@ -269,15 +269,13 @@
+ 
+ nautilus_deps = [glib,
+                  gtk,
++                 epoxy,
+                  autoar,
+                  xml,
+-                 gsettings_desktop_schemas,
+                  libgd_dep,
+                  gail,
+-                 gnome_desktop,
+                  eel_2,
+                  nautilus_extension,
+-                 x11,
+                  gmodule_no_export]
+ 
+ if get_option ('enable-exif')
+@@ -314,9 +312,3 @@
+                        dependencies: libnautilus_dep,
+                        install: true)
+ 
+-test ('nautilus', nautilus, args: ['--check', '--g-fatal-warnings'])
+-
+-nautilus_autorun_software = executable ('nautilus-autorun-software',
+-                                        'nautilus-autorun-software.c',
+-                                        dependencies: libnautilus_dep,
+-                                        install: true)
+--- a/src/nautilus-application.c
++++ b/src/nautilus-application.c
+@@ -62,7 +62,6 @@
+ #include <gio/gio.h>
+ #include <eel/eel-gtk-extensions.h>
+ #include <eel/eel-stock-dialogs.h>
+-#include <gdk/gdkx.h>
+ #include <gtk/gtk.h>
+ 
+ typedef struct
+@@ -1265,13 +1264,8 @@
+ nautilus_application_startup (GApplication *app)
+ {
+     NautilusApplication *self = NAUTILUS_APPLICATION (app);
+-    NautilusApplicationPrivate *priv;
+ 
+     nautilus_profile_start (NULL);
+-    priv = nautilus_application_get_instance_private (self);
+-
+-    /* create DBus manager */
+-    priv->fdb_manager = nautilus_freedesktop_dbus_new ();
+     nautilus_application_startup_common (self);
+ 
+     nautilus_profile_end (NULL);
+@@ -1514,8 +1508,7 @@
+ {
+     return g_object_new (NAUTILUS_TYPE_APPLICATION,
+                          "application-id", "org.gnome.Nautilus",
+-                         "flags", G_APPLICATION_HANDLES_COMMAND_LINE | G_APPLICATION_HANDLES_OPEN,
+-                         "inactivity-timeout", 12000,
++                         "flags", G_APPLICATION_HANDLES_COMMAND_LINE | G_APPLICATION_HANDLES_OPEN | G_APPLICATION_NON_UNIQUE,
+                          NULL);
+ }
+ 
+--- a/src/nautilus-canvas-container.c
++++ b/src/nautilus-canvas-container.c
+@@ -23,8 +23,6 @@
+  */
+ 
+ #include <config.h>
+-#include <X11/Xlib.h>
+-#include <X11/Xatom.h>
+ #include <math.h>
+ #include "nautilus-canvas-container.h"
+ 
+@@ -40,7 +38,6 @@
+ 
+ #include <gdk/gdkkeysyms.h>
+ #include <gtk/gtk.h>
+-#include <gdk/gdkx.h>
+ #include <glib/gi18n.h>
+ #include <stdio.h>
+ #include <string.h>
+@@ -2668,76 +2665,12 @@
+                   GdkRGBA                 *bgcolor,
+                   GdkRGBA                 *bordercolor)
+ {
+-    Atom real_type;
+-    gint result = -1;
+-    gint real_format;
+-    gulong items_read = 0;
+-    gulong items_left = 0;
+-    gchar *colors;
+-    Atom representative_colors_atom;
+-    Display *display;
+-
+-    if (nautilus_canvas_container_get_is_desktop (container))
+-    {
+-        representative_colors_atom = gdk_x11_get_xatom_by_name ("_GNOME_BACKGROUND_REPRESENTATIVE_COLORS");
+-        display = gdk_x11_display_get_xdisplay (gdk_display_get_default ());
+-
+-        gdk_error_trap_push ();
+-        result = XGetWindowProperty (display,
+-                                     GDK_ROOT_WINDOW (),
+-                                     representative_colors_atom,
+-                                     0L,
+-                                     G_MAXLONG,
+-                                     False,
+-                                     XA_STRING,
+-                                     &real_type,
+-                                     &real_format,
+-                                     &items_read,
+-                                     &items_left,
+-                                     (guchar **) &colors);
+-        gdk_error_trap_pop_ignored ();
+-    }
+-
+-    if (result == Success && items_read)
+-    {
+-        /* by treating the result as a nul-terminated string, we
+-         * select the first colour in the list.
+-         */
+-        GdkRGBA read;
+-        gdouble shade;
+-
+-        gdk_rgba_parse (&read, colors);
+-        XFree (colors);
+-
+-        /* Border
+-         *
+-         * We shade darker colours to be slightly lighter and
+-         * lighter ones to be slightly darker.
+-         */
+-        shade = read.green < 0.5 ? 1.1 : 0.9;
+-        bordercolor->red = read.red * shade;
+-        bordercolor->green = read.green * shade;
+-        bordercolor->blue = read.blue * shade;
+-        bordercolor->alpha = 1.0;
+-
+-        /* Background */
+-        *bgcolor = read;
+-        bgcolor->alpha = 0.6;
+-    }
+-    else
+-    {
+-        /* Fallback to the style context if we can't get the Atom */
+-        GtkStyleContext *context;
+-
+-        context = gtk_widget_get_style_context (GTK_WIDGET (container));
+-        gtk_style_context_save (context);
+-        gtk_style_context_add_class (context, GTK_STYLE_CLASS_RUBBERBAND);
+-
+-        gtk_style_context_get_background_color (context, GTK_STATE_FLAG_NORMAL, bgcolor);
+-        gtk_style_context_get_border_color (context, GTK_STATE_FLAG_NORMAL, bordercolor);
+-
+-        gtk_style_context_restore (context);
+-    }
++    GtkStyleContext *context = gtk_widget_get_style_context (GTK_WIDGET (container));
++    gtk_style_context_save (context);
++    gtk_style_context_add_class (context, GTK_STYLE_CLASS_RUBBERBAND);
++    gtk_style_context_get_background_color (context, GTK_STATE_FLAG_NORMAL, bgcolor);
++    gtk_style_context_get_border_color (context, GTK_STATE_FLAG_NORMAL, bordercolor);
++    gtk_style_context_restore (context);
+ }
+ 
+ static void
+--- a/src/nautilus-canvas-dnd.c
++++ b/src/nautilus-canvas-dnd.c
+@@ -47,7 +47,6 @@
+ #include <eel/eel-string.h>
+ #include <eel/eel-vfs-extensions.h>
+ #include <gdk/gdkkeysyms.h>
+-#include <gdk/gdkx.h>
+ #include <gtk/gtk.h>
+ #include <glib/gi18n.h>
+ 
+--- a/src/nautilus-file-utilities.c
++++ b/src/nautilus-file-utilities.c
+@@ -359,17 +359,7 @@
+                                        NAUTILUS_USER_DIRECTORY_NAME,
+                                        NULL);
+ 
+-    if (!g_file_test (user_directory, G_FILE_TEST_EXISTS))
+-    {
+-        g_mkdir (user_directory, DEFAULT_NAUTILUS_DIRECTORY_MODE);
+-        /* FIXME bugzilla.gnome.org 41286:
+-         * How should we handle the case where this mkdir fails?
+-         * Note that nautilus_application_startup will refuse to launch if this
+-         * directory doesn't get created, so that case is OK. But the directory
+-         * could be deleted after Nautilus was launched, and perhaps
+-         * there is some bad side-effect of not handling that case.
+-         */
+-    }
++    g_mkdir_with_parents (user_directory, DEFAULT_NAUTILUS_DIRECTORY_MODE);
+ 
+     return user_directory;
+ }
+--- a/src/nautilus-file.c
++++ b/src/nautilus-file.c
+@@ -5443,7 +5443,7 @@
+ 
+     if (pixbuf != NULL)
+     {
+-        gicon = g_object_ref (pixbuf);
++        gicon = g_object_ref (G_ICON (pixbuf));
+     }
+     else if (file->details->is_thumbnailing)
+     {
+@@ -7611,7 +7611,7 @@
+     return FALSE;
+ }
+ 
+-struct
++static struct
+ {
+     const char *icon_name;
+     const char *display_name;
+--- a/src/nautilus-files-view.c
++++ b/src/nautilus-files-view.c
+@@ -49,7 +49,6 @@
+ #include <X11/XF86keysym.h>
+ #endif
+ 
+-#include <gdk/gdkx.h>
+ #include <gdk/gdkkeysyms.h>
+ #include <gtk/gtk.h>
+ #include <glib/gi18n.h>
+@@ -9502,8 +9501,8 @@
+     builder = gtk_builder_new_from_resource ("/org/gnome/nautilus/ui/nautilus-toolbar-view-menu.ui");
+     priv->toolbar_menu_sections = g_new0 (NautilusToolbarMenuSections, 1);
+     priv->toolbar_menu_sections->supports_undo_redo = TRUE;
+-    priv->toolbar_menu_sections->zoom_section = g_object_ref_sink (gtk_builder_get_object (builder, "zoom_section"));
+-    priv->toolbar_menu_sections->extended_section = g_object_ref_sink (gtk_builder_get_object (builder, "extended_section"));
++    priv->toolbar_menu_sections->zoom_section = GTK_WIDGET (g_object_ref_sink (gtk_builder_get_object (builder, "zoom_section")));
++    priv->toolbar_menu_sections->extended_section = GTK_WIDGET (g_object_ref_sink (gtk_builder_get_object (builder, "extended_section")));
+     priv->zoom_controls_box = GTK_WIDGET (gtk_builder_get_object (builder, "zoom_controls_box"));
+     priv->zoom_level_label = GTK_WIDGET (gtk_builder_get_object (builder, "zoom_level_label"));
+ 
+--- /dev/null
++++ b/src/nautilus-lixinos-thumbnails.c
+@@ -0,0 +1,9 @@
++/* Nautilus uses desktop thumbnail helpers on GNOME. Use stock file icons. */
++#include "nautilus-thumbnails.h"
++
++gboolean nautilus_can_thumbnail (NautilusFile *file) { return FALSE; }
++gboolean nautilus_can_thumbnail_internally (NautilusFile *file) { return FALSE; }
++gboolean nautilus_thumbnail_is_mimetype_limited_by_size (const char *mime_type) { return FALSE; }
++void nautilus_create_thumbnail (NautilusFile *file) {}
++void nautilus_thumbnail_remove_from_queue (const char *uri) {}
++void nautilus_thumbnail_prioritize (const char *uri) {}
+--- a/src/nautilus-main.c
++++ b/src/nautilus-main.c
+@@ -84,6 +84,17 @@
+     bind_textdomain_codeset (GETTEXT_PACKAGE, "UTF-8");
+     textdomain (GETTEXT_PACKAGE);
+ 
++    g_setenv ("GDK_BACKEND", "broadway", TRUE);
++    g_setenv ("GIO_USE_VFS", "local", TRUE);
++    const char *xdg_dirs = g_getenv ("XDG_DATA_DIRS");
++    g_autofree char *data_dirs = g_strconcat ("/lib/nautilus/share:",
++                                             xdg_dirs && *xdg_dirs ? xdg_dirs : "/usr/local/share:/usr/share",
++                                             NULL);
++    g_setenv ("XDG_DATA_DIRS", data_dirs, TRUE);
++    g_setenv ("GSETTINGS_BACKEND", "memory", TRUE);
++    g_setenv ("GSETTINGS_SCHEMA_DIR", "/lib/nautilus/schemas", TRUE);
++    g_setenv ("FONTCONFIG_FILE", "/lib/nautilus/fonts.conf", TRUE);
++    g_setenv ("NO_AT_BRIDGE", "1", TRUE);
+     g_set_prgname ("nautilus");
+ 
+ #ifdef HAVE_EXEMPI
+--- a/src/nautilus-mime-actions.c
++++ b/src/nautilus-mime-actions.c
+@@ -33,7 +33,6 @@
+ #include <glib/gi18n.h>
+ #include <glib/gstdio.h>
+ #include <string.h>
+-#include <gdk/gdkx.h>
+ 
+ #include "nautilus-file-attributes.h"
+ #include "nautilus-file.h"
+@@ -1307,18 +1306,10 @@
+ search_for_application_mime_type (ActivateParametersInstall *parameters_install,
+                                   const gchar               *mime_type)
+ {
+-    GdkWindow *window;
+     guint xid = 0;
+     const char *mime_types[2];
+ 
+     g_assert (parameters_install->proxy != NULL);
+-
+-    /* get XID from parent window */
+-    window = gtk_widget_get_window (GTK_WIDGET (parameters_install->parent_window));
+-    if (window != NULL)
+-    {
+-        xid = GDK_WINDOW_XID (window);
+-    }
+ 
+     mime_types[0] = mime_type;
+     mime_types[1] = NULL;
+--- a/src/nautilus-program-choosing.c
++++ b/src/nautilus-program-choosing.c
+@@ -35,7 +35,6 @@
+ #include <stdlib.h>
+ 
+ #include <gdk/gdk.h>
+-#include <gdk/gdkx.h>
+ 
+ void
+ nautilus_launch_application_for_mount (GAppInfo  *app_info,
+--- a/src/nautilus-progress-info-manager.c
++++ b/src/nautilus-progress-info-manager.c
+@@ -76,7 +76,7 @@
+ 
+     if (singleton != NULL)
+     {
+-        return g_object_ref (singleton);
++        return g_object_ref (G_OBJECT (singleton));
+     }
+ 
+     retval = G_OBJECT_CLASS (nautilus_progress_info_manager_parent_class)->constructor
+--- a/src/nautilus-properties-window.c
++++ b/src/nautilus-properties-window.c
+@@ -35,7 +35,6 @@
+ #include <cairo.h>
+ 
+ #define GNOME_DESKTOP_USE_UNSTABLE_API
+-#include <libgnome-desktop/gnome-desktop-thumbnail.h>
+ 
+ #include <eel/eel-accessibility.h>
+ #include <eel/eel-glib-extensions.h>
+@@ -1600,7 +1599,7 @@
+ 
+     change->file = nautilus_file_ref (file);
+     change->group = g_strdup (group);
+-    change->window = g_object_ref (G_OBJECT (window));
++    change->window = g_object_ref (GTK_WINDOW (window));
+     change->timeout =
+         g_timeout_add (CHOWN_CHGRP_TIMEOUT,
+                        (GSourceFunc) schedule_group_change_timeout,
+@@ -2021,7 +2020,7 @@
+ 
+     change->file = nautilus_file_ref (file);
+     change->owner = g_strdup (owner);
+-    change->window = g_object_ref (G_OBJECT (window));
++    change->window = g_object_ref (GTK_WINDOW (window));
+     change->timeout =
+         g_timeout_add (CHOWN_CHGRP_TIMEOUT,
+                        (GSourceFunc) schedule_owner_change_timeout,
+--- a/src/nautilus-shell-search-provider.c
++++ b/src/nautilus-shell-search-provider.c
+@@ -26,7 +26,6 @@
+ #include <gio/gio.h>
+ #include <string.h>
+ #include <glib/gi18n.h>
+-#include <gdk/gdkx.h>
+ 
+ #include "nautilus-file.h"
+ #include "nautilus-file-utilities.h"
+--- a/src/nautilus-window.c
++++ b/src/nautilus-window.c
+@@ -42,7 +42,6 @@
+ #include <eel/eel-debug.h>
+ #include <eel/eel-gtk-extensions.h>
+ #include <gdk-pixbuf/gdk-pixbuf.h>
+-#include <gdk/gdkx.h>
+ #include <gdk/gdkkeysyms.h>
+ #include <gtk/gtk.h>
+ #include <glib/gi18n.h>
+@@ -1249,59 +1248,9 @@
+ }
+ 
+ static gboolean
+-check_have_gnome_disks (void)
+-{
+-    gchar *disks_path;
+-    gboolean res;
+-
+-    disks_path = g_find_program_in_path ("gnome-disks");
+-    res = (disks_path != NULL);
+-    g_free (disks_path);
+-
+-    return res;
+-}
+-
+-static gboolean
+ should_show_format_command (GVolume *volume)
+ {
+-    gchar *unix_device_id;
+-    gboolean show_format;
+-
+-    unix_device_id = g_volume_get_identifier (volume, G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE);
+-    show_format = (unix_device_id != NULL) && check_have_gnome_disks ();
+-    g_free (unix_device_id);
+-
+-    return show_format;
+-}
+-
+-static void
+-action_format (GSimpleAction *action,
+-               GVariant      *variant,
+-               gpointer       user_data)
+-{
+-    NautilusWindow *window = NAUTILUS_WINDOW (user_data);
+-    GAppInfo *app_info;
+-    gchar *cmdline, *device_identifier, *xid_string;
+-    gint xid;
+-
+-    device_identifier = g_volume_get_identifier (window->priv->selected_volume,
+-                                                 G_VOLUME_IDENTIFIER_KIND_UNIX_DEVICE);
+-    xid = (gint) gdk_x11_window_get_xid (gtk_widget_get_window (GTK_WIDGET (window)));
+-    xid_string = g_strdup_printf ("%d", xid);
+-
+-    cmdline = g_strconcat ("gnome-disks ",
+-                           "--block-device ", device_identifier, " ",
+-                           "--format-device ",
+-                           "--xid ", xid_string,
+-                           NULL);
+-    app_info = g_app_info_create_from_commandline (cmdline, NULL, 0, NULL);
+-    g_app_info_launch (app_info, NULL, NULL, NULL);
+-
+-    g_free (cmdline);
+-    g_free (device_identifier);
+-    g_free (xid_string);
+-    g_clear_object (&app_info);
+-    g_clear_object (&window->priv->selected_volume);
++    return FALSE;
+ }
+ 
+ static void
+@@ -2097,7 +2046,6 @@
+     { "go-to-tab", NULL, "i", "0", action_go_to_tab },
+     { "empty-trash", action_empty_trash },
+     { "properties", action_properties },
+-    { "format", action_format },
+ };
+ 
+ static void

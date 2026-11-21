@@ -1,4 +1,4 @@
-"""Agent front end for the C kernel. Model replies are data, never shell input."""
+"""User-space Agent worker. The desktop workbench runs on both LixinOS kernels."""
 
 import json
 import os
@@ -6,6 +6,7 @@ import stat
 import struct
 import subprocess
 import sys
+import time
 
 ARCHIVE = "/.agent-system-undo"
 MANIFEST = ARCHIVE + "/manifest"
@@ -82,7 +83,7 @@ def helper(action, data=b""):
     return subprocess.run(["/lib/agent-io", action], input=data, capture_output=True)
 
 
-def request(action, *fields, retry=True):
+def model_response(action, fields):
     body = "\t".join([action, *(s.encode().hex() for s in fields)]).encode()
     reply = helper("model", body)
     if reply.returncode == 125:
@@ -93,6 +94,31 @@ def request(action, *fields, retry=True):
         fail("model bridge unavailable; launch with DEEPSEEK_API_KEY")
     status, *values = reply.stdout.decode("ascii").split("\t")
     values = [bytes.fromhex(v).decode() for v in values]
+    return status, values
+
+
+def request(action, *fields, retry=True, trace=None):
+    attempt = 1 if retry else 2
+    if trace:
+        trace.emit("model_started", attempt=attempt, remaining=int(fields[3]))
+        if trace.mode == "desktop":
+            trace.require()
+    started = time.monotonic_ns()
+    try:
+        status, values = model_response(action, fields)
+    except (Cancelled, Paused, KeyboardInterrupt, OSError, ValueError, subprocess.SubprocessError) as error:
+        if trace:
+            outcome = ("cancelled" if isinstance(error, (Cancelled, KeyboardInterrupt))
+                       else "paused" if isinstance(error, Paused) else "failed")
+            trace.emit("model_finished", attempt=attempt, remaining=int(fields[3]),
+                       result=dict(status=outcome, duration_ms=elapsed_ms(started),
+                                   detail=excerpt(error, 512)))
+        raise
+    if trace:
+        result = dict(status="ok" if status == "ok" else "failed", duration_ms=elapsed_ms(started))
+        if status != "ok":
+            result["detail"] = excerpt(values[0] if values else status, 512)
+        trace.emit("model_finished", attempt=attempt, remaining=int(fields[3]), result=result)
     if (
         status == "error"
         and action == "chat-session"
@@ -104,9 +130,12 @@ def request(action, *fields, retry=True):
         return request(
             action,
             instruction
-            + "\nRegenerate a JSON object with tool and args, with args an array of strings.",
+            + ("\nRetry using one declared workbench tool with valid arguments."
+               if instruction.startswith("You are the LixinOS desktop app agent.")
+               else "\nRegenerate a JSON object with tool and args, with args an array of strings."),
             *rest,
             retry=False,
+            trace=trace,
         )
     if status != "ok":
         fail("model error: " + visible(values[0] if values else status))
@@ -115,6 +144,141 @@ def request(action, *fields, retry=True):
 
 def visible(text):
     return "".join(c if c.isprintable() or c == "\n" else "?" for c in str(text))
+
+
+TRACE_PREFIX = ".agent-trace-"
+TRACE_SUFFIX = ".jsonl"
+
+
+def elapsed_ms(started):
+    return (time.monotonic_ns() - started) // 1_000_000
+
+
+def excerpt(value, limit):
+    data = visible(value).encode()
+    return data.decode() if len(data) <= limit else data[:limit].decode(errors="ignore") + "\n[truncated]"
+
+
+def list_traces(root):
+    paths = [name for name in os.listdir(root) if name.startswith(TRACE_PREFIX)
+             and name.endswith(TRACE_SUFFIX) and os.path.isfile(os.path.join(root, name))]
+    if not paths:
+        print("agent: no traces in this project")
+    for name in sorted(paths, reverse=True)[:8]:
+        print(os.path.join(root, name))
+
+
+def fingerprint(data):
+    return "oversize" if len(data) > 32768 else f"{len(data)}:{checksum(data):08x}"
+
+
+def desktop_checkpoint(root):
+    def file_fingerprint(path):
+        try:
+            with open(path, "rb") as stream:
+                return fingerprint(stream.read(32769))
+        except (FileNotFoundError, IsADirectoryError):
+            return None
+
+    return dict(source=file_fingerprint(os.path.join(root, "app.c")),
+                tests=file_fingerprint(os.path.join(root, "tests.json")),
+                candidate=file_fingerprint(os.path.join(root, ".desktop/candidate")),
+                installed=file_fingerprint(f"/bin/.{os.path.basename(root)}.desktop-release"))
+
+
+class Trace:
+    def __init__(self, root, mode, task, session_id, resumed_from=None, auto_approve=True,
+                 continues_task=False):
+        self.root = root
+        self.mode = mode
+        self.session_id = session_id
+        self.path = None
+        self.started = time.monotonic_ns()
+        self.seq = 0
+        self.size = 0
+        self.disabled = False
+        start = dict(project=root, mode=mode, task=excerpt(task, 2048),
+                     unix_seconds=int(time.time()), auto_approve=auto_approve)
+        if resumed_from is not None:
+            start["resumed_from"] = resumed_from
+            start["continues_task"] = continues_task
+        self.emit("turn_started", **start)
+
+    def open_trace(self):
+        if self.path is not None:
+            return open(self.path, "r+b", buffering=0)
+        stamp = int(time.time())
+        for index in range(1, 10000):
+            path = os.path.join(self.root, f"{TRACE_PREFIX}{stamp:010d}-{index:04d}{TRACE_SUFFIX}")
+            try:
+                stream = open(path, "xb", buffering=0)
+            except FileExistsError:
+                continue
+            self.path = path
+            return stream
+        fail("no available trace filename")
+
+    def emit(self, event, **data):
+        if self.disabled:
+            return
+        try:
+            with self.open_trace() as stream:
+                turn_id = os.path.basename(self.path)
+                if self.session_id is None:
+                    self.session_id = turn_id
+                record = dict(schema=2, seq=self.seq + 1, elapsed_ms=elapsed_ms(self.started),
+                              event=event, session_id=self.session_id, turn_id=turn_id, data=data)
+                if self.mode == "desktop" and event in ("turn_started", "tool_started", "tool_finished", "turn_finished"):
+                    record["workspace"] = desktop_checkpoint(self.root)
+
+                def encode():
+                    return (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+
+                line = encode()
+                # The port commits up to 4 KiB in one write. Keep long previews
+                # from leaving half a JSON record on the disk.
+                if len(line) > 4096:
+                    for key in ("text", "task"):
+                        if key in data:
+                            data[key] = excerpt(data[key], 768)
+                    if "result" in data:
+                        result = {key: value for key, value in data["result"].items() if key != "artifact"}
+                        if "detail" in result:
+                            result["detail"] = excerpt(result["detail"], 768)
+                        data["result"] = result
+                    data["truncated"] = True
+                    line = encode()
+                    if len(line) > 4096:
+                        fail("trace record exceeds the write limit")
+                if self.size + len(line) > 512 * 1024:
+                    fail("trace size limit reached")
+                stream.seek(self.size)
+                if stream.write(line) != len(line):
+                    fail("incomplete trace write")
+            self.size += len(line)
+            self.seq += 1
+        except (OSError, ValueError) as error:
+            self.disabled = True
+            print("agent: trace stopped:", visible(error), flush=True)
+
+    def require(self):
+        if self.disabled:
+            fail("desktop session log could not be saved")
+
+    def finish(self, status, detail=None):
+        result = dict(status=status, duration_ms=elapsed_ms(self.started))
+        if detail is not None:
+            result["detail"] = excerpt(detail, 512)
+        self.emit("turn_finished", **result)
+
+
+def trace_tool(tool, args, desktop, step):
+    action = dict(step=step, call_id=step, tool=excerpt(tool, 32))
+    if desktop and desktop_tool(tool, args):
+        action["target"] = args[3]
+    elif args and tool in ("exec", "terminal", "read", "list", "write", "test", "smoke", "verify"):
+        action["target"] = excerpt(args[0], 256)
+    return action
 
 
 def read(path):
@@ -566,12 +730,14 @@ def project_root(root, chat):
         fail("choose a project directory outside /bin, /agent-policy and .git")
 
 
-def run_command(argv, root):
+def run_command(argv, root, preview_lines=None):
     import codecs
 
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
     output = []
     used = 0
+    tail = ""
+    lines_left = preview_lines
     with subprocess.Popen(
         ["/lib/agent-command", *argv],
         cwd=root,
@@ -582,13 +748,23 @@ def run_command(argv, root):
         child.stdin.close()
         while block := os.read(child.stdout.fileno(), 4096):
             text = visible(decoder.decode(block))
-            print(text, end="", flush=True)
+            if lines_left is None:
+                print(text, end="", flush=True)
+            elif lines_left > 0:
+                preview = "".join(text.splitlines(keepends=True)[:lines_left])
+                print(preview, end="", flush=True)
+                lines_left -= preview.count("\n")
             if used < 2048:
                 output.append(text[: 2048 - used])
                 used += len(output[-1])
-        tail = visible(decoder.decode(b"", final=True))
-        print(tail, end="", flush=True)
-        return child.wait(), "".join(output) + tail
+            if preview_lines is not None:
+                tail = (tail + text)[-1024:]
+        final = visible(decoder.decode(b"", final=True))
+        if lines_left is None or lines_left > 0:
+            print(final, end="", flush=True)
+        if preview_lines is not None and used == 2048:
+            return child.wait(), "".join(output)[:768] + "\n[more output]\n" + tail + final
+        return child.wait(), "".join(output) + final
 
 
 def runner_actions(child, mode, budget, peek, ask):
@@ -641,15 +817,164 @@ def runner_actions(child, mode, budget, peek, ask):
             result = yield submission
 
 
-def session(root, task, mode, conversation="", bypass=False):
+DESKTOP_SCRIPT = "/src/agent/desktop.py"
+DESKTOP_GUIDE = "/src/agent/desktop.md"
+
+
+def desktop_tool(tool, args):
+    if tool != "exec" or args[:3] != ["python3", "-I", DESKTOP_SCRIPT] or len(args) < 4:
+        return False
+    return len(args) - 4 in {"read": (1, 3), "write": (2,), "patch": (3,),
+                             "check": (0,), "status": (0,)}.get(args[3], ())
+
+
+def named_desktop_tool(tool, args):
+    operation = {
+        ("read_file", 1): "read", ("read_file", 3): "read",
+        ("write_file", 2): "write", ("apply_patch", 3): "patch",
+        ("check_app", 0): "check", ("app_status", 0): "status",
+    }.get((tool, len(args)))
+    return ("exec", ["python3", "-I", DESKTOP_SCRIPT, operation, *args]) if operation else (tool, args)
+
+
+def desktop_intent(root, args):
+    operation, target, *content = args[3:]
+    if operation not in ("write", "patch") or target not in ("source", "tests"):
+        return None
+    path = os.path.join(root, "app.c" if target == "source" else "tests.json")
+    before = read(path)
+    if operation == "write":
+        after = content[0].encode()
+    else:
+        old, new = (text.encode() for text in content)
+        if not old or before.count(old) != 1:
+            return None
+        after = before.replace(old, new, 1)
+    if not after.strip() or len(after) > 32768:
+        return None
+    return dict(file=target, before=fingerprint(before), after=fingerprint(after))
+
+
+def desktop_observations(observations, trace, compacted):
+    if len(observations) <= 12 and sum(len(item) for item in observations) <= 16384:
+        return observations, compacted
+    older, recent = observations[:-8], observations[-8:]
+    if not older:
+        return recent, compacted
+    entries = [json.loads(item) for item in older]
+    checks = [entry for entry in entries if entry["operation"] == "check"]
+    summary = dict(tool="history_summary", status="ok", detail="Earlier tool results are saved in the session log.",
+                   count=len(older), calls=[(e["operation"], e["status"]) for e in entries[-8:]])
+    if checks:
+        summary["last_check"] = excerpt(checks[-1]["detail"], 512)
+    if compacted != len(older):
+        trace.emit("context_compacted", omitted=len(older), retained=len(recent))
+    return [json.dumps(summary), *recent], len(older)
+
+
+def desktop_session(root, task, conversation, bypass, trace):
+    budget, peek = settings()
+    instruction = read(DESKTOP_GUIDE).decode()
+    git = read(GIT).decode()
+    observations = []
+    updates = ""
+    checked_at = compacted = None
+
+    def follow_up():
+        nonlocal updates
+        note = keyboard_line("agent paused. Enter a follow-up.\nagent> ")
+        trace.emit("follow_up", text=excerpt(note, 1024))
+        trace.require()
+        updates = excerpt(updates + note + "\n", 4096)
+
+    def finish(summary):
+        summary = excerpt(summary, 4096)
+        print("\x1b[95m" + summary + "\x1b[0m", flush=True)
+        trace.emit("assistant", text=summary)
+        trace.require()
+        return summary
+
+    for step in range(1, budget + 2):
+        while True:
+            try:
+                context, compacted = desktop_observations(observations, trace, compacted)
+                tool, *args = request("chat-session", instruction, task, root,
+                                      str(budget + 1 - step), updates, "", git,
+                                      conversation, *context, trace=trace)
+                break
+            except Paused:
+                follow_up()
+        if tool == "finish" and len(args) == 1:
+            return finish(args[0])
+        if step > budget:
+            break
+        tool, args = named_desktop_tool(tool, args)
+        allowed = desktop_tool(tool, args)
+        operation = args[3] if allowed else ""
+        target = " ".join(args[4:7]) if operation == "read" else args[4] if operation in ("write", "patch") else ""
+        title = f"{operation} {target}".strip() if allowed else tool
+        print(f"\x1b[36m [{step:02}/{budget}] {excerpt(title, 180)}\x1b[0m", flush=True)
+        action = trace_tool(tool, args, True, step)
+        action["label"] = excerpt(title, 180)
+        rc, output = None, ""
+        reuse = operation == "check" and checked_at == updates
+        started = time.monotonic_ns()
+        try:
+            intent = desktop_intent(root, args) if operation in ("write", "patch") else None
+            trace.emit("tool_started", **action, **({"intent": intent} if intent else {}))
+            trace.require()
+            if not allowed:
+                status, output = "failed", "desktop mode accepts only workbench tools. See /prompt"
+            elif not bypass and not approved(f"Run {title} in {root}?"):
+                status, output = "declined", "Operator declined the command."
+            else:
+                argv = ["/bin/python3", *args[1:]]
+                if reuse:
+                    argv.append("--reuse")
+                rc, output = run_command(argv, root, preview_lines=3)
+                if rc == 125:
+                    raise Cancelled("turn cancelled")
+                if rc == 126:
+                    raise Paused()
+                status = "timed_out" if rc == 124 else "ok" if rc == 0 else "failed"
+        except Paused:
+            follow_up()
+            status, output = "paused", "Operator paused the command. Inspect the draft before another edit."
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            status, output = "failed", visible(error)
+        detail = f"Command exited with status {rc}.\n{output}" if rc is not None else output
+        result = dict(status=status, detail=excerpt(detail, 2600))
+        if rc is not None and rc not in (124, 125, 126):
+            result["exit_code"] = rc
+        trace.emit("tool_finished", **action, duration_ms=elapsed_ms(started), result=result)
+        trace.require()
+        preview = excerpt(detail, peek)
+        if operation == "check" and rc == 0:
+            proof = next((line for line in reversed(output.splitlines()) if line.startswith(("CHECK PASSED ", "CHECK REUSED "))), "")
+            if proof and proof not in preview:
+                preview += "\n" + proof
+        observations.append(json.dumps(dict(tool=tool, operation=operation, label=title,
+                                            **{**result, "detail": preview}), ensure_ascii=False))
+        if operation == "check":
+            checked_at = updates if status == "ok" else None
+            if reuse and status == "ok" and output.startswith("CHECK REUSED "):
+                return finish("Stopped after a repeated check. The unchanged draft has a passing candidate for /publish.")
+    print("agent: tool budget exhausted")
+    return None
+
+
+def session(root, task, mode, conversation="", bypass=False, trace=None):
     root = os.path.abspath(root)
-    if mode in ("chat", "run"):
-        project_root(root, mode == "chat")
+    desktop = mode == "desktop"
+    if mode in ("chat", "desktop", "run"):
+        project_root(root, mode != "run")
     if not os.path.isdir(root) and not (mode == "tune" and not os.path.exists(root)):
         fail("project directory not found")
+    if desktop:
+        return desktop_session(root, task, conversation, bypass, trace)
     system = mode == "system"
     tune = mode == "tune"
-    chat = mode == "chat"
+    chat = mode in ("chat", "desktop")
     budget, peek = settings()
     if tune:
         budget = 12
@@ -717,11 +1042,13 @@ def session(root, task, mode, conversation="", bypass=False):
                     git_reference,
                     *([conversation] if chat else []),
                     *observations,
+                    trace=trace,
                 )
             except Paused:
-                updates += (
-                    keyboard_line("agent paused. Enter a follow-up.\nagent> ") + "\n"
-                )
+                note = keyboard_line("agent paused. Enter a follow-up.\nagent> ")
+                updates += note + "\n"
+                if trace and note:
+                    trace.emit("follow_up", text=excerpt(note, 512))
 
     print("agent: starting /bin/agent-run", flush=True)
     child = subprocess.Popen(
@@ -738,6 +1065,10 @@ def session(root, task, mode, conversation="", bypass=False):
                 break
             status = "ok"
             record = {}
+            action = trace_tool(tool, args, False, step + 1) if trace else None
+            if trace and tool != "finish":
+                trace.emit("tool_started", **action)
+            started = time.monotonic_ns()
             try:
                 if tool == "finish" and len(args) == 1:
                     if chat and any(state(p) != v for p, v in verified.items()):
@@ -754,6 +1085,8 @@ def session(root, task, mode, conversation="", bypass=False):
                             if applied.startswith("discarded"):
                                 summary = "The staged changes were discarded."
                     print("\x1b[95m" + summary + "\x1b[0m" if chat else summary)
+                    if trace:
+                        trace.emit("assistant", text=excerpt(summary, 4096))
                     return summary
                 if tool == "apply" and not args:
                     result = apply()
@@ -992,10 +1325,16 @@ def session(root, task, mode, conversation="", bypass=False):
                     result = "staged " + tool + " " + path + " using " + tool
                 else:
                     fail("unsupported tool or invalid arguments")
+            except (Cancelled, KeyboardInterrupt) as error:
+                if trace and tool != "finish":
+                    trace.emit("tool_finished", **action, duration_ms=elapsed_ms(started),
+                               result=dict(status="cancelled", detail=excerpt(error, 512)))
+                raise
             except Paused:
-                updates += (
-                    keyboard_line("agent paused. Enter a follow-up.\nagent> ") + "\n"
-                )
+                note = keyboard_line("agent paused. Enter a follow-up.\nagent> ")
+                updates += note + "\n"
+                if trace and note:
+                    trace.emit("follow_up", text=excerpt(note, 512))
                 status = "paused"
                 result = "Operator paused before completion; review the follow-up."
             except (OSError, ValueError, UnicodeError, subprocess.SubprocessError) as e:
@@ -1018,6 +1357,10 @@ def session(root, task, mode, conversation="", bypass=False):
                     and "path" in locals()
                 ):
                     evidence.setdefault((path, data), [0, 0, 0])[2] += 1
+            if trace and tool != "finish":
+                trace_result = {key: value for key, value in record.items() if key != "command"}
+                trace.emit("tool_finished", **action, duration_ms=elapsed_ms(started),
+                           result=dict(status=status, detail=excerpt(result, 4096), **trace_result))
             delivery = (
                 ("+" if status not in ("failed", "timed_out") else "-")
                 + visible(result[:peek])
@@ -1033,26 +1376,37 @@ def session(root, task, mode, conversation="", bypass=False):
         child.stdout.close()
         child.wait()
     print("agent: tool budget exhausted; discarded staged changes")
-    return ""
+    return None
 
 
-def chat_session(root):
+def chat_session(root, desktop=False, resume=None):
     project_root(root, True)
     if not os.path.isdir(root):
         fail("project directory not found")
     turns = []
     history = []
-    bypass = True
-    helper("header", b"\1" + root.encode())
-    print("LixinOS Agent | Bypass on |", root, "|", settings()[0], "tools/turn")
-    print(
-        "Bypass auto-approves local workspace commands. Staged saves and terminal handoff require approval. /help /bypass /export /exit"
-    )
+    bypass = resume["auto_approve"] if resume else True
+    session_id = resume["session_id"] if resume else None
+    resumed_from = resume["from_turn"] if resume else None
+    pending_task = resume["task"] if resume and resume["continue_turn"] else None
+    helper("header", bytes([1 if bypass else 2]) + root.encode())
+    print("LixinOS Agent | Bypass " + ("on" if bypass else "off") + " |", root, "|", settings()[0], "tools/turn")
+    if desktop:
+        print("Desktop workbench | /status /publish /rollback /help /exit")
+    else:
+        print("Bypass auto-approves local workspace commands. Staged saves and terminal handoff require approval. /help /bypass /export /exit")
+    if resume:
+        print("agent:", visible(resume["summary"]))
+        turns.append(resume["context"])
     while True:
-        try:
-            line = keyboard_line("\x1b[96magent> \x1b[0m", history).strip()
-        except (Cancelled, EOFError, KeyboardInterrupt):
-            return
+        continuing = pending_task is not None
+        if pending_task is not None:
+            line, pending_task = pending_task, None
+        else:
+            try:
+                line = keyboard_line("\x1b[96magent> \x1b[0m", history).strip()
+            except (Cancelled, EOFError, KeyboardInterrupt):
+                return
         if line and (not history or line != history[-1]):
             history.append(line)
             history[:] = history[-64:]
@@ -1060,10 +1414,31 @@ def chat_session(root):
             return
         if not line:
             continue
+        if line == "/trace":
+            list_traces(root)
+            continue
+        if desktop and line in ("/status", "/publish", "/rollback"):
+            trace = Trace(root, "desktop", line, session_id, auto_approve=bypass)
+            session_id = trace.session_id
+            action = dict(step=1, call_id=1, tool="desktop_operator", target=line[1:])
+            trace.emit("tool_started", **action)
+            started = time.monotonic_ns()
+            try:
+                code = subprocess.run(["/bin/python3", "-I", DESKTOP_SCRIPT, line[1:]], cwd=root).returncode
+                result = dict(exit_code=code, status="ok" if code == 0 else "failed",
+                              detail="desktop operation completed" if code == 0 else "desktop operation failed")
+            except (OSError, KeyboardInterrupt, subprocess.SubprocessError) as error:
+                result = dict(status="cancelled" if isinstance(error, KeyboardInterrupt) else "failed",
+                              detail=excerpt(error, 512))
+                print("agent:", visible(error))
+            trace.emit("tool_finished", **action, duration_ms=elapsed_ms(started), result=result)
+            trace.finish(result["status"], result["detail"] if result["status"] != "ok" else None)
+            continue
         if line == "/help":
-            print(
-                "Recall inputs with your terminal history. /prompt /clear /bypass /export /exit"
-            )
+            if desktop:
+                print("Describe the app or change. /status checks the candidate. /publish installs it. /rollback restores its predecessor. /prompt /export /trace /bypass /exit")
+            else:
+                print("Recall inputs with your terminal history. /prompt /clear /bypass /export /trace /exit")
             continue
         if line == "/bypass":
             bypass = not bypass
@@ -1074,7 +1449,7 @@ def chat_session(root):
             turns.clear()
             continue
         if line == "/prompt":
-            print(read("/src/agent/chat.md").decode())
+            print(read(DESKTOP_GUIDE if desktop else "/src/agent/chat.md").decode())
             continue
         if line.startswith("/export"):
             if not turns:
@@ -1100,18 +1475,84 @@ def chat_session(root):
             except (OSError, ValueError) as e:
                 print("agent:", visible(e))
             continue
+        mode = "desktop" if desktop else "chat"
+        context = "\n".join(turns[-16:])
+        if desktop:
+            prior = resume if continuing else load_desktop_resume(root, optional=True)
+            session_id = prior["session_id"] if prior else session_id
+            resumed_from = prior["from_turn"] if prior else None
+            context = prior["context"] if prior else ""
+        trace = Trace(root, mode, line, session_id, resumed_from, bypass, continues_task=continuing)
+        session_id = trace.session_id
+        resumed_from = None
         try:
-            answer = session(root, line, "chat", "\n".join(turns[-16:]), bypass)
-        except (ValueError, OSError, KeyboardInterrupt, Cancelled) as e:
-            print("agent:", visible(e))
+            answer = session(root, line, mode, context, bypass, trace)
+        except (ValueError, OSError, KeyboardInterrupt, Cancelled, subprocess.SubprocessError) as error:
+            trace.finish("cancelled" if isinstance(error, (Cancelled, KeyboardInterrupt)) else "failed", error)
+            print("agent:", visible(error))
             continue
-        turns.extend(("User: " + line, "Assistant: " + answer))
+        if answer is None:
+            trace.finish("tool_limit", "project agent reached its tool limit")
+        else:
+            trace.finish("ok")
+            turns.extend(("User: " + line, "Assistant: " + answer))
+
+
+def load_desktop_resume(root, trace_file="", optional=False):
+    path = [trace_file] if trace_file else []
+    result = subprocess.run(["/bin/python3", "-I", DESKTOP_SCRIPT, "resume-info", *path],
+                            cwd=root, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL if optional else None, check=not optional)
+    return json.loads(result.stdout) if result.returncode == 0 else None
+
+
+def desktop_work(root, operation, *args):
+    root = os.path.abspath(root)
+    project_root(root, True)
+    subprocess.run(["/bin/python3", "-I", DESKTOP_SCRIPT, "status"], cwd=root, check=True)
+    if operation in ("publish", "rollback") and len(args) == 1:
+        trace = Trace(root, "desktop", "/" + operation, None)
+        action = dict(step=1, call_id=1, tool="desktop_operator", target=operation)
+        trace.emit("tool_started", **action)
+        started = time.monotonic_ns()
+        code = subprocess.run(["/bin/python3", "-I", DESKTOP_SCRIPT, operation, args[0]], cwd=root).returncode
+        status = "ok" if code == 0 else "failed"
+        trace.emit("tool_finished", **action, duration_ms=elapsed_ms(started),
+                   result=dict(status=status, exit_code=code))
+        trace.finish(status)
+        return code
+    if operation == "resume" and len(args) == 1:
+        prior = load_desktop_resume(root, args[0])
+        if not prior["continue_turn"]:
+            return 0
+        task = prior["task"]
+    elif operation == "send" and len(args) == 2 and 0 < len(args[0].strip().encode()) <= 2048:
+        task = args[0]
+        prior = load_desktop_resume(root, args[1], optional=not args[1])
+    else:
+        fail("invalid desktop task request")
+    if prior and not prior["auto_approve"]:
+        fail("resume this approval-required turn in the terminal")
+    trace = Trace(root, "desktop", task, prior["session_id"] if prior else None,
+                  prior["from_turn"] if prior else None, continues_task=operation == "resume")
+    try:
+        answer = session(root, task, "desktop", prior["context"] if prior else "", True, trace)
+    except (ValueError, OSError, KeyboardInterrupt, Cancelled, subprocess.SubprocessError) as error:
+        trace.finish("cancelled" if isinstance(error, (Cancelled, KeyboardInterrupt)) else "failed", error)
+        raise
+    if answer is None:
+        trace.finish("tool_limit", "project agent reached its tool limit")
+        return 1
+    trace.finish("ok")
+    return 0
 
 
 def main(args):
     if not args:
         fail("usage: agent inspect, improve, rollback, or SCRIPT TASK")
     mode, *rest = args
+    if mode in ("chat", "desktop") and rest[:1] == ["--auto-approve"]:
+        rest = rest[1:]
     if mode == "inspect" and len(rest) == 1:
         inspect(rest[0])
     elif mode == "rollback" and len(rest) == 1:
@@ -1126,8 +1567,22 @@ def main(args):
         session("/agent-policy", rest[0], "tune")
     elif mode == "rollback-tune" and not rest:
         rollback(POLICY)
-    elif mode == "chat" and len(rest) <= 1:
-        chat_session(os.path.abspath(rest[0] if rest else "."))
+    elif mode == "desktop" and len(rest) == 2 and rest[0] == "new":
+        sys.exit(subprocess.run(["/bin/python3", "-I", DESKTOP_SCRIPT, *rest]).returncode)
+    elif mode in ("chat", "desktop") and len(rest) <= 1:
+        chat_session(os.path.abspath(rest[0] if rest else "."), mode == "desktop")
+    elif mode == "desktop-work" and len(rest) == 3 and rest[:2] == ["/", "store-ideas"]:
+        from runpy import run_path
+        run_path("/lib/app-store/ideas.py")["store_ideas"](rest[2], request)
+    elif mode == "desktop-work" and len(rest) >= 2:
+        sys.exit(desktop_work(*rest))
+    elif mode == "resume":
+        if len(rest) > 2:
+            fail("usage: agent resume [PROJECT [TRACE_FILE]]")
+        root = os.path.abspath(rest[0] if rest else ".")
+        chat_session(root, True, load_desktop_resume(root, rest[1] if len(rest) > 1 else ""))
+    elif mode == "trace" and len(rest) <= 1:
+        list_traces(os.path.abspath(rest[0] if rest else "."))
     elif mode == "improve":
         script(rest, True)
     else:

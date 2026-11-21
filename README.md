@@ -1,10 +1,37 @@
 # LixinOS
 
-**0.3.0** · [中文系统手册](docs/README.md) · [版本说明](docs/0.3.0.md)
+**0.4.0** · [中文系统手册](docs/README.md) · [版本说明](docs/0.4.0.md)
 
 ## Choose a kernel at startup
 
-Run `./scripts/run-kernel.sh` to open the macOS kernel picker before QEMU starts. Choose the original Rust kernel (default) or the guest-built TCC kernel. When `data/shared.img` is installed, both kernels boot with that same persistent filesystem. Enter `q` and press Return before switching kernels. Interactive `--serial` and `--ssh` sessions show a numbered menu. For unattended startup, pass `--kernel rust` or `--kernel tcc` with the desired display mode, for example `./scripts/run-kernel.sh --kernel tcc --split`.
+Run `./scripts/run-kernel.sh` to open the macOS kernel picker before QEMU starts. Choose the original Rust kernel (default) or the guest-built TCC kernel. Both kernels prefer the local daily work disk once initialized. Otherwise the launcher uses `data/shared.img` if installed. Enter `q` and press Return before switching kernels. Interactive `--serial` and `--ssh` sessions show a numbered menu. For unattended startup, pass `--kernel rust` or `--kernel tcc` with the desired display mode, for example `./scripts/run-kernel.sh --kernel tcc --split`.
+
+## 我的工作盘
+
+在 Mac 上运行 `python3 scripts/workdisk.py status` 查看工作盘和备份。首次设置时关掉使用原盘的虚拟机，运行
+`python3 scripts/workdisk.py init data/desktop-pingfang.img`。启动器使用本地副本
+`~/Library/Application Support/LixinOS/daily.img`。两个发布内核共用项目和历史；原镜像保存在项目目录。
+`LIXINOS_DISK` 可指定其他盘进行测试。
+
+关机后在 Mac 上用以下命令备份。需要恢复时，把备份路径和要找回的 guest 文件路径交给 `restore`。
+
+```sh
+python3 scripts/workdisk.py backup
+python3 scripts/workdisk.py status
+python3 scripts/workdisk.py restore "/完整路径/备份.img" /home/lixin/hello.py
+```
+
+目标父目录须存在。要覆盖同名文件，在命令末尾加 `--replace`。本地备份也可以复制到外置盘保管。
+
+在日常工作盘的桌面打开 **Apps → settings.win3**，可以调整默认编辑器、登录与开发环境、Agent 限额、时区、显示和连接选项。各项会标明生效时间。[设置使用说明](User/desktop/README.md#系统设置)
+
+开机进入 `/home/lixin`。用 `edit .profile` 修改登录设置，打开新 shell 或重启后生效。
+每行可以写变量赋值、`export NAME=value` 或 `cd 目录`，支持引号、变量展开和注释。
+例如添加 `export EDITOR=kilo` 后，`edit hello.py` 会使用 Kilo。
+`cd` 回到 `$HOME`；编译到 `$HOME/bin` 的程序可以直接按名字运行。
+
+前台程序或管道卡住时按 **Ctrl+C**，随后用 `echo $?` 可看到退出码 130。
+Desktop 的独立窗口应用可点右上角关闭，程序会先收到管道关闭通知，250 毫秒后仍在运行的子进程会被结束。
 
 ## CPython in the guest
 
@@ -34,6 +61,12 @@ The clock at the right shows 24-hour local time. Narrow windows show hours
 and minutes. The launcher uses Asia/Shanghai by default. Set
 `LIXINOS_TIMEZONE` to use a different time zone at startup.
 
+### NetSurf graphical browser
+
+The [NetSurf package](User/netsurf/README.md) adds NetSurf 3.11 to both kernels.
+Run `netsurf https://example.com/` in a QEMU graphics window or click **Browser**
+in the packaged desktop. Press **Ctrl+L** to enter an address.
+
 ### Links 2 browser
 
 Run `links` in the guest shell, or open a guest file with `links hello.html`.
@@ -56,7 +89,7 @@ links https://example.com
 ```
 
 In a QEMU window, use `links -g https://example.com` for the graphical browser,
-or click **Links** on the desktop. Click a link to follow it, the address bar
+or click **Browser** in the desktop dock. Click a link to follow it, the address bar
 to type a URL, **Back** to return, or **×** to close. Drag the title bar to
 move the window. The mouse wheel scrolls by a page.
 
@@ -108,30 +141,43 @@ In split mode the wheel acts within the focused pane.
 
 ### Desktop
 
-Type `desktop` in a QEMU window. Click **文件** to browse the guest disk, a
+Type `desktop` in a QEMU window. The left dock opens **Files**, **Browser** (NetSurf when installed, otherwise Links),
+**Calc**, **Terminal**, **Nano**, **Editor**, **Eyes** and **Apps**.
+Use **Apps** to launch independent window programs from /bin and its **Windows**
+tab to switch instances or restore minimized windows. Build one in the guest
+with `tcc /src/desktop/counter.c -o /bin/counter.win`. Open **stopwatch.win2** in
+Apps for a resizable example with timer-driven partial redraw. Space starts or
+pauses the stopwatch and R resets it. Files, Browser and Calc can stay
+open together. Click a window or its dock icon to bring it to the front. Drag
+its title bar to move it, or drag its lower-right corner to resize it. The
+**−**, **□** and **×** buttons minimize, maximize/restore and close the window.
+Click its dock icon to restore a minimized app with its contents intact.
+
+Click **Files** to browse the guest disk, a
 folder to enter it, or **上一级** to return to its parent. The arrows and mouse
 wheel page through longer listings.
 
-Click a text file to edit it, or click **文本编辑器**, type a path and press Enter
+Click a text file to edit it, or click **Nano**, type a path and press Enter
 to create one. Click in the document to place the caret and use the arrow keys
 to move it. Drag across text to select, including across lines. **Ctrl+C** copies,
 **Ctrl+X** cuts, and **Ctrl+V** pastes from the guest clipboard. Typing replaces
 the selection. **Ctrl+A** selects the document, **Ctrl+S** saves and **Ctrl+Q**
 returns to the desktop. You can also click the actions along the bottom of the editor. The shell command `nano` retains its console shortcuts.
 
-Click **终端** for a new window running the guest's `/bin/bash`. At a shell
-prompt, click the **−** button next to **×** or press **Ctrl+]** to put the window aside.
-Use the desktop's **<** and **>** buttons to select a saved shell, then click
-**Shell** to restore its screen, working directory and unfinished command.
-Each window runs in the foreground. Type `exit` to close its shell.
-**Esc** leaves the desktop and asks for a second press if sessions are still open.
+Click **Terminal** to open Bash. Click **+** in the title bar to open another
+tab and click a tab number to select it. Up to four tabs can run independently
+in each pane. A command keeps running when you switch tabs and its output
+stays in its own tab. Keyboard input and Ctrl+C go to the selected tab.
+**×** or `exit` closes the selected session. **−** hides the tab group while
+its sessions keep running. Use the session number at the bottom of the dock
+to reopen it. At a shell prompt, Ctrl+] also hides the group.
 
 #### Desktop window conventions
 
 - Every application window has a 44-logical-pixel title bar and a **×** button in the upper right. The file browser shows the directory it is displaying. The editor and terminal show the application name.
 - Hold the left mouse button on the title bar and drag to move the entire window. Releasing the button leaves it in place. Window edges stay within the desktop, including in split mode. Title-bar buttons handle clicks separately from dragging.
 - **×** closes the foreground window. The file browser returns to the desktop. The editor offers **Y** to save, **N** to discard, or **Esc** to continue editing when there are unsaved changes. The filename dialog can also be dragged or closed.
-- In a terminal, **×** ends that shell session along with its foreground command. The separate **−** button keeps the session, its position and its contents for later.
+- In a terminal, **×** ends that shell session along with its foreground command. The separate **−** button hides the tab group and keeps its sessions running.
 
 Run `python3 scripts/test-desktop.py` (or add `--split`) for the QEMU test.
 
@@ -141,13 +187,15 @@ Run `./scripts/run-kernel.sh --split` for two 68-column terminals in one 3014 ×
 
 ### Other console modes
 
-In a QEMU window, drag across visible terminal text and press
-**Ctrl+Shift+C** to copy it to the Mac clipboard. Press **Ctrl+Shift+V**
-to paste Mac clipboard text into the focused LixinOS console, including
-desktop terminal popups. The console supports up to 4 KiB of plain ASCII
-per paste. Nano and Kilo preserve tabs and newlines. At the shell, line
-breaks and tabs become spaces so pasted commands stay in the edit buffer
-until you press Return.
+In a QEMU window, the pointer becomes an I-beam over selectable text. Drag
+to highlight text, then right-click and choose **Copy**. Choose **Paste** in
+the same menu to insert clipboard text into the focused input. The menu is
+available across the graphical console and application canvases. Text
+selection is supported by terminals, the graphical Nano window, Text Editor
+and desktop filename fields. The Mac clipboard bridge supports up to 4 KiB
+of plain ASCII per paste. Nano, Kilo and Text Editor preserve tabs and line
+breaks. At the shell, these become spaces and Return submits the command.
+**Ctrl+Shift+C** and **Ctrl+Shift+V** also work in the graphical console.
 
 In macOS Terminal, including SSH sessions, use the terminal app's usual
 **Command+C** and **Command+V** shortcuts.
@@ -260,6 +308,28 @@ QEMU provides host OS randomness through a separate virtio-rng device. The port
 and its locked dependency manifest are under `/src/ssh`. Run
 `python3 scripts/test-ssh-out.py` on the Mac to exercise authentication,
 interactive terminal I/O, reboot persistence and host-key rejection in QEMU.
+
+#### Transfer files to and from the Mac
+
+Enable Remote Login on the Mac for your account. From the guest, use the Mac
+username and QEMU host address. SFTP shares the SSH fingerprint records and the
+enrolled GPU20 profile. Quote paths containing spaces.
+
+```text
+sftp xulixin@10.0.2.2
+sftp> get -r Documents/hello hello
+sftp> quit
+tcc hello/main.c -o hello/app
+./hello/app
+sftp xulixin@10.0.2.2
+sftp> put -r hello Documents/hello-from-LixinOS
+sftp> quit
+```
+
+Use `-P PORT` for a custom port. An existing destination directory receives the source under its basename. A download publishes each complete regular file atomically.
+Uploads use a temporary remote file and rename it after closing it. Replacing
+an existing remote file requires the server's OpenSSH POSIX rename extension.
+Transfers currently support files up to 100 MiB and 32 directory levels.
 
 #### GPU20 through a Mac jump host
 
@@ -378,7 +448,7 @@ and is released when the editor exits.
 
 Type `htop` at the guest prompt for a live dashboard. It refreshes once per second. Press `q` to return to the shell. In the QEMU window the last dashboard frame stays in the terminal history. Uptime comes from the ARM virtual counter. Heap usage comes from the allocator. File counts include empty files, directory counts include the root, and content bytes exclude filesystem metadata.
 
-The launcher assigns one vCPU. With a shared build volume it assigns 12 GiB of RAM to Rust or 24 GiB to TCC. The smaller legacy disks use 640 MiB or 1536 MiB respectively. The boot stack is 128 KiB. Up to 16 tasks, including the login shells, share the CPU. The kernel allocates a 128 KiB stack and private translation tables for each new task, and backs each EL0 image with 4 MiB of heap memory on launch. Code is executable and read-only, data is writable and non-executable. Additional user arenas grow in 2 MiB blocks. A synchronous caller waits for its child while other runnable tasks take turns. Exiting releases image memory, and the next continuation reclaims the stack and page tables. A joinable child's PID and exit status remain until collected. The filesystem tree and file contents occupy heap memory while mounted. The kernel alternates between two checksummed disk snapshots, flushing the payload before publishing its header. On boot it loads the newest valid snapshot. The shared disk has two 4 GiB snapshot slots. One slot holds the active filesystem, including a 512-byte header, names, contents, timestamps and version history. Each file can occupy up to 512 MiB. Legacy disks have 192 MiB slots and a 100 MiB file limit. A separate 65 KiB ring at the end keeps the latest 64 shell commands. On first launch with an older disk, the launcher copies valid snapshots and history to a temporary image and atomically replaces the old image after verification. Use `touch --files-from names.txt` to create a batch of files with one path per line and one snapshot commit.
+The launcher assigns one vCPU. With a shared build volume it assigns 12 GiB of RAM to Rust or 24 GiB to TCC. The smaller legacy disks use 640 MiB or 1536 MiB respectively. The boot stack is 128 KiB. Up to 16 tasks, including the login shells, share the CPU. The kernel allocates a 128 KiB stack and private translation tables for each new task, and backs each EL0 image with 4 MiB of heap memory on launch. Code is executable and read-only, data is writable and non-executable. Additional user arenas grow in 2 MiB blocks. A synchronous caller waits for its child while other runnable tasks take turns. Exiting releases image memory, and the next continuation reclaims the stack and page tables. A joinable child's PID and exit status remain until collected. The filesystem tree and file contents occupy heap memory while mounted. The kernel alternates between two checksummed disk snapshots, flushing the payload before publishing its header. On boot it loads the newest valid snapshot. The Rust writer keeps the offset of each unchanged large file in each slot. Warm saves can reuse its aligned sectors. The first saves after boot and changes that move a body may write it in full. The shared disk has two 4 GiB snapshot slots. One slot holds the active filesystem, including a 512-byte header, names, contents, timestamps and version history. Each file can occupy up to 512 MiB. Legacy disks have 192 MiB slots and a 100 MiB file limit. A separate 65 KiB ring at the end keeps the latest 64 shell commands. On first launch with an older disk, the launcher copies valid snapshots and history to a temporary image and atomically replaces the old image after verification. Use `touch --files-from names.txt` to create a batch of files with one path per line and one snapshot commit.
 
 ### Run a C program or MicroPython
 
@@ -541,7 +611,7 @@ tcc /src/gui/text-editor.c -o /bin/text-editor
 desktop
 ```
 
-Click **Calculator** or **Editor** on the desktop. You can also start a
+Click **Calc** for the built-in calculator, or **Editor** for the compiled text editor. Run `calculator` to open the standalone build. You can also start a
 saved LXE1 app with an `.app` filename by clicking it in the desktop file browser. Apps use
 the foreground pane and return to the desktop on close. Saved programs and
 documents persist when you restart with the same disk.
@@ -551,6 +621,13 @@ Calculator accepts mouse and keyboard input. Text Editor opens
 in the main shell. Use **Save** or **Ctrl+S** to save and **Esc** to close.
 It edits up to 32 KiB of ASCII text with LF line endings and confirms before
 discarding unsaved edits.
+
+The [Slint package](User/slint-demo/README.md) provides `slint-demo` and
+`slint-editor FILE`. The applications use the resizable canvas and update
+changed regions. Run them from a QEMU graphics console.
+
+The [Nano-X package](User/nano-x/README.md) provides a separate desktop with a
+file browser. Run `nano-x` to open it or `desktop` to open the LixinOS desktop.
 
 Use `<lixin-gui.h>` for canvas drawing, text, buttons and pointer input.
 Use `<lixin.h>` for `lx_save_file` and other file operations. Run
@@ -785,7 +862,7 @@ git log
 
 `git add .` stages the current directory, including tracked deletions.
 The initial branch is `main`. Commits use the guest clock and the identity
-`LixinOS <user@lixinos.local>`. The guest Git port currently transfers files, including its index and objects, up to 16 KiB. Each command saves
+`LixinOS <user@lixinos.local>`. The Git port transfers working files, index data and objects in 16 KiB chunks. File size is bounded by the guest volume and available memory. Each command saves
 its metadata in one snapshot.
 
 From the project root on the Mac, export into a **new directory**:

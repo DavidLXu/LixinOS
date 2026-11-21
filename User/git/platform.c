@@ -25,15 +25,21 @@ int lx_libgit_init(void) {
     return git_runtime_init(init, sizeof(init) / sizeof(*init)) < 0 ? -1 : 0;
 }
 
-extern char __user_heap_start[], __user_heap_limit[];
+// Git gets its own per-process EL0 arena, including when it runs as a builtin.
 void *_sbrk(ptrdiff_t n) {
-    static char *end = __user_heap_start;
-    if (n < 0 || n > __user_heap_limit - end) {
+    static size_t used;
+    volatile int *length = (volatile int *)0x443d8000;
+    if (n < 0 || (size_t)n > (128u << 20) - used) {
         errno = ENOMEM;
         return (void *)-1;
     }
-    char *old = end;
-    end += n;
+    int saved = *length;
+    *length = used + n;
+    long base = console_call(6, 10);
+    *length = saved;
+    if (base < 0) { errno = ENOMEM; return (void *)-1; }
+    void *old = (void *)(base + used);
+    used += n;
     return old;
 }
 void _exit(int status) { finish(status); }
@@ -42,7 +48,7 @@ void _exit(int status) { finish(status); }
 #include <stdarg.h>
 #include <git2/remote.h>
 
-enum { LX_STAT, LX_LIST, LX_READ, LX_WRITE, LX_MKDIR, LX_REMOVE, LX_RENAME, LX_TIME };
+enum { LX_STAT, LX_LIST, LX_READ, LX_WRITE, LX_MKDIR, LX_REMOVE, LX_RENAME, LX_TIME, LX_PREAD, LX_PWRITE };
 enum { PATH_CAP = 513, FILE_CAP = 16384 };
 typedef struct {
     int length, number;
@@ -246,7 +252,7 @@ int _lseek(int fd, int offset, int whence) {
     long pos = (long)offset + (whence == SEEK_CUR   ? d->offset
                                : whence == SEEK_END ? st.st_size
                                                     : 0);
-    if (pos < 0 || pos > FILE_CAP)
+    if (pos < 0 || pos > INT_MAX || (whence != SEEK_SET && whence != SEEK_CUR && whence != SEEK_END))
         return error(EINVAL);
     return d->offset = (int)pos;
 }
@@ -254,17 +260,21 @@ ssize_t pread(int fd, void *out, size_t n, off_t offset) {
     Descriptor *d = descriptor(fd);
     if (!d)
         return -1;
-    if (offset < 0)
+    if (offset < 0 || offset > INT_MAX || n > INT_MAX - (size_t)offset)
         return error(EINVAL);
-    int size = call(LX_READ, d->path);
-    if (size < 0)
-        return -1;
-    if (offset >= size)
-        return 0;
-    if (n > (size_t)(size - offset))
-        n = size - offset;
-    memcpy(out, msg->bytes + offset, n);
-    return n;
+    size_t done = 0;
+    while (done < n) {
+        int chunk = n - done > FILE_CAP ? FILE_CAP : (int)(n - done);
+        msg->number = offset + done;
+        msg->length = chunk;
+        int got = call(LX_PREAD, d->path);
+        if (got < 0) return done ? (ssize_t)done : -1;
+        if (got > chunk) return error(EIO);
+        memcpy((char *)out + done, msg->bytes, got);
+        done += got;
+        if (got < chunk) break;
+    }
+    return done;
 }
 int _read(int fd, char *out, int n) {
     Descriptor *d = descriptor(fd);
@@ -279,16 +289,18 @@ ssize_t pwrite(int fd, const void *src, size_t n, off_t offset) {
     Descriptor *d = descriptor(fd);
     if (!d)
         return -1;
-    int size = call(LX_READ, d->path);
-    if (size < 0)
-        return -1;
-    if (offset < 0 || offset > FILE_CAP || n > FILE_CAP - (size_t)offset)
+    if (offset < 0 || offset > INT_MAX || n > INT_MAX - (size_t)offset)
         return error(EFBIG);
-    if (offset > size)
-        memset(msg->bytes + size, 0, offset - size);
-    memcpy(msg->bytes + offset, src, n);
-    msg->length = (int)(offset + n) > size ? (int)(offset + n) : size;
-    return call(LX_WRITE, d->path) < 0 ? -1 : (ssize_t)n;
+    size_t done = 0;
+    while (done < n) {
+        int chunk = n - done > FILE_CAP ? FILE_CAP : (int)(n - done);
+        msg->number = offset + done;
+        msg->length = chunk;
+        memcpy(msg->bytes, (const char *)src + done, chunk);
+        if (call(LX_PWRITE, d->path) < 0) return done ? (ssize_t)done : -1;
+        done += chunk;
+    }
+    return done;
 }
 int _write(int fd, const char *s, int n) {
     if (fd == 1 || fd == 2) {

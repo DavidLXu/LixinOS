@@ -64,6 +64,7 @@ static u64 frame_address(unsigned frame) {
     return frame < 16 ? 0x66000000UL + frame * BLOCK
                       : 0x70000000UL + (frame - 16) * BLOCK;
 }
+enum { CANVAS_FIXED = 1, CANVAS_RESIZABLE = 2 };
 enum { GRAPHICS_ARENA, LIBC_ARENA, EXTENDED_ARENA, PROGRAM_ARENA, WIDE_ARENA, ARENAS };
 static const u64 arena_base[ARENAS] = {ARENA, 0x78000000UL, 0xc0000000UL, 0xa0000000UL, 64 * GIB};
 static const unsigned build_blocks[ARENAS] = {64, 320, 512, 256, 2048};
@@ -94,7 +95,7 @@ static void map_heap(unsigned id) {
     }
 }
 static long grow_heap(unsigned kind, u64 size) {
-    unsigned limit = build_volume ? build_blocks[kind] : kind <= EXTENDED_ARENA ? 64 : 0;
+    unsigned limit = build_volume ? build_blocks[kind] : kind <= PROGRAM_ARENA ? 64 : 0;
     if (size > limit * BLOCK)
         return -1;
     struct frame_map *heap = &heaps[bank][kind];
@@ -164,7 +165,7 @@ struct process {
     char edit_path[513];
     struct file original;
     int foreground, nano;
-    unsigned argc, used, canvas, windows;
+    unsigned argc, used, canvas, windows, clipboard_options;
     struct {
         int slot;
         long pid;
@@ -192,6 +193,12 @@ int agent_path_allowed(const char *path, int writing) {
     return !writing && (under(path,"/bin") || under(path,"/lib") || under(path,"/src") ||
         under(path,"/libexec") || under(path,"/proc") || equal(path,"/"));
 }
+u64 process_private_bytes(unsigned slot) {
+    u64 blocks=2;
+    for(unsigned k=0;k<ARENAS;k++) blocks+=heaps[slot][k].count;
+    return blocks*BLOCK;
+}
+const char *process_task_name(unsigned slot) { return processes[slot].executable; }
 static void inherit_scope(struct process *child, struct process *parent) {
     child->env_result = parent->env_result;
     if (child->env_result) memcpy(child->environment,parent->environment,child->env_result-1);
@@ -239,7 +246,11 @@ static int resolve(const char *cwd, const char *path, char out[513]) {
         if (*path) {
             struct file dir;
             out[n] = 0;
-            if (!vfs_lookup(out, &dir) || dir.size != 0xffffffff)
+            // A scoped command must traverse the ancestors of its workspace.
+            // Final lookups and directory listings still enforce the scope.
+            const char *scope = processes[bank].scope;
+            if (!(scope[0] && under(scope, out) && !equal(scope, out)) &&
+                (!vfs_lookup(out, &dir) || dir.size != 0xffffffff))
                 return 0;
         }
     }
@@ -552,14 +563,29 @@ static void close_handle(struct process *p, unsigned i) {
     release_buffer(f->data, f->size);
     f->data = 0;
 }
-int handles_pointer(void) { return processes[bank].canvas; }
+int uses_terminal_pointer(void) {
+    if (processes[bank].background || processes[bank].canvas) return 0;
+    if (popup_terminal()) return 1;
+    /* A preempted window client uses pipes. Its timer tick must leave
+       tablet events for the desktop that owns this pane's canvas. */
+    for (unsigned i = 0; i < BANKS; i++)
+        if (processes[i].pane == process_pane() && processes[i].canvas) return 0;
+    return 1;
+}
+int graphical_shortcuts(void) {
+    if (popup_terminal()) return display_editor_active();
+    for (unsigned i = 0; i < BANKS; ++i)
+        if (processes[i].pane == process_pane() && processes[i].canvas) return 1;
+    return 0;
+}
 int display_busy(void) {
     for (unsigned i = 0; i < BANKS; i++)
-        if (processes[i].canvas)
+        if (processes[i].canvas == CANVAS_FIXED)
             return 1;
     return 0;
 }
 int editing_file(void) { return !!processes[bank].edit_path[0]; }
+int canvas_clipboard_options(void) { return processes[bank].canvas ? processes[bank].clipboard_options : 0; }
 static int readable(u64 address, u64 size) {
     if (address >= USER + BLOCK && address <= UTILITY && size <= UTILITY - address)
         return 1;
@@ -750,7 +776,7 @@ static long exchange_agent_runner(struct process *p, u64 value) {
     return size;
 }
 
-long native_syscall(u64 value, u64 op) {
+static long syscall_service(u64 value, u64 op) {
     struct process *p = &processes[bank];
     char *mail = (char *)UTILITY, path[513];
     unsigned fd = value >> 32, n = (u32)value;
@@ -814,6 +840,8 @@ long native_syscall(u64 value, u64 op) {
         return pid < 0 ? -1 : task_wait(pid);
     }
     case 6:
+        if (value == 10 && *p->git_meta)
+            return grow_heap(LIBC_ARENA, *(unsigned *)0x443d8000UL);
         return git_call(bank, p->git_meta, value);
     case 45:
         return file_operation(bank, p->cwd, value, mail);
@@ -884,6 +912,7 @@ long native_syscall(u64 value, u64 op) {
     case 30:
         return value <= 4096 ? entropy_read((u8 *)mail, value) : -1;
     case 29:
+        if (value == 9) return task_resources((u64 *)mail);
         if (value == 0)
             return net_info(mail);
         if (value == 1)
@@ -940,7 +969,7 @@ long native_syscall(u64 value, u64 op) {
                 ready = 2;
             else
                 return -1;
-            if ((ready & mask) || ((u32)value != 0xffffffff && clock_ticks() - start >= duration))
+            if (task_stopped() || (ready & mask) || ((u32)value != 0xffffffff && clock_ticks() - start >= duration))
                 return ready & mask;
             schedule();
         }
@@ -956,7 +985,7 @@ long native_syscall(u64 value, u64 op) {
             return -1;
         if (p->handles[fd - 3].socket) {
             long sent;
-            while ((sent = socket_io(p->handles[fd - 3].socket - 1, 1, (u8 *)mail, n)) == -2)
+            while ((sent = socket_io(p->handles[fd - 3].socket - 1, 1, (u8 *)mail, n)) == -2 && !task_stopped())
                 schedule();
             return sent;
         }
@@ -1028,7 +1057,7 @@ long native_syscall(u64 value, u64 op) {
         }
         if (fd >= 3 && fd < FD_LIMIT && n <= 4096 && p->handles[fd - 3].socket) {
             long got;
-            while ((got = socket_io(p->handles[fd - 3].socket - 1, 0, (u8 *)mail, n)) == -2)
+            while ((got = socket_io(p->handles[fd - 3].socket - 1, 0, (u8 *)mail, n)) == -2 && !task_stopped())
                 schedule();
             return got;
         }
@@ -1069,7 +1098,17 @@ long native_syscall(u64 value, u64 op) {
     case 33:
         return p->nano && canvas_size() ? editor_input() : -1;
     case 34:
+        if (p->canvas && !p->nano) {
+            if (!value || value > 4096) return -1;
+            clipboard_copy((const u8 *)MAIL, value);
+            return 0;
+        }
+        /* Fall through for the Nano document clipboard. */
     case 35: {
+        if (op == 35 && p->canvas && !p->nano) {
+            if (value == 1) { clipboard_cancel(); return 0; }
+            return value == 0 ? clipboard_take_text((u8 *)MAIL) : -1;
+        }
 
         if (!p->nano || !canvas_size())
             return -1;
@@ -1085,25 +1124,35 @@ long native_syscall(u64 value, u64 op) {
         return console_read(value > 1000 ? 1000 : value);
     case 19: {
         u64 size = canvas_size();
-        if (p->background || p->out || p->capture || p->in || p->input || !size ||
+        unsigned mode = value ? CANVAS_RESIZABLE : CANVAS_FIXED;
+        if (!popup_tab_input() || value > 1 || (p->canvas && p->canvas != mode) ||
+            p->background || p->out || p->capture || p->in || p->input || !size ||
             grow_heap(GRAPHICS_ARENA, ((size & 65535) * (size >> 16) + 1024) * 4) < 0)
             return 0;
-        p->canvas = 1;
-        return size;
+        if (!p->canvas && value) {
+            for (unsigned i = 0; i < BANKS; i++)
+                if (processes[i].pane == p->pane && processes[i].canvas)
+                    return 0;
+        }
+        if (!p->canvas && process_pane() == focused_pane()) close_edit_menu();
+        p->canvas = mode;
+        return size | (value ? (u64)canvas_generation() << 32 : 0);
     }
     case 20:
-        return p->canvas
-                   ? present((const u64 *)MAIL, ARENA, heaps[bank][GRAPHICS_ARENA].count * BLOCK)
+        return p->canvas && !!value == (p->canvas == CANVAS_RESIZABLE)
+                   ? present((const u64 *)MAIL, ARENA, heaps[bank][GRAPHICS_ARENA].count * BLOCK, value)
                    : -1;
     case 21:
-        return p->canvas ? canvas_pointer() : -1;
+        if (!p->canvas) return -1;
+        p->clipboard_options = value & 5;
+        return canvas_pointer(value);
     case 36:
         return *(volatile u32 *)0x09010000;
     case 43: {
         if (value > 3600000)
             return -1;
         u64 start = clock_ticks(), wait = clock_hz() * value / 1000;
-        while (clock_ticks() - start < wait)
+        while (!task_stopped() && clock_ticks() - start < wait)
             idle_slice();
         return 0;
     }
@@ -1214,6 +1263,14 @@ long native_syscall(u64 value, u64 op) {
         sync_image();
         return 0;
     }
+    case 57: task_own_interrupt_key(); return 0;
+    case 56:
+        if (value == ~0UL) { p->env_result = 0; return 0; }
+        if (value > sizeof(p->environment) || (value && ((char *)MAIL)[value-1])) return -1;
+        memcpy(p->environment,(char *)MAIL,value);
+        p->env_result = value+1;
+        return 0;
+    case 55: return task_stop_child(value);
     case 54: return task_pid();
     case 53:
         if (p->env_result) memcpy((void *)MAIL,p->environment,p->env_result-1);
@@ -1256,7 +1313,7 @@ static int load_elf(struct file f, u64 code_end, u64 data_end) {
         if (!code && le32(ph + 4) != 6)
             return 0;
         u64 lo = code ? USER : USER + BLOCK, hi = code ? code_end : data_end;
-        if (build_volume && base >= arena_base[PROGRAM_ARENA] && base < 3 * GIB) {
+        if (base >= arena_base[PROGRAM_ARENA] && base < 3 * GIB) {
             u64 where = base - arena_base[PROGRAM_ARENA];
             if (size > mem || start > f.size || size > f.size - start || where > 256 * BLOCK ||
                 mem > 256 * BLOCK - where || (where % BLOCK) || !mem ||
@@ -1287,30 +1344,9 @@ static int load_elf(struct file f, u64 code_end, u64 data_end) {
     return entry;
 }
 
-/* The desktop yields with a mailbox action after saving its EL0 continuation. */
-static long desktop_child(struct process *p) {
-    int action = *(int *)MAIL;
-    const char *request = (const char *)(MAIL + 8);
-    if (length(request, 513) > 512)
-        return -1;
-    if (action > 0) {
-        unsigned i = action - 1;
-        if (i >= p->windows)
-            return -1;
-        int slot = p->sessions[i].slot;
-        if (!popup_show(slot))
-            return -1;
-        task_resume(slot);
-        long status = task_wait(p->sessions[i].pid);
-        popup_hide(slot, status == -2);
-        if (status != -2) {
-            memmove(&p->sessions[i], &p->sessions[i + 1],
-                    (p->windows - i - 1) * sizeof(p->sessions[0]));
-            p->windows--;
-        }
-        return status == -2 ? 0 : status;
-    }
-    const char *image = action == -2   ? request
+static long start_desktop_child(struct process *p, int action, const char *request, int *child_slot) {
+    const char *image = action == -3   ? "/bin/text-editor"
+                        : action == -2 ? request
                         : action == -1 ? "/bin/nano"
                         : action == 0  ? "/bin/bash"
                                        : 0;
@@ -1319,33 +1355,131 @@ static long desktop_child(struct process *p) {
     struct file f;
     if (!vfs_lookup(p->path, &f))
         return -1;
-    if (action == -2 && !magic(f, "LXE1", 4) && !equal(p->path, "/bin/links"))
+    if ((action == -2 || action == -3) && !magic(f, "LXE1", 4) && !equal(p->path, "/bin/links"))
         return -1;
     char *arg = add_text(p->args, p->path) + 1;
     p->argc = 1;
-    if (action == -1 || equal(p->path, "/bin/links")) {
-        arg = add_text(arg, action == -1 ? request : "-g") + 1;
+    if (action == -1 || action == -3 || equal(p->path, "/bin/links")) {
+        arg = add_text(arg, action == -2 ? "-g" : request) + 1;
         p->argc++;
     }
     p->used = arg - p->args;
     int slot = task_slot();
-    int popup = action != -2;
+    int popup = action != -2 && action != -3;
     u64 canvas = canvas_size();
     unsigned tw = ((unsigned *)MAIL)[1];
     if (slot < 0 || (popup && (!readable(ARENA, (canvas & 65535) * 44 * 4UL) ||
                                !popup_open(slot, tw, (const u32 *)ARENA, action == -1))))
         return -1;
+    if (action == 0) popup_mark_tab(slot);
     long pid = spawn(p, 8);
-    if (pid >= 0 && action == -1)
-        processes[slot].start_flags = 16;
-    long status = pid < 0 ? -1 : task_wait(pid);
-    if (popup)
-        popup_hide(slot, status == -2);
-    if (status == -2) {
-        p->sessions[p->windows].slot = slot;
-        p->sessions[p->windows++].pid = pid;
-        return 0;
+    if (pid < 0) {
+        if (popup) popup_hide(slot, 0);
+        return -1;
     }
+    if (action == -1) processes[slot].start_flags = 16;
+    *child_slot = slot;
+    return pid;
+}
+
+static void remove_tab(struct process *p, unsigned index) {
+    popup_hide(p->sessions[index].slot, 0);
+    p->windows--;
+    memmove(&p->sessions[index], &p->sessions[index + 1],
+            (p->windows - index) * sizeof(p->sessions[0]));
+}
+
+static int add_tab(struct process *p, int previous) {
+    if (p->windows >= TERMINAL_TABS) return -1;
+    int slot;
+    long pid = start_desktop_child(p, 0, "", &slot);
+    if (pid < 0) return -1;
+    if (previous >= 0) popup_position(slot, previous);
+    unsigned index = p->windows++;
+    p->sessions[index].slot = slot;
+    p->sessions[index].pid = pid;
+    return index;
+}
+
+static long terminal_tabs(struct process *p, int action) {
+    for (unsigned i = 0; i < p->windows;) {
+        if (task_wait_mode(p->sessions[i].pid, 1) == -2) i++;
+        else remove_tab(p, i);
+    }
+    int active;
+    if (!action) {
+        active = add_tab(p, -1);
+    } else if (p->windows) {
+        active = action > (int)p->windows ? p->windows - 1 : action - 1;
+        if (!popup_show(p->sessions[active].slot)) return -1;
+    } else return -1;
+    if (active < 0) return -1;
+    popup_tab_bar(active, p->windows);
+    for (;;) {
+        display_idle_pointer();
+        int click = popup_tab_action();
+        int slot = p->sessions[active].slot;
+        u64 pid = p->sessions[active].pid;
+        long status = task_wait_mode(pid, 1);
+        if (status != -2 || click == TAB_CLOSE) {
+            if (status == -2) {
+                task_stop_child(pid);
+                task_wait(pid);
+            }
+            popup_hide(slot, 1);
+            if (p->windows > 1) {
+                unsigned next = active == (int)p->windows - 1 ? active - 1 : active + 1;
+                popup_position(p->sessions[next].slot, slot);
+            }
+            remove_tab(p, active);
+            if (!p->windows) return 0;
+            if (active >= (int)p->windows) active = p->windows - 1;
+            if (!popup_show(p->sessions[active].slot)) return -1;
+            popup_tab_bar(active, p->windows);
+        } else if (click == TAB_HIDE) {
+            popup_hide(slot, 1);
+            return 0;
+        } else if (click == TAB_NEW || (click > 0 && click != active + 1)) {
+            popup_hide(slot, 1);
+            if (click == TAB_NEW) {
+                int new_tab = add_tab(p, slot);
+                if (new_tab >= 0) {
+                    active = new_tab;
+                } else if (!popup_show(slot)) return -1;
+            } else {
+                active = click - 1;
+                int next = p->sessions[active].slot;
+                popup_position(next, slot);
+                if (!popup_show(next)) return -1;
+            }
+            popup_tab_bar(active, p->windows);
+        } else {
+            unsigned count = p->windows;
+            for (unsigned i = 0; i < p->windows;) {
+                if ((int)i == active || task_wait_mode(p->sessions[i].pid, 1) == -2) {
+                    i++;
+                } else {
+                    remove_tab(p, i);
+                    if ((int)i < active) active--;
+                }
+            }
+            if (count != p->windows) popup_tab_bar(active, p->windows);
+        }
+        idle_slice();
+    }
+}
+
+/* The desktop yields with a mailbox action after saving its EL0 continuation. */
+static long desktop_child(struct process *p) {
+    int action = *(int *)MAIL;
+    const char *request = (const char *)(MAIL + 8);
+    if (length(request, 513) > 512) return -1;
+    if (action >= 0) return terminal_tabs(p, action);
+    int slot;
+    long pid = start_desktop_child(p, action, request, &slot);
+    if (pid < 0) return -1;
+    long status = task_wait(pid);
+    if (action == -1) popup_hide(slot, 0);
     return status;
 }
 #include "agent-service.h"
@@ -1371,9 +1505,18 @@ static long launch(const char *name, const char *args, unsigned n, unsigned argc
             under(active->cwd,"/libexec") || proc_path(active->cwd)) return 1;
         unsigned skip=length(args,n)+1;
         if (skip>=n) return 1;
+        const char *command = args + skip;
+        unsigned command_size = n - skip;
+        static const char desktop_check[] = "/bin/python3\0-I\0/src/agent/desktop.py\0check";
+        static const char reuse[] = "--reuse";
+        int check = ((argc == 5 && command_size == sizeof(desktop_check)) ||
+                     (argc == 6 && command_size == sizeof(desktop_check) + sizeof(reuse) &&
+                      !memcmp(command + sizeof(desktop_check), reuse, sizeof(reuse)))) &&
+                    !memcmp(command, desktop_check, sizeof(desktop_check));
         active->agent_child=0;
         memcpy(active->scope,active->cwd,length(active->cwd,513)+1);
-        active->command_deadline=clock_ticks()+5*clock_hz();
+        // Desktop checks compile, run the regression suite, and save the candidate.
+        active->command_deadline=clock_ticks()+(check ? 60 : 5)*clock_hz();
         char program[513];
         if (!resolve(active->cwd,args+skip,program)) return 1;
         return launch(program,args+skip,n-skip,argc-1,0);
@@ -1643,11 +1786,19 @@ static long spawn(struct process *parent, unsigned flags) {
         p->capture->references++;
     }
     parent->used = parent->argc = 0;
-    return task_create(slot, !!(flags & 4));
+    long pid = task_create(slot, !!(flags & 4));
+    if (pid > 0 && !p->background && !p->scope[0]) task_job(slot);
+    return pid;
 fail:
     redirect_close(p->capture, 0);
     redirect_close(p->input, 0);
     return -1;
+}
+
+long native_syscall(u64 value, u64 op) {
+    long result = syscall_service(value,op);
+    int stop = task_stopped();
+    return stop == 137 ? -4094 : stop == 130 ? -4095 : result;
 }
 
 long run_task(unsigned slot) {
@@ -1657,11 +1808,9 @@ long run_task(unsigned slot) {
     while (p->windows) {
         unsigned i = --p->windows;
         int child = p->sessions[i].slot;
-        popup_hide(child, 0);
-        /* Unwind a minimized shell through the same EOF path as window close. */
-        processes[child].background = 1;
-        task_resume(child);
+        task_stop_child(p->sessions[i].pid);
         task_wait(p->sessions[i].pid);
+        popup_hide(child, 0);
     }
     batch_abort(slot);
     release_buffer(p->original.data, p->original.size);
@@ -1680,8 +1829,10 @@ long run_task(unsigned slot) {
         while (heap->count)
             heap_used[heap->frames[--heap->count]] = 0;
     }
-    if (p->canvas)
+    if (p->canvas) {
+        if (process_pane() == focused_pane()) close_edit_menu();
         display_restore();
+    }
     p->canvas = p->foreground = 0;
     return status;
 }

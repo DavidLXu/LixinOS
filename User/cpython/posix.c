@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <stddef.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdint.h>
@@ -392,6 +393,9 @@ long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
     case SYS_exit_group:
         finish(a);
     case SYS_wait4: return wait_child(a,(int *)b,c);
+    case SYS_kill:
+        if (a <= 0 || b != SIGKILL) return -ENOTSUP;
+        return console_call(55, a) < 0 ? -ESRCH : 0;
     case SYS_pipe2: {
         if (b & ~(O_CLOEXEC|O_NONBLOCK)) return -EINVAL;
         long pair = console_call(49,0);
@@ -641,7 +645,7 @@ long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
         return lx_munmap(a, b);
     case SYS_brk:
         return lx_brk(a);
-    case SYS_futex: return lx_futex((int *)a, b, c, (void *)d);
+    case SYS_futex: return lx_futex((int *)a, b, c, (void *)d, (int *)e, f);
     case SYS_sched_yield: lx_schedule(); return 0;
     case SYS_rt_sigprocmask: return lx_sigmask(a, (void *)b, (void *)c);
     case SYS_rt_sigaction: {

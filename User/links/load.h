@@ -13,3 +13,6 @@ const char *load_page(char address[ADDRESS_LIMIT], struct page_source *out);
 
 const char *load_resource(char address[ADDRESS_LIMIT],const char *parent,struct page_source *out);
 const char *fetch_same_origin(const char *base, const char *ref, struct page_source *out);
+
+/* One HTTP(S) GET. The caller frees out->bytes, including on error. */
+const char *lx_http_get(const char *address, struct page_source *out, char *redirect, int credentials);

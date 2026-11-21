@@ -11,16 +11,22 @@ const LIMIT: usize = 4096;
 pub const COPY: u8 = 0xfd;
 pub const PASTE: u8 = 0xfc;
 
-struct Paste {
+#[derive(Clone, Copy)]
+struct Target {
     pid: usize,
+    editor: bool,
     multiline: bool,
+    block: bool,
+}
+
+struct Paste {
+    target: Target,
     bytes: alloc::vec::IntoIter<u8>,
 }
 
 struct Request {
     id: u64,
-    pid: usize,
-    multiline: bool,
+    target: Target,
     deadline: u64,
 }
 
@@ -85,30 +91,40 @@ pub fn copy_document(bytes: Vec<u8>) {
     }
 }
 
-fn prepare(bytes: &[u8], pid: usize, multiline: bool) -> Paste {
+fn prepare(bytes: &[u8], target: Target) -> Paste {
+    let bytes = if target.block { &bytes[..bytes.len().min(LIMIT)] } else { bytes };
     let mut normalized = Vec::with_capacity(bytes.len());
     let mut previous_cr = false;
     for &byte in bytes {
         match byte {
             b'\n' if previous_cr => (),
-            b'\r' | b'\n' => normalized.push(if multiline { b'\r' } else { b' ' }),
-            b'\t' => normalized.push(if multiline { b'\t' } else { b' ' }),
+            b'\r' | b'\n' => normalized.push(if target.block { b'\n' } else if target.multiline { b'\r' } else { b' ' }),
+            b'\t' => normalized.push(if target.block || target.multiline { b'\t' } else { b' ' }),
             32..=126 => normalized.push(byte),
+            128..=255 if target.block => normalized.push(byte),
             _ => (),
         }
         previous_cr = byte == b'\r';
     }
     Paste {
-        pid,
-        multiline,
+        target,
         bytes: normalized.into_iter(),
     }
 }
 
 pub fn paste() {
+    let options = crate::utility::clipboard_options() | u64::from(crate::foreground::editing());
+    paste_with_options(options);
+}
+
+pub fn paste_with_options(options: u64) {
     let clipboard = unsafe { &mut *SLOT.0.get() };
-    let pid = crate::scheduler::pid();
-    let multiline = crate::foreground::editing();
+    let target = Target {
+        pid: crate::scheduler::pid(),
+        editor: crate::foreground::editing(),
+        multiline: options & 1 != 0,
+        block: options & 4 != 0,
+    };
     clipboard.ready = None;
     clipboard.request = None;
     if let Some(host) = &mut clipboard.host {
@@ -120,14 +136,24 @@ pub fn paste() {
         {
             clipboard.request = Some(Request {
                 id,
-                pid,
-                multiline,
+                target,
                 deadline: monitor::ticks() + monitor::seconds_to_ticks(3),
             });
             return;
         }
     }
-    clipboard.ready = Some(prepare(&clipboard.local, pid, multiline));
+    clipboard.ready = Some(prepare(&clipboard.local, target));
+}
+
+pub fn cancel_paste() {
+    let clipboard = unsafe { &mut *SLOT.0.get() };
+    let pid = crate::scheduler::pid();
+    if clipboard.request.as_ref().is_some_and(|r| r.target.pid == pid) {
+        clipboard.request = None;
+    }
+    if clipboard.ready.as_ref().is_some_and(|p| p.target.pid == pid) {
+        clipboard.ready = None;
+    }
 }
 
 fn decode(field: &[u8]) -> Option<Vec<u8>> {
@@ -141,8 +167,7 @@ fn decode(field: &[u8]) -> Option<Vec<u8>> {
         .collect()
 }
 
-pub fn input() -> Option<u8> {
-    let clipboard = unsafe { &mut *SLOT.0.get() };
+fn poll(clipboard: &mut Clipboard) {
     if let Some(host) = &mut clipboard.host {
         for _ in 0..512 {
             let Ok(Some(byte)) = host.recv(true) else {
@@ -181,7 +206,7 @@ pub fn input() -> Option<u8> {
                         .is_some_and(|request| request.id == id)
                     {
                         let request = clipboard.request.take().unwrap();
-                        clipboard.ready = Some(prepare(&bytes, request.pid, request.multiline));
+                        clipboard.ready = Some(prepare(&bytes, request.target));
                     }
                 }
             }
@@ -195,13 +220,38 @@ pub fn input() -> Option<u8> {
         .is_some_and(|request| monitor::ticks() >= request.deadline)
     {
         let request = clipboard.request.take().unwrap();
-        clipboard.ready = Some(prepare(&clipboard.local, request.pid, request.multiline));
+        clipboard.ready = Some(prepare(&clipboard.local, request.target));
     }
-    let paste = clipboard.ready.as_mut()?;
-    if paste.pid != crate::scheduler::pid() {
+}
+
+pub fn take_text() -> Option<Vec<u8>> {
+    let clipboard = unsafe { &mut *SLOT.0.get() };
+    poll(clipboard);
+    let paste = clipboard.ready.as_ref()?;
+    if paste.target.pid != crate::scheduler::pid() || !paste.target.block {
         return None;
     }
-    if paste.multiline != crate::foreground::editing() {
+    let mut bytes: Vec<u8> = clipboard.ready.take()?.bytes.collect();
+    if let Err(error) = core::str::from_utf8(&bytes) {
+        if error.error_len().is_some() {
+            return None;
+        }
+        bytes.truncate(error.valid_up_to());
+    }
+    Some(bytes)
+}
+
+pub fn input() -> Option<u8> {
+    let clipboard = unsafe { &mut *SLOT.0.get() };
+    poll(clipboard);
+    let paste = clipboard.ready.as_mut()?;
+    if paste.target.pid != crate::scheduler::pid() {
+        return None;
+    }
+    if paste.target.block {
+        return None;
+    }
+    if paste.target.editor != crate::foreground::editing() {
         clipboard.ready = None;
         return None;
     }

@@ -10,6 +10,7 @@ here = Path(__file__).resolve().parent
 harness = runpy.run_path(str(here / "test-panes.py"))
 parser = argparse.ArgumentParser()
 parser.add_argument("--screenshots", type=Path)
+parser.add_argument("--workspace-only", action="store_true", help="exercise the three managed windows")
 parser.add_argument("--split", action="store_true")
 parser.add_argument("--guest-build", action="store_true")
 args = parser.parse_args()
@@ -31,8 +32,11 @@ def exercise(guest, control, directory):
     screen_height = 1408
     pane_width = (screen_width-22)//4 if args.split else screen_width//2
     pane_height = (screen_height-44)//2
-    panel_width = min(pane_width-32, 600)
-    left, top = (pane_width-panel_width)//2, (pane_height-391)//2
+    dock_step = min(82, (pane_height-48)//8)
+    terminal_label_y = 8 + 3*dock_step + min(41, dock_step-21)
+    panel_width = min(pane_width-88, 600)
+    side = 112 if panel_width >= 540 else 0
+    left, top = 76+(pane_width-76-panel_width)//2, (pane_height-391)//2
     window_width = min(pane_width//11-8,76)*11+12
     wx, wy = (pane_width-window_width)//2,(pane_height-(21*22+44+6))//2
     atlas = (here.parent / "Kernel/target/user-build/desktop.gray").read_bytes()
@@ -124,43 +128,106 @@ def exercise(guest, control, directory):
     prompt = harness["serial"]["SHELL"]
     if args.split:
         guest.until(prompt)
-    check_scrollback(0,0)
+    if not args.workspace_only:
+        check_scrollback(0,0)
     guest.expect(b"mkdir demo\r", prompt)
+    if not args.guest_build:
+        guest.expect(b"echo '<title>Desktop test</title><p>Hello LixinOS</p>' > /desktop-test.html\r", prompt)
     if args.guest_build:
         guest.expect(b"tcc /src/tinycc/bootstrap.c -o /bin/tcc-new\r", prompt)
         guest.expect(b"/bin/tcc-new -I/src/tinycc/sdk /src/desktop/desktop.c -o /bin/desktop\r", prompt)
         guest.expect(b"echo $?\r", prompt, b"\n0\n")
     guest.send(b"desktop\r")
-    wait(lambda p: matches(p,40,69,"文件",True), "desktop")
+    wait(lambda p: matches(p,15,49,"Files",True), "desktop")
+    background=capture()
+    def wallpaper(y): return background(pane_width-1,y)
+    # Keep real app state across focus changes, resizes and minimization.
+    if not args.guest_build and not args.split:
+        cx = 76+(pane_width-76-376)//2
+        cy = (pane_height-378)//2
+        bw = min(850,pane_width-88)
+        bx, by = 76+(pane_width-76-bw)//2, (pane_height-540)//2
+        click(38,35)
+        wait(lambda p: matches(p,left+40,top+11,"/"))
+        click(left+panel_width-53,top+22)
+        wait(lambda p: matches(p,116,11,"/"))
+        click(pane_width-53,22)
+        wait(lambda p: matches(p,left+40,top+11,"/"))
+        click(38,110)
+        wait(lambda p: matches(p,bx+14,by+11,"Links 2.30"), "browser-home")
+        guest.send(b"g/desktop-test.html\r")
+        wait(lambda p: matches(p,bx+14,by+11,"Desktop test"), "browser-page")
+        click(38,192)
+        wait(lambda p: matches(p,cx+14,cy+11,"Calculator"))
+        guest.send(b"c6*7=")
+        result = lambda p,x,y: matches(p,x+25,y+59,"42",True)
+        wait(lambda p: result(p,cx,cy))
+        # Move the calculator to the right and browser to the upper left.
+        dx=pane_width-376-cx-12
+        drag(cx+100,cy+20,dx,70)
+        cx,cy=cx+dx,cy+70
+        wait(lambda p: result(p,cx,cy))
+        drag(cx+372,cy+374,-32,-30)
+        wait(lambda p: result(p,cx,cy) and p(cx+339,cy+344).hex()=="87938e")
+        click(cx+344-85,cy+22)
+        wait(lambda p: not result(p,cx,cy))
+        drag(bx+100,by+20,80-bx,16-by)
+        point(38,110)
+        wait(lambda p: matches(p,94,27,"Desktop test"))
+        click(38,35)
+        drag(left+100,top+20,110-left,pane_height-391-top)
+        wait(lambda p: matches(p,150,pane_height-391+11,"/"))
+        click(38,192)
+        wait(lambda p: result(p,cx,cy) and matches(p,94,27,"Desktop test") and
+             matches(p,150,pane_height-391+11,"/"), "workspace")
+        click(cx+344-21,cy+22)
+        wait(lambda p: not result(p,cx,cy))
+        click(38,110)
+        wait(lambda p: not matches(p,150,pane_height-391+11,"/"))
+        click(80+bw-21,16+22)
+        wait(lambda p: matches(p,150,pane_height-391+11,"/"))
+        guest.send(b"\x1b")
+        guest.until(prompt)
+        if args.workspace_only:
+            guest.send(b"shutdown\r")
+            assert guest.vm.wait(timeout=10)==0
+            return
+        guest.send(b"desktop\r")
+        wait(lambda p: matches(p,15,49,"Files",True) and
+             p(120,pane_height-380)==wallpaper(pane_height-380))
     point(160,110)
-    wait(lambda p: p(162,116) == b"\xff\xff\xff")
-    click(58,45)
+    outline, fill = bytes.fromhex("1b2532"), bytes.fromhex("f7fbff")
+    wait(lambda p: p(160,110) == outline and p(162,116) == fill)
+    click(38,35)
     def demo_row(p):
-        return next((i for i in range(9) if matches(p,left+42,top+83+30*i,"demo")), None)
+        return next((i for i in range(9) if matches(p,left+side+42,top+83+30*i,"demo")), None)
     root = wait(lambda p: matches(p,left+40,top+11,"/") and demo_row(p) is not None, "files")
     drag(left+150,top+20,26,47)
     left, top = left+26, top+47
     root = wait(lambda p: matches(p,left+40,top+11,"/") and demo_row(p) is not None)
     # Drag past the top-left limit, then back; controls must follow the title.
     drag(left+150,top+20,1-(left+150),1-(top+20))
-    wait(lambda p: matches(p,40,11,"/"))
-    drag(150,20,left,top)
+    wait(lambda p: matches(p,116,11,"/"))
+    drag(226,20,left-76,top)
     root = wait(lambda p: matches(p,left+40,top+11,"/") and demo_row(p) is not None)
-    click(left+66,top+95+30*demo_row(root))
-    wait(lambda p: matches(p,left+40,top+11,"/demo") and matches(p,left+16,top+90,"空目录"), "demo")
-    click(left+panel_width-70,top+22)
+    click(left+side+66,top+95+30*demo_row(root))
+    wait(lambda p: p(left+side+100,top+95+30*demo_row(root)).hex() == "cde5df")
+    guest.send(b"\r")
+    wait(lambda p: matches(p,left+40,top+11,"/demo") and matches(p,left+side+16,top+90,"空目录"), "demo")
+    click(left+panel_width-140,top+22)
     wait(lambda p: demo_row(p) is not None, "parent")
     click(left+panel_width-20,top+22)
-    wait(lambda p: p(left+panel_width-110,top+4) == bytes.fromhex("26494c"))
-    click(145,45)
-    dialog_x = (pane_width-440)//2
-    wait(lambda p: matches(p,dialog_x+14,183,"文本编辑器"))
-    drag(dialog_x+120,192,-38,27)
-    wait(lambda p: matches(p,dialog_x-38+14,210,"文本编辑器"))
-    click(dialog_x-38+419,172+27+22)
-    wait(lambda p: p(dialog_x+130,220)==bytes.fromhex("26494c"))
-    click(145,45)
-    wait(lambda p: matches(p,dialog_x-38+14,210,"文本编辑器"))
+    wait(lambda p: p(left+panel_width-110,top+4) == wallpaper(top+4))
+    click(38,8+4*82+20)
+    dialog_x = 76+(pane_width-76-440)//2
+    dialog_y = (pane_height-120)//2
+    wait(lambda p: matches(p,dialog_x+14,dialog_y+11,"文本编辑器"))
+    drag(dialog_x+120,dialog_y+20,-38,27)
+    wait(lambda p: matches(p,dialog_x-38+14,dialog_y+38,"文本编辑器"))
+    click(dialog_x-38+419,dialog_y+27+22)
+    wait(lambda p: p(dialog_x+130,220)==wallpaper(220))
+    click(38,8+4*82+20)
+    wait(lambda p: matches(p,dialog_x-38+14,dialog_y+38,"文本编辑器"))
     guest.send(b"demo/note.txt\r")
     guest.until(b"^Q Exit")
     guest.send(b"hello from nano")
@@ -197,11 +264,15 @@ def exercise(guest, control, directory):
     guest.until(b"Save changes?")
     guest.send(b"y")
     wait(lambda p: not matches(p,ex+14,ey+11,"文本编辑器"))
-    click(58,45)
+    click(38,35)
     root = wait(lambda p: demo_row(p) is not None)
-    click(left+66,top+95+30*demo_row(root))
-    wait(lambda p: matches(p,left+42,top+83,"note.txt"))
-    click(left+170,top+95)
+    click(left+side+66,top+95+30*demo_row(root))
+    wait(lambda p: p(left+side+100,top+95+30*demo_row(root)).hex() == "cde5df")
+    guest.send(b"\r")
+    wait(lambda p: matches(p,left+side+42,top+83,"note.txt"))
+    click(left+side+170,top+95)
+    wait(lambda p: p(left+side+120,top+95).hex() == "cde5df")
+    guest.send(b"\r")
     guest.until(b"hello from nano")
     # Copy in the reopened document, click a different line and paste using
     # the toolbar. Saving and reopening through the shell checks exact bytes.
@@ -217,23 +288,26 @@ def exercise(guest, control, directory):
     guest.send(b"\x13")
     guest.until(b"Saved")
     guest.send(b"\x11")
-    wait(lambda p: matches(p,left+42,top+83,"note.txt") and not matches(p,wx+14,wy+11,"文本编辑器"))
+    wait(lambda p: matches(p,left+side+42,top+83,"note.txt") and not matches(p,wx+14,wy+11,"文本编辑器"))
     click(left+panel_width-20,top+22)
-    desktop = wait(lambda p: matches(p,222,69,"终端",True) and
-                   p(left+panel_width-110,top+4) == bytes.fromhex("26494c"))
-    click(239,45)
+    desktop = wait(lambda p: matches(p,2,terminal_label_y,"Terminal",True) and
+                   p(left+panel_width-110,top+4) == wallpaper(top+4))
+    click(38,275)
     guest.until(prompt)
     wait(lambda p: matches(p,wx+14,wy+11,"终端"), "terminal")
     check_scrollback(wx+6,wy+44)
     guest.expect(b"cd /demo\r", b"lixin:/demo$ ")
+    pointer_x, pointer_y = wx+130, wy+20
+    point(pointer_x, pointer_y)
+    wait(lambda p: p(pointer_x, pointer_y) == outline)
     guest.send(b"cat no")
     guest.until(b"cat no")
-    point(wx+130,wy+20)
-    before = wait(lambda p: matches(p,wx+14,wy+11,"终端"))
+    before = wait(lambda p: matches(p,wx+14,wy+11,"终端") and
+                  p(pointer_x, pointer_y) == outline)
     # One continuous grab, reversing direction across both axes. Sample the
     # old footprint and the translated title, border and body at each stop.
     samples = [(x,y) for y in range(0,512,7) for x in range(0,window_width,7)
-               if not (115 <= x <= 155 and 5 <= y <= 50)]
+               if not (130 <= x < 146 and 20 <= y < 41)]
     qmp("input-send-event", events=[{"type":"btn","data":{"button":"left","down":True}}])
     for dx,dy in ((1,0),(-1,0),(0,-1),(-18,-23),(23,40)):
         tx,ty=wx+dx,wy+dy
@@ -251,27 +325,26 @@ def exercise(guest, control, directory):
         wait(moved, f"terminal-drag-{dx}-{dy}")
     qmp("input-send-event", events=[{"type":"btn","data":{"button":"left","down":False}}])
     click(tx+window_width-54,ty+22)
-    wait(lambda p: matches(p,382,33,"1",True))
-    click(239,45)
+    wait(lambda p: matches(p,32,pane_height-35,"1",True))
+    click(38,275)
     guest.until(prompt)
     guest.expect(b"pwd\r",prompt,b"\n/\n")
     qmp("human-monitor-command", **{"command-line": "sendkey ctrl-bracket_right 40"})
-    wait(lambda p: matches(p,382,33,"2",True))
-    click(304,46)
-    wait(lambda p: matches(p,382,33,"1",True))
-    click(342,46)
+    wait(lambda p: matches(p,32,pane_height-35,"2",True))
+    click(12,pane_height-22)
+    wait(lambda p: matches(p,32,pane_height-35,"1",True))
+    click(38,pane_height-22)
     wait(lambda p: matches(p,tx+14,ty+11,"终端"))
     guest.expect(b"te.txt\r",b"lixin:/demo$ ",b"hello from nano\nxy!zhello")
     wait(lambda p: matches(p,tx+14,ty+11,"终端"), "restored-terminal")
     click(tx+window_width-21,ty+22)
-    wait(lambda p: matches(p,382,33,"1",True))
-    click(342,46)
-    wait(lambda p: matches(p,wx+14,wy+11,"终端"))
+    # Closing the active tab shows its remaining neighbor at the same position.
+    wait(lambda p: matches(p,tx+14,ty+11,"终端") and p(tx+165,ty+9).hex()=="395772")
     guest.send(b"python\r")
     guest.until(b">>> ")
-    click(wx+window_width-21,wy+22)
-    wait(lambda p: matches(p,222,69,"终端",True) and p(295,30)==bytes.fromhex("26494c"))
-    click(58,45)
+    click(tx+window_width-21,ty+22)
+    wait(lambda p: matches(p,2,terminal_label_y,"Terminal",True) and p(295,30)==wallpaper(30))
+    click(38,35)
     wait(lambda p: demo_row(p) is not None)
     qmp("human-monitor-command", **{"command-line": "sendkey esc 40"})
     guest.until(prompt)
@@ -281,4 +354,7 @@ def exercise(guest, control, directory):
 
 
 harness["test"](exercise, "--split" if args.split else "--window")
-print("Verified window dragging and close controls, editor save/cancel, file browsing, Bash minimize/restore and closing a running REPL.")
+if args.workspace_only:
+    print("Verified guest browser navigation, file window maximize/restore, calculator resize and result across dock switches.")
+else:
+    print("Verified window dragging and close controls, editor save/cancel, file browsing, Bash minimize/restore and closing a running REPL.")

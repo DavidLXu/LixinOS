@@ -17,6 +17,7 @@ type Entry = Option<Vec<u8>>;
 type Changes = BTreeMap<String, Option<Entry>>;
 struct Session {
     volume: Rc<RefCell<Volume>>,
+    heap: user::UserArena,
     metadata: String,
     generation: u64,
     changes: Changes,
@@ -35,6 +36,7 @@ pub fn run(volume: Rc<RefCell<Volume>>, root: &str, args: &[String]) -> Result<(
     let bank = user::bank();
     unsafe {
         (*SLOTS.0.get())[bank] = Some(Session {
+            heap: user::UserArena::for_browser_heap(),
             volume,
             metadata: format!("{}/.git", root.trim_end_matches('/')),
             generation,
@@ -137,6 +139,10 @@ fn operation(s: &mut Session, m: &mut Message, op: u64) -> Result<i64, i64> {
     if op == 7 {
         return Ok(unsafe { core::ptr::read_volatile(0x0901_0000 as *const u32) } as i64);
     }
+    if op == 10 {
+        s.heap.grow(m.length as usize).map_err(|_| 12i64)?;
+        return Ok(user::WEB_HEAP_BASE as i64);
+    }
     let p = path(&m.path)?;
     let volume = s.volume.borrow();
     let files = &volume.files;
@@ -151,7 +157,7 @@ fn operation(s: &mut Session, m: &mut Message, op: u64) -> Result<i64, i64> {
         let dir = key.rsplit_once('/').unwrap().0;
         lookup(files, changes, if dir.is_empty() { "/" } else { dir }) == Some(&None)
     };
-    if (3..=6).contains(&op) && !writable(p) {
+    if ((3..=6).contains(&op) || op == 9) && !writable(p) {
         return Err(13);
     }
     match op {
@@ -178,6 +184,30 @@ fn operation(s: &mut Session, m: &mut Message, op: u64) -> Result<i64, i64> {
             let data = entry.ok_or(2i64)?.as_ref().ok_or(21i64)?;
             m.bytes.get_mut(..data.len()).ok_or(27i64)?.copy_from_slice(data);
             Ok(data.len() as i64)
+        }
+        8 | 9 => {
+            let offset = usize::try_from(m.number).map_err(|_| 22i64)?;
+            let size = m.length as usize;
+            if size > m.bytes.len() { return Err(22); }
+            let data = entry.ok_or(2i64)?.as_ref().ok_or(21i64)?;
+            if op == 8 {
+                let n = size.min(data.len().saturating_sub(offset));
+                if n != 0 { m.bytes[..n].copy_from_slice(&data[offset..offset+n]); }
+                return Ok(n as i64);
+            }
+            let end = offset.checked_add(size).ok_or(27i64)?;
+            if end > volume.disk.file_limit() { return Err(27); }
+            if !changes.contains_key(p) {
+                changes.insert(p.into(), Some(Some(data.clone())));
+            }
+            let target = changes.get_mut(p).and_then(Option::as_mut)
+                .and_then(Option::as_mut).ok_or(21i64)?;
+            if end > target.len() {
+                target.try_reserve(end-target.len()).map_err(|_| 12i64)?;
+                target.resize(end, 0);
+            }
+            target[offset..end].copy_from_slice(&m.bytes[..size]);
+            Ok(0)
         }
         3 | 4 => {
             if op == 4 && entry.is_some() {

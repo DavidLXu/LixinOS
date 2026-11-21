@@ -17,6 +17,9 @@ const DEFAULT: Size = Size {
     rows: ROWS,
 };
 static mut SIZE: Size = DEFAULT;
+static mut GEOMETRY_GENERATION: u32 = 1;
+// Keep the terminal image separate while a resizable canvas owns its pixels.
+static mut CANVAS_SCREENS: [Option<Screen>; PANES] = [const { None }; PANES];
 static mut REQUEST: Option<Size> = None;
 static mut SELECTOR: u16 = 0;
 static mut CLOCK_OFFSET: i32 = 0;
@@ -64,6 +67,35 @@ impl Size {
     }
 }
 
+pub(super) fn generation() -> u64 { u64::from(unsafe { GEOMETRY_GENERATION }) }
+
+unsafe fn canvas_screen(pane: usize) -> *mut Option<Screen> {
+    unsafe { addr_of_mut!(CANVAS_SCREENS).cast::<Option<Screen>>().add(pane) }
+}
+
+pub(super) fn resizable_canvas(pane: usize) -> bool {
+    unsafe { (*canvas_screen(pane)).is_some() }
+}
+
+pub(super) fn save_canvas_screen(pane: usize) {
+    unsafe {
+        let term = &TERMS[pane];
+        let start = origin(pane, size().cols) + term.bar_rows() * BAR_PIXELS;
+        let fb = &(*FB).0;
+        *canvas_screen(pane) = Some(term.capture(&fb[start..]));
+    }
+}
+
+pub(super) fn restore_canvas_screen(pane: usize) {
+    unsafe {
+        let Some(screen) = (*canvas_screen(pane)).take() else { return; };
+        let term = &mut TERMS[pane];
+        let start = origin(pane, size().cols) + term.bar_rows() * BAR_PIXELS;
+        let fb = &mut (*FB).0;
+        term.restore(&mut fb[start..], screen);
+    }
+}
+
 pub(crate) fn apply_resize() {
     let Some(next) = (unsafe { REQUEST }) else {
         return;
@@ -75,16 +107,22 @@ pub(crate) fn apply_resize() {
         return;
     }
     // Canvases and fixed-size foreground programs draw into their original viewport.
-    if unsafe { (*addr_of!(CANVAS_OPEN)).iter().any(|&open| open) }
+    if (0..PANES).any(|pane| unsafe { CANVAS_OPEN[pane] } && !resizable_canvas(pane))
         || crate::foreground::blocks_resize()
     {
         return;
     }
+    hide_text_pointer();
+    edit_menu::close();
     unsafe {
         let old = SIZE;
-        let fb = &mut (*addr_of_mut!(FB)).0;
+        let fb = &mut (*FB).0;
         let mut screens = Vec::with_capacity(PANES);
         for pane in 0..PANES {
+            if let Some(screen) = (*canvas_screen(pane)).take() {
+                screens.push((screen, true));
+                continue;
+            }
             let term = &mut TERMS[pane];
             let pixels = &mut fb[origin(pane, old.cols) + term.bar_rows() * BAR_PIXELS..];
             term.clear_selection(pixels);
@@ -93,7 +131,7 @@ pub(crate) fn apply_resize() {
             } else {
                 term.cursor(pixels);
             }
-            screens.push(term.capture(pixels));
+            screens.push((term.capture(pixels), false));
         }
         for y in CH..next.height {
             fb[y * W..y * W + next.width].fill(BG);
@@ -103,8 +141,9 @@ pub(crate) fn apply_resize() {
             }
         }
         SIZE = next;
+        GEOMETRY_GENERATION = GEOMETRY_GENERATION.wrapping_add(1).max(1);
         REQUEST = None;
-        for (pane, screen) in screens.into_iter().enumerate() {
+        for (pane, (screen, resizable)) in screens.into_iter().enumerate() {
             let term = &mut TERMS[pane];
             term.cols = next.cols;
             term.rows = next.rows - term.bar_rows();
@@ -113,6 +152,9 @@ pub(crate) fn apply_resize() {
             let pixels = &mut base[term.bar_rows() * BAR_PIXELS..];
             term.restore(pixels, screen);
             term.cursor(pixels);
+            if resizable {
+                *canvas_screen(pane) = Some(term.capture(pixels));
+            }
         }
         reset_pointer();
         draw_status(USAGE.busy_percent);
@@ -137,7 +179,7 @@ impl Terminal {
         let height = self.rows * CH;
         let mut pixels = Vec::with_capacity(width * height);
         for row in 0..height {
-            pixels.extend_from_slice(&fb[row * W..row * W + width]);
+            pixels.extend_from_slice(&fb[row * self.stride..row * self.stride + width]);
         }
         Screen {
             pixels,
@@ -159,7 +201,7 @@ impl Terminal {
         if self.cols == screen.cols && self.rows == screen.rows {
             let width = self.cols * CW;
             for (row, pixels) in screen.pixels.chunks_exact(width).enumerate() {
-                fb[row * W..row * W + width].copy_from_slice(pixels);
+                fb[row * self.stride..row * self.stride + width].copy_from_slice(pixels);
             }
             self.cells[..screen.cells.len()].copy_from_slice(&screen.cells);
             self.styles[..screen.styles.len()].copy_from_slice(&screen.styles);
@@ -219,7 +261,7 @@ impl Terminal {
         self.cells.fill(b' ');
         self.wrapped.fill(false);
         for row in 0..self.rows * CH {
-            fb[row * W..row * W + self.cols * CW].fill(self.background);
+            fb[row * self.stride..row * self.stride + self.cols * CW].fill(self.background);
         }
         for row in wraps {
             if (first..first + self.rows).contains(&row) {
@@ -234,10 +276,10 @@ impl Terminal {
             self.cells[row * self.cols + col] = screen.cells[old];
             self.styles[row*self.cols+col] = screen.styles.get(old).copied().unwrap_or(scrollback::DEFAULT_STYLE);
             let from = old / screen.cols * CH * (screen.cols * CW) + old % screen.cols * CW;
-            let to = row * CH * W + col * CW;
+            let to = row * CH * self.stride + col * CW;
             for pixel_row in 0..CH {
                 let src = from + pixel_row * screen.cols * CW;
-                let dst = to + pixel_row * W;
+                let dst = to + pixel_row * self.stride;
                 fb[dst..dst + CW].copy_from_slice(&screen.pixels[src..src + CW]);
             }
         }

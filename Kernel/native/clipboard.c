@@ -4,7 +4,7 @@ static struct virtio port = {(volatile u32 *)0x0a000c00};
 static struct queue rx, tx;
 static u8 buffers[Q][256], output[8197];
 static u8 document[1 << 20], paste[4096];
-static unsigned length, online, seq, waiting, paste_at, paste_len, multi;
+static unsigned length, online, seq, waiting, paste_at, paste_len, multi, text_block;
 static u64 destination, deadline;
 void clipboard_init(void) {
     if (!device(port, 3, 0) || !setup_queue(port, 0, &rx) || !setup_queue(port, 1, &tx))
@@ -58,15 +58,17 @@ static void prepare(const u8 *bytes, unsigned n) {
         if (c == '\n' && i && bytes[i - 1] == '\r')
             continue;
         if (c == '\r' || c == '\n')
-            c = multi ? '\r' : ' ';
+            c = text_block ? '\n' : multi ? '\r' : ' ';
         if (c == '\t')
-            c = multi ? '\t' : ' ';
-        if ((c >= 32 && c <= 126) || c == '\r' || c == '\t')
+            c = text_block || multi ? '\t' : ' ';
+        if ((c >= 32 && c <= 126) || (text_block && c >= 128) ||
+            c == '\r' || c == '\n' || c == '\t')
             paste[paste_len++] = c;
     }
 }
-void clipboard_request(int multiline) {
-    multi = multiline;
+void clipboard_request(int options) {
+    multi = options & 1;
+    text_block = options & 4;
     destination = task_pid();
     paste_len = paste_at = 0;
     if (!online) {
@@ -82,11 +84,42 @@ void clipboard_request(int multiline) {
     send(end - (char *)output);
 }
 int clipboard_key(void) {
-    if (destination != task_pid())
+    if (destination != task_pid() || text_block)
         return -1;
     if (waiting && clock_ticks() > deadline)
         waiting = 0;
     return paste_at < paste_len ? paste[paste_at++] : -1;
+}
+void clipboard_cancel(void) {
+    if (destination == task_pid())
+        waiting = paste_at = paste_len = 0;
+}
+static unsigned utf8_prefix(const u8 *bytes, unsigned size) {
+    for (unsigned i = 0; i < size;) {
+        unsigned c = bytes[i], start = i++;
+        if (c < 128) continue;
+        unsigned more = c >= 0xc2 && c <= 0xdf ? 1 :
+                        c >= 0xe0 && c <= 0xef ? 2 :
+                        c >= 0xf0 && c <= 0xf4 ? 3 : 0;
+        if (!more) return 0;
+        if (more > size - i) return start;
+        unsigned first = bytes[i++];
+        if ((first & 0xc0) != 0x80 || (c == 0xe0 && first < 0xa0) ||
+            (c == 0xed && first >= 0xa0) || (c == 0xf0 && first < 0x90) ||
+            (c == 0xf4 && first >= 0x90)) return 0;
+        while (--more) if ((bytes[i++] & 0xc0) != 0x80) return 0;
+    }
+    return size;
+}
+int clipboard_take_text(u8 *out) {
+    clipboard_poll();
+    if (destination != task_pid() || !text_block) return -1;
+    if (waiting && clock_ticks() > deadline) prepare(document, length);
+    if (waiting || !paste_len) return -1;
+    unsigned size = utf8_prefix(paste, paste_len);
+    memcpy(out, paste, size);
+    paste_at = paste_len = 0;
+    return size;
 }
 static unsigned number(const char **s) {
     unsigned n = 0;

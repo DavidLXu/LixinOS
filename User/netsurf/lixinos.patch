@@ -1,0 +1,1652 @@
+--- a/netsurf/content/fetch.c
++++ b/netsurf/content/fetch.c
+@@ -54,7 +54,7 @@
+ #include "content/fetchers.h"
+ #include "content/fetchers/resource.h"
+ #include "content/fetchers/about/about.h"
+-#include "content/fetchers/curl.h"
++nserror lixin_fetch_register(void);
+ #include "content/fetchers/data.h"
+ #include "content/fetchers/file/file.h"
+ #include "javascript/fetcher.h"
+@@ -286,12 +286,10 @@
+ {
+ 	nserror ret;
+ 
+-#ifdef WITH_CURL
+-	ret = fetch_curl_register();
++ret = lixin_fetch_register();
+ 	if (ret != NSERROR_OK) {
+ 		return ret;
+ 	}
+-#endif
+ 
+ 	ret = fetch_data_register();
+ 	if (ret != NSERROR_OK) {
+--- a/netsurf/content/handlers/css/css.c
++++ b/netsurf/content/handlers/css/css.c
+@@ -252,15 +252,8 @@
+ static bool
+ nscss_process_data(struct content *c, const char *data, unsigned int size)
+ {
+-	nscss_content *css = (nscss_content *) c;
+-	css_error error;
+-
+-	error = nscss_process_css_data(&css->data, data, size);
+-	if (error != CSS_OK && error != CSS_NEEDDATA) {
+-		content_broadcast_error(c, NSERROR_CSS, NULL);
+-	}
+-
+-	return (error == CSS_OK || error == CSS_NEEDDATA);
++    /* The complete llcache buffer is parsed once in nscss_convert. */
++    return true;
+ }
+ 
+ /**
+@@ -284,11 +277,24 @@
+  * \param c  Content to convert
+  * \return true on success, false on failure
+  */
++char *ns_root_lengths(const char *, size_t, size_t *);
++
+ bool nscss_convert(struct content *c)
+ {
+ 	nscss_content *css = (nscss_content *) c;
+ 	css_error error;
+ 
++    size_t bytes;
++    const char *source = (const char *)content__get_source_data(c, &bytes);
++    char *expanded = source ? ns_root_lengths(source, bytes, &bytes) : NULL;
++    if (bytes) {
++        error = nscss_process_css_data(&css->data, expanded ? expanded : source, bytes);
++        free(expanded);
++        if (error != CSS_OK && error != CSS_NEEDDATA) {
++            content_broadcast_error(c, NSERROR_CSS, NULL);
++            return false;
++        }
++    }
+ 	error = nscss_convert_css_data(&css->data);
+ 	if (error != CSS_OK) {
+ 		content_broadcast_error(c, NSERROR_CSS, NULL);
+--- a/netsurf/content/handlers/css/select.c
++++ b/netsurf/content/handlers/css/select.c
+@@ -73,6 +73,7 @@
+ static css_error node_is_root(void *pw, void *node, bool *match);
+ static css_error node_count_siblings(void *pw, void *node,
+ 		bool same_name, bool after, int32_t *count);
++static css_error has_descendant_at_index(void *pw, void *node, uint32_t index, bool *match);
+ static css_error node_is_empty(void *pw, void *node, bool *match);
+ static css_error node_is_link(void *pw, void *node, bool *match);
+ static css_error node_is_hover(void *pw, void *node, bool *match);
+@@ -133,6 +134,7 @@
+ 	ua_default_for_property,
+ 	set_libcss_node_data,
+ 	get_libcss_node_data,
++	has_descendant_at_index,
+ };
+ 
+ /**
+@@ -260,6 +262,12 @@
+ 	int pseudo_element;
+ 	css_error error;
+ 
++	/* During box construction the document has no completed layout yet.
++	 * Relative font sizes must use the root selected for this tree. */
++	css_unit_ctx units = *unit_len_ctx;
++	units.root_style = ctx->root_style;
++	unit_len_ctx = &units;
++
+ 	/* Select style for node */
+ 	error = css_select_style(ctx->ctx, n, unit_len_ctx, media, inline_style,
+ 			&selection_handler, ctx, &styles);
+@@ -288,6 +296,9 @@
+ 		styles->styles[CSS_PSEUDO_ELEMENT_NONE] = composed;
+ 	}
+ 
++	if (!units.root_style && !ctx->parent_style)
++		units.root_style = styles->styles[CSS_PSEUDO_ELEMENT_NONE];
++
+ 	for (pseudo_element = CSS_PSEUDO_ELEMENT_NONE + 1;
+ 			pseudo_element < CSS_PSEUDO_ELEMENT_COUNT;
+ 			pseudo_element++) {
+@@ -1417,6 +1428,57 @@
+ 	}
+ 
+ 	return CSS_OK;
++}
++
++/* Inspect each sibling list once; walk the subtree without recursion. */
++static css_error has_descendant_at_index(void *pw, void *root, uint32_t index, bool *match)
++{
++	dom_node *parent = dom_node_ref(root);
++	dom_exception err = DOM_NO_ERR;
++	*match = false;
++	while (parent) {
++		dom_node *child = NULL, *first = NULL, *next = NULL;
++		uint32_t count = 0;
++		err = dom_node_get_first_child(parent, &child);
++		while (!err && child) {
++			dom_node_type type;
++			err = dom_node_get_node_type(child, &type);
++			if (!err && type == DOM_ELEMENT_NODE) {
++				if (!first) first = dom_node_ref(child);
++				*match = (++count == index);
++			}
++			next = NULL;
++			if (!err && !*match) err = dom_node_get_next_sibling(child, &next);
++			dom_node_unref(child);
++			child = next;
++		}
++		if (err || *match) {
++			if (first) dom_node_unref(first);
++			break;
++		}
++		if (first) {
++			dom_node_unref(parent);
++			parent = first;
++			continue;
++		}
++		while (parent != root) {
++			next = NULL;
++			err = dom_node_get_next_sibling(parent, &next);
++			if (!err && !next) {
++				err = dom_node_get_parent_node(parent, &next);
++				dom_node_unref(parent);
++				parent = next;
++				if (!err && parent) continue;
++			} else {
++				dom_node_unref(parent);
++				parent = next;
++			}
++			break;
++		}
++		if (err || parent == root) break;
++	}
++	if (parent) dom_node_unref(parent);
++	return err ? CSS_BADPARM : CSS_OK;
+ }
+ 
+ /**
+--- a/netsurf/content/handlers/css/utils.h
++++ b/netsurf/content/handlers/css/utils.h
+@@ -37,10 +37,10 @@
+ 
+ 	switch (value) {
+ 	case CSS_DISPLAY_GRID:
+-		return CSS_DISPLAY_BLOCK;
++		return CSS_DISPLAY_FLEX;
+ 
+ 	case CSS_DISPLAY_INLINE_GRID:
+-		return CSS_DISPLAY_INLINE_BLOCK;
++		return CSS_DISPLAY_INLINE_FLEX;
+ 
+ 	default:
+ 		break;
+@@ -60,10 +60,10 @@
+ 
+ 	switch (value) {
+ 	case CSS_DISPLAY_GRID:
+-		return CSS_DISPLAY_BLOCK;
++		return CSS_DISPLAY_FLEX;
+ 
+ 	case CSS_DISPLAY_INLINE_GRID:
+-		return CSS_DISPLAY_INLINE_BLOCK;
++		return CSS_DISPLAY_INLINE_FLEX;
+ 
+ 	default:
+ 		break;
+--- a/netsurf/content/handlers/html/box.h
++++ b/netsurf/content/handlers/html/box.h
+@@ -88,6 +88,7 @@
+ 	REPLACE_DIM = 1 << 9,	/* replaced element has given dimensions */
+ 	IFRAME      = 1 << 10,	/* box contains an iframe */
+ 	CONVERT_CHILDREN = 1 << 11,  /* wanted children converting */
++	CONTENTS_ONLY = 1 << 13, /* style association without a layout box */
+ 	IS_REPLACED = 1 << 12	/* box is a replaced element */
+ } box_flags;
+ 
+@@ -223,6 +224,8 @@
+ 	/**
+ 	 * First child box, or NULL.
+ 	 */
++    struct box *paint_first, *paint_next;
++    int paint_z;
+ 	struct box *children;
+ 
+ 	/**
+--- a/netsurf/content/handlers/html/box_construct.c
++++ b/netsurf/content/handlers/html/box_construct.c
+@@ -108,8 +108,9 @@
+ 	BOX_NONE,            /* CSS_DISPLAY_NONE */
+ 	BOX_FLEX,            /* CSS_DISPLAY_FLEX */
+ 	BOX_INLINE_FLEX,     /* CSS_DISPLAY_INLINE_FLEX */
+-	BOX_BLOCK,           /* CSS_DISPLAY_GRID */
+-	BOX_INLINE_BLOCK,    /* CSS_DISPLAY_INLINE_GRID */
++	BOX_FLEX,            /* CSS_DISPLAY_GRID */
++	BOX_INLINE_FLEX,     /* CSS_DISPLAY_INLINE_GRID */
++	BOX_BLOCK,           /* CSS_DISPLAY_CONTENTS: style and DOM association only */
+ };
+ 
+ 
+@@ -213,7 +214,8 @@
+ 			 * use the parent node's styling as the parent
+ 			 * style, above. */
+ 			if (b != NULL && b->type != BOX_INLINE &&
+-					b->type != BOX_BR) {
++					b->type != BOX_BR &&
++					!(b->flags & CONTENTS_ONLY)) {
+ 				props->containing_block = b;
+ 
+ 				dom_node_unref(parent_node);
+@@ -601,6 +603,7 @@
+ 			case BOX_INLINE_FLEX:
+ 				box->type = BOX_FLEX;
+ 				break;
++			case BOX_INLINE:
+ 			case BOX_INLINE_BLOCK:
+ 				box->type = BOX_BLOCK;
+ 				break;
+@@ -617,9 +620,12 @@
+ 		return false;
+ 	}
+ 
++	bool contents = css_display == CSS_DISPLAY_CONTENTS && !props.node_is_root;
++	if (contents && ((box->flags & IS_REPLACED) || box->gadget || box->object))
++		box->type = BOX_NONE;
+ 	/* Handle the :before pseudo element */
+ 	if (!(box->flags & IS_REPLACED)) {
+-		box_construct_generate(ctx->n, ctx->content, box,
++		box_construct_generate(ctx->n, ctx->content, contents ? props.containing_block : box,
+ 				box->styles->styles[CSS_PSEUDO_ELEMENT_BEFORE]);
+ 	}
+ 
+@@ -655,6 +661,12 @@
+ 
+ 	/* Attach box to DOM node */
+ 	box->node = dom_node_ref(ctx->n);
++	/* Children still inherit computed style and link metadata through this
++	 * DOM-associated box. Their layout parent is the nearest real box. */
++	if (contents) {
++		box->flags |= CONTENTS_ONLY;
++		return true;
++	}
+ 
+ 	if (props.inline_container == NULL &&
+ 			(box->type == BOX_INLINE ||
+@@ -821,7 +833,9 @@
+ 		}
+ 	} else if (!(box->flags & IS_REPLACED)) {
+ 		/* Handle the :after pseudo element */
+-		box_construct_generate(n, content, box,
++		box_construct_generate(n, content,
++				(box->flags & CONTENTS_ONLY) ?
++				props.containing_block : box,
+ 				box->styles->styles[CSS_PSEUDO_ELEMENT_AFTER]);
+ 	}
+ }
+@@ -839,107 +853,34 @@
+  * \note \a n will be unreferenced
+  */
+ static dom_node *
+-next_node(dom_node *n, html_content *content, bool convert_children)
++next_node(dom_node *n, html_content *content, bool children, dom_node *stop)
+ {
+ 	dom_node *next = NULL;
+-	bool has_children;
+-	dom_exception err;
+-
+-	err = dom_node_has_child_nodes(n, &has_children);
+-	if (err != DOM_NO_ERR) {
++	if (children && dom_node_get_first_child(n, &next) == DOM_NO_ERR && next) {
+ 		dom_node_unref(n);
+-		return NULL;
+-	}
+-
+-	if (convert_children && has_children) {
+-		err = dom_node_get_first_child(n, &next);
+-		if (err != DOM_NO_ERR) {
++		return next;
++	}
++	while (n != NULL) {
++		if (box_for_node(n) != NULL)
++			box_construct_element_after(n, content);
++		if (n == stop || box_is_root(n)) {
+ 			dom_node_unref(n);
+-			return NULL;
+-		}
++			break;
++		}
++		if (dom_node_get_next_sibling(n, &next) != DOM_NO_ERR) {
++			dom_node_unref(n);
++			break;
++		}
++		if (next != NULL) {
++			dom_node_unref(n);
++			return next;
++		}
++		dom_node *parent = NULL;
++		dom_node_get_parent_node(n, &parent);
+ 		dom_node_unref(n);
+-	} else {
+-		err = dom_node_get_next_sibling(n, &next);
+-		if (err != DOM_NO_ERR) {
+-			dom_node_unref(n);
+-			return NULL;
+-		}
+-
+-		if (next != NULL) {
+-			if (box_for_node(n) != NULL)
+-				box_construct_element_after(n, content);
+-			dom_node_unref(n);
+-		} else {
+-			if (box_for_node(n) != NULL)
+-				box_construct_element_after(n, content);
+-
+-			while (box_is_root(n) == false) {
+-				dom_node *parent = NULL;
+-				dom_node *parent_next = NULL;
+-
+-				err = dom_node_get_parent_node(n, &parent);
+-				if (err != DOM_NO_ERR) {
+-					dom_node_unref(n);
+-					return NULL;
+-				}
+-
+-				assert(parent != NULL);
+-
+-				err = dom_node_get_next_sibling(parent,
+-						&parent_next);
+-				if (err != DOM_NO_ERR) {
+-					dom_node_unref(parent);
+-					dom_node_unref(n);
+-					return NULL;
+-				}
+-
+-				if (parent_next != NULL) {
+-					dom_node_unref(parent_next);
+-					dom_node_unref(parent);
+-					break;
+-				}
+-
+-				dom_node_unref(n);
+-				n = parent;
+-				parent = NULL;
+-
+-				if (box_for_node(n) != NULL) {
+-					box_construct_element_after(
+-							n, content);
+-				}
+-			}
+-
+-			if (box_is_root(n) == false) {
+-				dom_node *parent = NULL;
+-
+-				err = dom_node_get_parent_node(n, &parent);
+-				if (err != DOM_NO_ERR) {
+-					dom_node_unref(n);
+-					return NULL;
+-				}
+-
+-				assert(parent != NULL);
+-
+-				err = dom_node_get_next_sibling(parent, &next);
+-				if (err != DOM_NO_ERR) {
+-					dom_node_unref(parent);
+-					dom_node_unref(n);
+-					return NULL;
+-				}
+-
+-				if (box_for_node(parent) != NULL) {
+-					box_construct_element_after(parent,
+-							content);
+-				}
+-
+-				dom_node_unref(parent);
+-			}
+-
+-			dom_node_unref(n);
+-		}
+-	}
+-
+-	return next;
++		n = parent;
++	}
++	return NULL;
+ }
+ 
+ 
+@@ -981,6 +922,59 @@
+ }
+ 
+ 
++/* Entity tokens can be separate adjacent DOM text nodes. Shape and wrap
++ * them together within their common parent, without crossing markup. */
++static dom_exception box_collect_text(dom_node **node, dom_string **out)
++{
++	dom_exception err = dom_characterdata_get_data(*node, out);
++	if (err != DOM_NO_ERR || !*out)
++		return err;
++	size_t length = dom_string_byte_length(*out), capacity = 0;
++	char *buffer = NULL;
++	for (;;) {
++		dom_node *next = NULL;
++		dom_node_type type;
++		err = dom_node_get_next_sibling(*node, &next);
++		if (err != DOM_NO_ERR || !next) break;
++		err = dom_node_get_node_type(next, &type);
++		if (err != DOM_NO_ERR || type != DOM_TEXT_NODE) {
++			dom_node_unref(next);
++			break;
++		}
++		dom_string *part = NULL;
++		err = dom_characterdata_get_data(next, &part);
++		if (err != DOM_NO_ERR || !part) { dom_node_unref(next); break; }
++		size_t add = dom_string_byte_length(part);
++		if (add > SIZE_MAX/2 - length - 1) err = DOM_NO_MEM_ERR;
++		if (err == DOM_NO_ERR && capacity <= length + add) {
++			size_t size = (length + add + 1) * 2;
++			char *tmp = realloc(buffer, size);
++			if (tmp == NULL) err = DOM_NO_MEM_ERR;
++			else {
++				if (!buffer) memcpy(tmp, dom_string_data(*out), length);
++				buffer = tmp;
++				capacity = size;
++			}
++		}
++		if (err == DOM_NO_ERR) {
++			memcpy(buffer + length, dom_string_data(part), add);
++			length += add;
++			dom_node_unref(*node);
++			*node = next;
++		} else dom_node_unref(next);
++		dom_string_unref(part);
++		if (err != DOM_NO_ERR) break;
++	}
++	if (buffer || err != DOM_NO_ERR) {
++		dom_string_unref(*out);
++		*out = NULL;
++		if (err == DOM_NO_ERR)
++			err = dom_string_create((const uint8_t *)buffer, length, out);
++		free(buffer);
++	}
++	return err;
++}
++
+ /**
+  * Construct the box tree for an XML text node.
+  *
+@@ -1000,7 +994,7 @@
+ 
+ 	assert(props.containing_block != NULL);
+ 
+-	err = dom_characterdata_get_data(ctx->n, &content);
++	err = box_collect_text(&ctx->n, &content);
+ 	if (err != DOM_NO_ERR || content == NULL)
+ 		return false;
+ 
+@@ -1224,6 +1218,46 @@
+ }
+ 
+ 
++/* Append a newly attached DOM subtree to a laid-out block. The enclosing
++ * box tree stays live, including its form controls, selection and resources. */
++bool box_append_dom_node(html_content *c, dom_node *node)
++{
++	dom_node *parent = NULL, *last = NULL;
++	if (dom_node_get_parent_node(node, &parent) != DOM_NO_ERR || !parent)
++		return false;
++	struct box *block = box_for_node(parent);
++	dom_node_get_last_child(parent, &last);
++	bool append = last == node && block && block->type == BOX_BLOCK &&
++			(block->flags & CONVERT_CHILDREN) && !box_for_node(node);
++	dom_node_unref(last);
++	dom_node_unref(parent);
++	if (!append)
++		return false;
++
++	struct box_construct_ctx ctx = {
++		.content = c, .root_box = c->layout, .bctx = c->bctx,
++		.n = dom_node_ref(node)
++	};
++	while (ctx.n) {
++		bool children = true;
++		dom_node_type type;
++		if (dom_node_get_node_type(ctx.n, &type) != DOM_NO_ERR ||
++		    (type == DOM_ELEMENT_NODE && !box_construct_element(&ctx, &children)) ||
++		    (type == DOM_TEXT_NODE && !box_construct_text(&ctx))) {
++			dom_node_unref(ctx.n);
++			return false;
++		}
++		ctx.n = next_node(ctx.n, c, children, node);
++	}
++	if (!box_normalise_block(block, c->layout, c))
++		return false;
++	if (block->last)
++		block->last->max_width = UNKNOWN_MAX_WIDTH;
++	for (struct box *b = block; b; b = b->parent)
++		b->max_width = UNKNOWN_MAX_WIDTH;
++	return true;
++}
++
+ /**
+  * Convert an ELEMENT node to a box tree fragment,
+  * then schedule conversion of the next ELEMENT node
+@@ -1248,7 +1282,7 @@
+ 		}
+ 
+ 		/* Find next element to process, converting text nodes as we go */
+-		next = next_node(ctx->n, ctx->content, convert_children);
++		next = next_node(ctx->n, ctx->content, convert_children, NULL);
+ 		while (next != NULL) {
+ 			dom_node_type type;
+ 			dom_exception err;
+@@ -1272,9 +1306,10 @@
+ 					free(ctx);
+ 					return;
+ 				}
+-			}
+-
+-			next = next_node(next, ctx->content, true);
++				next = ctx->n;
++			}
++
++			next = next_node(next, ctx->content, true, NULL);
+ 		}
+ 
+ 		ctx->n = next;
+--- a/netsurf/content/handlers/html/box_construct.h
++++ b/netsurf/content/handlers/html/box_construct.h
+@@ -87,6 +87,8 @@
+ /**
+  * aborts any ongoing box construction
+  */
++bool box_append_dom_node(struct html_content *c, struct dom_node *node);
++
+ nserror cancel_dom_to_box(void *box_conversion_context);
+ 
+ 
+--- a/netsurf/content/handlers/html/box_inspect.c
++++ b/netsurf/content/handlers/html/box_inspect.c
+@@ -203,7 +203,7 @@
+ 
+ 	switch (dir) {
+ 	case BOX_WALK_CHILDREN:
+-		b = b->children;
++		b = b->paint_first;
+ 		if (b == NULL)
+ 			break;
+ 		*x += b->x;
+@@ -218,7 +218,7 @@
+ 		do {
+ 			*x -= b->x;
+ 			*y -= b->y;
+-			b = b->next;
++			b = b->paint_next;
+ 			if (b == NULL)
+ 				break;
+ 			*x += b->x;
+--- a/netsurf/content/handlers/html/box_special.c
++++ b/netsurf/content/handlers/html/box_special.c
+@@ -1148,6 +1148,9 @@
+ /**
+  * Embedded image [13.2].
+  */
++#include "picture.inc"
++#include "inline-svg.inc"
++
+ static bool
+ box_image(dom_node *n,
+ 	  html_content *content,
+@@ -1192,10 +1195,10 @@
+ 	if (box->usemap && box->usemap[0] == '#')
+ 		box->usemap++;
+ 
+-	/* get image URL */
+-	err = dom_element_get_attribute(n, corestring_dom_src, &s);
+-	if (err != DOM_NO_ERR || s == NULL)
+-		return true;
++	/* Prefer the first matching picture source, then img srcset and src. */
++    s = picture_url(n,content);
++    if (s == NULL)
++        return true;
+ 
+ 	if (box_extract_link(content, s, content->base_url, &url) == false) {
+ 		dom_string_unref(s);
+@@ -1861,6 +1864,7 @@
+ 	dom_html_element_type tag_type;
+ 	bool res;
+ 
++	if (picture_tag(node,"svg")) return inline_svg(node,content,box,convert_children);
+ 	exc = dom_html_element_get_tag_type(node, &tag_type);
+ 	if (exc != DOM_NO_ERR) {
+ 		tag_type = DOM_HTML_ELEMENT_TYPE__UNKNOWN;
+--- a/netsurf/content/handlers/html/dom_event.c
++++ b/netsurf/content/handlers/html/dom_event.c
+@@ -109,46 +109,6 @@
+ 
+ 
+ /**
+- * Process img element being inserted into the DOM.
+- *
+- * \param htmlc The html content containing the DOM
+- * \param node The DOM node being inserted
+- * \return NSERROR_OK on success else appropriate error code
+- */
+-static bool html_process_inserted_img(html_content *htmlc, dom_node *node)
+-{
+-	dom_string *src;
+-	nsurl *url;
+-	nserror err;
+-	dom_exception exc;
+-	bool success;
+-
+-	/* Do nothing if foreground images are disabled */
+-	if (nsoption_bool(foreground_images) == false) {
+-		return true;
+-	}
+-
+-	exc = dom_element_get_attribute(node, corestring_dom_src, &src);
+-	if (exc != DOM_NO_ERR || src == NULL) {
+-		return true;
+-	}
+-
+-	err = nsurl_join(htmlc->base_url, dom_string_data(src), &url);
+-	if (err != NSERROR_OK) {
+-		dom_string_unref(src);
+-		return false;
+-	}
+-	dom_string_unref(src);
+-
+-	/* Speculatively fetch the image */
+-	success = html_fetch_object(htmlc, url, NULL, CONTENT_IMAGE, false);
+-	nsurl_unref(url);
+-
+-	return success;
+-}
+-
+-
+-/**
+  * process a LINK element being inserted into the DOM
+  *
+  * \note only the http-equiv attribute for refresh is currently considered
+@@ -607,10 +567,6 @@
+ 		switch (tag_type) {
+ 		case DOM_HTML_ELEMENT_TYPE_BASE:
+ 			html_process_inserted_base(htmlc, (dom_node *)node);
+-			break;
+-
+-		case DOM_HTML_ELEMENT_TYPE_IMG:
+-			html_process_inserted_img(htmlc, (dom_node *)node);
+ 			break;
+ 
+ 		case DOM_HTML_ELEMENT_TYPE_LINK:
+@@ -660,6 +616,10 @@
+ 			}
+ 		}
+ 	}
++	if (exc == DOM_NO_ERR && htmlc->enable_scripting && htmlc->had_initial_layout && !htmlc->aborted &&
++	    (type == DOM_TEXT_NODE || type == DOM_ELEMENT_NODE) &&
++	    box_append_dom_node(htmlc, (dom_node *)node))
++		html_schedule_dom_reflow(htmlc);
+ 	dom_node_unref(node);
+ }
+ 
+--- a/netsurf/content/handlers/html/font.c
++++ b/netsurf/content/handlers/html/font.c
+@@ -152,7 +152,7 @@
+ 				      INTTOFIX(PLOT_STYLE_SCALE)));
+ 
+ 	/* Clamp font size to configured minimum */
+-	if (fstyle->size < (nsoption_int(font_min_size) * PLOT_STYLE_SCALE) / 10)
++	if (length != 0 && fstyle->size < (nsoption_int(font_min_size) * PLOT_STYLE_SCALE) / 10)
+ 		fstyle->size = (nsoption_int(font_min_size) * PLOT_STYLE_SCALE) / 10;
+ 
+ 	fstyle->weight = plot_font_weight(css_computed_font_weight(css));
+--- a/netsurf/content/handlers/html/html.c
++++ b/netsurf/content/handlers/html/html.c
+@@ -224,6 +224,7 @@
+ 	c->box_conversion_context = NULL;
+ 
+ 	/* Clean up and report error if unsuccessful or aborted */
++	if (success && !c->aborted) success = html_start_pending_images(c);
+ 	if ((success == false) || (c->aborted)) {
+ 		html_object_free_objects(c);
+ 
+@@ -1185,6 +1186,20 @@
+ }
+ 
+ 
++static void html_reflow_after_mutation(void *pw)
++{
++	html_content *c = pw;
++	if (c->aborted || !c->layout || !c->bw)
++		return;
++	content__reformat(&c->base, false, c->base.available_width, c->base.available_height);
++	content__request_redraw(&c->base, 0, 0, c->base.width, c->base.height);
++}
++
++void html_schedule_dom_reflow(html_content *c)
++{
++	guit->misc->schedule(0, html_reflow_after_mutation, c);
++}
++
+ static void html_free_layout(html_content *htmlc)
+ {
+ 	if (htmlc->bctx != NULL) {
+@@ -1205,6 +1220,8 @@
+ 	struct form *f, *g;
+ 
+ 	NSLOG(netsurf, INFO, "content %p", c);
++
++	guit->misc->schedule(-1, html_reflow_after_mutation, html);
+ 
+ 	/* If we're still converting a layout, cancel it */
+ 	if (html->box_conversion_context != NULL) {
+--- a/netsurf/content/handlers/html/layout.c
++++ b/netsurf/content/handlers/html/layout.c
+@@ -71,6 +71,8 @@
+ #include "html/table.h"
+ 
+ /** Array of per-side access functions for computed style margins. */
++#include "position.inc"
++
+ const css_len_func margin_funcs[4] = {
+ 	[TOP]    = css_computed_margin_top,
+ 	[RIGHT]  = css_computed_margin_right,
+@@ -1043,7 +1045,11 @@
+ 	}
+ 
+ 	/* fixed width takes priority */
+-	if (block->type != BOX_TABLE_CELL && !lh__box_is_flex_item(block)) {
++	if (block->type != BOX_TABLE_CELL &&
++	    (!lh__box_is_flex_item(block) || (block->flags & IS_REPLACED) ||
++	     (block->parent->style &&
++	      (css_computed_display_static(block->parent->style) == CSS_DISPLAY_GRID ||
++	       css_computed_display_static(block->parent->style) == CSS_DISPLAY_INLINE_GRID)))) {
+ 		bool border_box = bs == CSS_BOX_SIZING_BORDER_BOX;
+ 		enum css_max_width_e max_type;
+ 		enum css_min_width_e min_type;
+@@ -4618,6 +4624,8 @@
+ 	layout_compute_offsets(&content->unit_len_ctx, box, containing_block,
+ 			&top, &right, &bottom, &left);
+ 
++	logical_insets(box, containing_block->width, &left, &right);
++
+ 	/* Pass containing block into layout_find_dimensions via the float
+ 	 * containing block box member. This is unused for absolutely positioned
+ 	 * boxes because a box can't be floated and absolutely positioned. */
+@@ -4627,6 +4635,21 @@
+ 			&max_width, &min_width, 0, 0,
+ 			margin, padding, border);
+ 	box->float_container = NULL;
++
++    /* A positioned flex child has the static position it would have as
++     * the sole item, even when it follows other items in document order. */
++    if (box->parent == containing_block && containing_block->type == BOX_FLEX &&
++        left == AUTO && right == AUTO && width != AUTO) {
++        uint8_t axis = css_computed_flex_direction(containing_block->style);
++        if (axis == CSS_FLEX_DIRECTION_ROW || axis == CSS_FLEX_DIRECTION_ROW_REVERSE) {
++            int free_width = containing_block->width - width - padding[LEFT] - padding[RIGHT]
++                           - border[LEFT].width - border[RIGHT].width;
++            uint8_t align = css_computed_justify_content(containing_block->style);
++            static_left = align == CSS_JUSTIFY_CONTENT_CENTER ? free_width/2 :
++                ((align == CSS_JUSTIFY_CONTENT_FLEX_END) != (axis == CSS_FLEX_DIRECTION_ROW_REVERSE)
++                    ? free_width : 0);
++        }
++    }
+ 
+ 	/* 10.3.7 */
+ 	NSLOG(layout, DEBUG,
+@@ -5415,6 +5438,8 @@
+ }
+ 
+ 
++#include "paint.inc"
++
+ /* exported function documented in html/layout.h */
+ bool layout_document(html_content *content, int width, int height)
+ {
+@@ -5464,6 +5489,7 @@
+ 	layout_position_absolute(doc, doc, 0, 0, content);
+ 	layout_position_relative(&content->unit_len_ctx, doc, doc, 0, 0);
+ 
++	prepare_paint(doc);
+ 	layout_calculate_descendant_bboxes(&content->unit_len_ctx, doc);
+ 
+ 	return ret;
+--- a/netsurf/content/handlers/html/layout_flex.c
++++ b/netsurf/content/handlers/html/layout_flex.c
+@@ -829,6 +829,15 @@
+ 		}
+ 	}
+ 
++	int space = 0;
++	size_t slots = 0, placed = 0;
++	uint8_t justify = css_computed_justify_content(ctx->flex->style);
++	if (line->main_auto_margin_count == 0 && ctx->available_main != AUTO &&
++	    ctx->available_main != UNKNOWN_WIDTH && ctx->available_main > line->used_main_size) {
++		space = ctx->available_main - line->used_main_size;
++		for (size_t i = line->first; i < item_count; i++)
++			if (!lh__box_is_absolute(ctx->item.data[i].box)) slots++;
++	}
+ 	for (size_t i = line->first; i < item_count; i++) {
+ 		enum box_side main_end = ctx->horizontal ? RIGHT : BOTTOM;
+ 		enum box_side main_start = ctx->horizontal ? LEFT : TOP;
+@@ -866,8 +875,26 @@
+ 					 lh__delta_outer_main(ctx->flex, b));
+ 		}
+ 
+-		*box_pos_main = main_pos + lh__non_auto_margin(b, main_start) +
+-				extra_pre + b->border[main_start].width;
++		/* Compute the cumulative gap, so rounding cannot drift at the far edge. */
++		int align = 0;
++		if (space && slots) {
++			switch (justify) {
++			case CSS_JUSTIFY_CONTENT_CENTER: align = space / 2; break;
++			case CSS_JUSTIFY_CONTENT_FLEX_END: align = space; break;
++			case CSS_JUSTIFY_CONTENT_SPACE_BETWEEN:
++				if (slots > 1) align = (int64_t)space * placed / (slots - 1);
++				break;
++			case CSS_JUSTIFY_CONTENT_SPACE_AROUND:
++				align = (int64_t)space * (2 * placed + 1) / (2 * slots);
++				break;
++			case CSS_JUSTIFY_CONTENT_SPACE_EVENLY:
++				align = (int64_t)space * (placed + 1) / (slots + 1);
++				break;
++			}
++		}
++		*box_pos_main = main_pos + (ctx->main_reversed ? -align : align) +
++				lh__non_auto_margin(b, main_start) + extra_pre + b->border[main_start].width;
++		if (!lh__box_is_absolute(b)) placed++;
+ 
+ 		if (!lh__box_is_absolute(b)) {
+ 			int cross_size;
+@@ -963,7 +990,11 @@
+ 			/* Fall through. */
+ 		case CSS_ALIGN_SELF_STRETCH:
+ 			if (lh__box_size_cross_is_auto(ctx->horizontal, b)) {
+-				*box_size_cross += cross_free_space;
++				*box_size_cross = max(0, *box_size_cross + cross_free_space);
++				if (item->max_cross >= 0)
++					*box_size_cross = min(*box_size_cross, item->max_cross);
++				if (item->min_cross > 0)
++					*box_size_cross = max(*box_size_cross, item->min_cross);
+ 
+ 				/* Relayout children for stretch. */
+ 				if (!layout_flex_item(ctx, item, b->width)) {
+@@ -1045,6 +1076,8 @@
+  * \param[in] content          memory pool for any new boxes
+  * \return  true on success, false on memory exhaustion
+  */
++#include "grid_layout.inc"
++
+ bool layout_flex(struct box *flex, int available_width,
+ 		html_content *content)
+ {
+@@ -1068,6 +1101,14 @@
+ 			flex->margin, flex->padding, flex->border);
+ 
+ 	available_width = min(available_width, flex->width);
++    uint8_t display = flex->style ? css_computed_display_static(flex->style) : 0;
++    if (display == CSS_DISPLAY_GRID || display == CSS_DISPLAY_INLINE_GRID) {
++        success = layout_grid(ctx, flex, available_width);
++        if (max_height>=0 && flex->height>max_height) flex->height=max_height;
++        if (min_height>0 && flex->height<min_height) flex->height=min_height;
++        goto cleanup;
++    }
++
+ 
+ 	if (ctx->horizontal) {
+ 		ctx->available_main = available_width;
+@@ -1090,6 +1131,15 @@
+ 		goto cleanup;
+ 	}
+ 
++	/* A single-line flex container with a definite cross size uses that
++	 * dimension for its line, even when a child overflows. Siblings
++	 * with align-self:stretch must still fit the container. */
++	if (ctx->wrap == CSS_FLEX_WRAP_NOWRAP && ctx->line.count == 1 &&
++	    ctx->available_cross != AUTO && ctx->available_cross != UNKNOWN_WIDTH) {
++		ctx->line.data[0].cross_size = ctx->available_cross;
++		ctx->cross_size = ctx->available_cross;
++	}
++
+ 	layout_flex__place_lines(ctx);
+ 
+ 	if (flex->height == AUTO) {
+--- a/netsurf/content/handlers/html/object.c
++++ b/netsurf/content/handlers/html/object.c
+@@ -683,9 +683,39 @@
+ }
+ 
+ 
++/* The guest transport is synchronous. Queue requests in document order
++ * until the box tree exists, so remote images cannot stall first layout. */
++struct pending_image {
++	struct pending_image *next;
++	nsurl *url;
++	struct box *box;
++	bool background;
++};
++
++static bool drain_images(html_content *c, bool start)
++{
++	bool ok = true;
++	while (c->image_first) {
++		struct pending_image *img = c->image_first;
++		c->image_first = img->next;
++		if (start && ok)
++			ok = html_fetch_object(c, img->url, img->box, CONTENT_IMAGE, img->background);
++		nsurl_unref(img->url);
++		free(img);
++	}
++	c->image_last = NULL;
++	return ok;
++}
++
++bool html_start_pending_images(html_content *c)
++{
++	return drain_images(c, true);
++}
++
+ /* exported interface documented in html/object.h */
+ nserror html_object_free_objects(html_content *html)
+ {
++	drain_images(html, false);
+ 	while (html->object_list != NULL) {
+ 		struct content_html_object *victim = html->object_list;
+ 
+@@ -721,6 +751,16 @@
+ 	/* If we've already been aborted, don't bother attempting the fetch */
+ 	if (c->aborted)
+ 		return true;
++
++	if (box && permitted_types == CONTENT_IMAGE && c->box_conversion_context) {
++		struct pending_image *img = malloc(sizeof(*img));
++		if (!img) return false;
++		*img = (struct pending_image){ NULL, nsurl_ref(url), box, background };
++		if (c->image_last) c->image_last->next = img;
++		else c->image_first = img;
++		c->image_last = img;
++		return true;
++	}
+ 
+ 	child.charset = c->encoding;
+ 	child.quirks = c->base.quirks;
+--- a/netsurf/content/handlers/html/object.h
++++ b/netsurf/content/handlers/html/object.h
+@@ -43,6 +43,8 @@
+  * \param background this is a background image
+  * \return true on success, false on memory exhaustion
+  */
++bool html_start_pending_images(struct html_content *c);
++
+ bool html_fetch_object(struct html_content *c, struct nsurl *url, struct box *box, content_type permitted_types, bool background);
+ 
+ /**
+--- a/netsurf/content/handlers/html/private.h
++++ b/netsurf/content/handlers/html/private.h
+@@ -168,6 +168,8 @@
+ 	unsigned int num_objects;
+ 	/** List of objects. */
+ 	struct content_html_object *object_list;
++	/** Requests waiting until the document has a box tree. */
++	struct pending_image *image_first, *image_last;
+ 	/** Forms, in reverse order to document. */
+ 	struct form *forms;
+ 	/** Hash table of imagemaps. */
+@@ -226,6 +228,8 @@
+  * \param htmlc HTML content
+  * \param box The box to redraw.
+  */
++void html_schedule_dom_reflow(html_content *c);
++
+ void html__redraw_a_box(html_content *htmlc, struct box *box);
+ 
+ 
+--- a/netsurf/content/handlers/html/redraw.c
++++ b/netsurf/content/handlers/html/redraw.c
+@@ -1,3 +1,4 @@
++#include <limits.h>
+ /*
+  * Copyright 2004-2008 James Bursa <bursa@users.sourceforge.net>
+  * Copyright 2004-2007 John M Bell <jmb202@ecs.soton.ac.uk>
+@@ -67,6 +68,8 @@
+ 
+ bool html_redraw_debug = false;
+ 
++#include "rounded.inc"
++
+ /**
+  * Determine if a box has a background that needs drawing
+  *
+@@ -573,6 +576,20 @@
+ }
+ 
+ 
++static void background_dimensions(struct box *box, int area_w, int area_h,
++		int *width, int *height)
++{
++	*width = content_get_width(box->background);
++	*height = content_get_height(box->background);
++	if (*width <= 0 || *height <= 0 || area_w <= 0 || area_h <= 0) return;
++	uint8_t size = css_computed_background_size(box->style);
++	if (size != CSS_BACKGROUND_SIZE_COVER && size != CSS_BACKGROUND_SIZE_CONTAIN) return;
++	double sx = (double)area_w / *width, sy = (double)area_h / *height;
++	double factor = size == CSS_BACKGROUND_SIZE_COVER ? fmax(sx,sy) : fmin(sx,sy);
++	*width = (int)fmin(INT_MAX, fmax(1, round(*width * factor)));
++	*height = (int)fmin(INT_MAX, fmax(1, round(*height * factor)));
++}
++
+ /**
+  * Plot background images.
+  *
+@@ -605,7 +622,7 @@
+ 	bool clip_to_children = false;
+ 	struct box *clip_box = box;
+ 	int ox = x, oy = y;
+-	int width, height;
++	int width, height, image_width = 0, image_height = 0;
+ 	css_fixed hpos = 0, vpos = 0;
+ 	css_unit hunit = CSS_UNIT_PX, vunit = CSS_UNIT_PX;
+ 	struct box *parent;
+@@ -640,6 +657,7 @@
+ 			height = box->padding[TOP] + box->height +
+ 					box->padding[BOTTOM];
+ 		}
++		background_dimensions(background, width, height, &image_width, &image_height);
+ 		/* handle background-repeat */
+ 		switch (css_computed_background_repeat(background->style)) {
+ 		case CSS_BACKGROUND_REPEAT_REPEAT:
+@@ -669,7 +687,7 @@
+ 				&hpos, &hunit, &vpos, &vunit);
+ 		if (hunit == CSS_UNIT_PCT) {
+ 			x += (width -
+-				content_get_width(background->background)) *
++				image_width) *
+ 				scale * FIXTOFLT(hpos) / 100.;
+ 		} else {
+ 			x += (int) (FIXTOFLT(css_unit_len2device_px(
+@@ -679,7 +697,7 @@
+ 
+ 		if (vunit == CSS_UNIT_PCT) {
+ 			y += (height -
+-				content_get_height(background->background)) *
++				image_height) *
+ 				scale * FIXTOFLT(vpos) / 100.;
+ 		} else {
+ 			y += (int) (FIXTOFLT(css_unit_len2device_px(
+@@ -756,8 +774,8 @@
+ 		}
+ 		/* and plot the image */
+ 		if (plot_content) {
+-			width = content_get_width(background->background);
+-			height = content_get_height(background->background);
++			width = image_width;
++			height = image_height;
+ 
+ 			/* ensure clip area only as large as required */
+ 			if (!repeat_x) {
+@@ -832,6 +850,7 @@
+ 	bool repeat_y = false;
+ 	bool plot_colour = true;
+ 	bool plot_content;
++	int image_width = 0, image_height = 0;
+ 	css_fixed hpos = 0, vpos = 0;
+ 	css_unit hunit = CSS_UNIT_PX, vunit = CSS_UNIT_PX;
+ 	css_color bgcol;
+@@ -847,6 +866,8 @@
+ 		return true;
+ 
+ 	if (plot_content) {
++		background_dimensions(box, (b.x1-b.x0)/scale, (b.y1-b.y0)/scale,
++				&image_width, &image_height);
+ 		/* handle background-repeat */
+ 		switch (css_computed_background_repeat(box->style)) {
+ 		case CSS_BACKGROUND_REPEAT_REPEAT:
+@@ -877,7 +898,7 @@
+ 				&hpos, &hunit, &vpos, &vunit);
+ 		if (hunit == CSS_UNIT_PCT) {
+ 			x += (b.x1 - b.x0 -
+-					content_get_width(box->background) *
++					image_width *
+ 					scale) * FIXTOFLT(hpos) / 100.;
+ 
+ 			if (!repeat_x && ((hpos < 2 && !first) ||
+@@ -892,7 +913,7 @@
+ 
+ 		if (vunit == CSS_UNIT_PCT) {
+ 			y += (b.y1 - b.y0 -
+-					content_get_height(box->background) *
++					image_height *
+ 					scale) * FIXTOFLT(vpos) / 100.;
+ 		} else {
+ 			y += (int) (FIXTOFLT(css_unit_len2device_px(
+@@ -917,8 +938,8 @@
+ 	}
+ 	/* and plot the image */
+ 	if (plot_content) {
+-		int width = content_get_width(box->background);
+-		int height = content_get_height(box->background);
++		int width = image_width;
++		int height = image_height;
+ 
+ 		if (!repeat_x) {
+ 			if (r.x0 < x)
+@@ -1187,7 +1208,7 @@
+ {
+ 	struct box *c;
+ 
+-	for (c = box->children; c; c = c->next) {
++	for (c = box->paint_first; c; c = c->paint_next) {
+ 
+ 		if (c->type != BOX_FLOAT_LEFT && c->type != BOX_FLOAT_RIGHT)
+ 			if (!html_redraw_box(html, c,
+@@ -1467,7 +1488,12 @@
+ 	/* background colour and image for block level content and replaced
+ 	 * inlines */
+ 
+-	bg_box = html_redraw_find_bg_box(box);
++	bool rounded = false;
++	struct rect bounds = { x - border_left, y - border_top,
++		x + padding_width + border_right, y + padding_height + border_bottom };
++	if (!rounded_box(box, bounds, &r, scale, &html->unit_len_ctx,
++			&current_background_color, ctx, &rounded)) return false;
++	bg_box = rounded ? NULL : html_redraw_find_bg_box(box);
+ 
+ 	/* bg_box == NULL implies that this box should not have
+ 	* its background rendered. Otherwise filter out linebreaks,
+@@ -1524,7 +1550,7 @@
+ 	}
+ 
+ 	/* borders for block level content and replaced inlines */
+-	if (box->style &&
++	if (!rounded && box->style &&
+ 	    box->type != BOX_TEXT &&
+ 	    box->type != BOX_INLINE_END &&
+ 	    (box->type != BOX_INLINE || box->object ||
+--- a/netsurf/content/handlers/image/image.c
++++ b/netsurf/content/handlers/image/image.c
+@@ -47,7 +47,9 @@
+  */
+ nserror image_init(void)
+ {
+-	nserror error = NSERROR_OK;
++	extern nserror lx_svg_init(void);
++	nserror error = lx_svg_init();
++	if (error != NSERROR_OK) return error;
+ 
+ #ifdef WITH_BMP
+ 	error = nsbmp_init();
+--- a/netsurf/content/handlers/javascript/duktape/Makefile
++++ b/netsurf/content/handlers/javascript/duktape/Makefile
+@@ -28,7 +28,10 @@
+ # ensure genbind generates debugging files
+ GBFLAGS+=-D
+ 
+-$(OBJROOT)/duktape/binding.h $(OBJROOT)/duktape/Makefile: content/handlers/javascript/duktape/netsurf.bnd $(BINDINGS)
++# nsgenbind creates both files in one run.
++$(OBJROOT)/duktape/binding.h: $(OBJROOT)/duktape/Makefile
++
++$(OBJROOT)/duktape/Makefile: content/handlers/javascript/duktape/netsurf.bnd $(BINDINGS)
+ 	$(Q)$(MKDIR) -p $(OBJROOT)/duktape
+ 	$(VQ)echo " GENBIND: $<"
+ 	$(Q)nsgenbind $(GBFLAGS) -I content/handlers/javascript/WebIDL $< $(OBJROOT)/duktape
+--- a/netsurf/content/handlers/javascript/duktape/Window.bnd
++++ b/netsurf/content/handlers/javascript/duktape/Window.bnd
+@@ -419,6 +419,12 @@
+ %}
+ 
+ getter Window::window()
++%{
++	duk_push_this(ctx);
++	return 1;
++%}
++
++getter Window::self()
+ %{
+ 	duk_push_this(ctx);
+ 	return 1;
+--- a/netsurf/content/handlers/javascript/duktape/dukky.c
++++ b/netsurf/content/handlers/javascript/duktape/dukky.c
+@@ -1286,7 +1286,7 @@
+ 		duk_pop(ctx);
+ 		/* ... copy handler callback */
+ 		if (((phase == DOM_CAPTURING_PHASE) && !(flags & ELF_CAPTURE)) ||
+-		    ((phase != DOM_CAPTURING_PHASE) && (flags & ELF_CAPTURE))) {
++		    ((phase == DOM_BUBBLING_PHASE) && (flags & ELF_CAPTURE))) {
+ 			duk_pop_2(ctx);
+ 			/* ... copy */
+ 			continue;
+--- a/netsurf/frontends/framebuffer/bitmap.c
++++ b/netsurf/frontends/framebuffer/bitmap.c
+@@ -25,6 +25,7 @@
+ #include <sys/types.h>
+ #include <stdbool.h>
+ #include <assert.h>
++#include <string.h>
+ #include <libnsfb.h>
+ #include <libnsfb_plot.h>
+ 
+@@ -65,6 +66,13 @@
+ 	if (nsfb_init(bm) == -1) {
+ 		nsfb_free(bm);
+ 		return NULL;
++	}
++
++	if (flags & BITMAP_CLEAR) {
++		uint8_t *pixels;
++		int stride;
++		nsfb_get_buffer(bm, &pixels, &stride);
++		memset(pixels, 0, (size_t)stride * height);
+ 	}
+ 
+ 	return bm;
+--- a/netsurf/frontends/framebuffer/fbtk/event.c
++++ b/netsurf/frontends/framebuffer/fbtk/event.c
+@@ -301,6 +301,8 @@
+ fbtk_keycode_to_ucs4(int code, fbtk_modifier_type mods)
+ {
+ 	int ucs4 = -1;
++        /* The guest delivers text after the keyboard layout has been applied. */
++        if (mods == FBTK_MOD_CLEAR && code >= 32 && code <= 126) return code;
+ 
+ 	if (mods & FBTK_MOD_LSHIFT || mods & FBTK_MOD_RSHIFT) {
+ 		if ((code >= 0) && (code < (int) NOF_ELEMENTS(sh_keymap)))
+--- a/netsurf/frontends/framebuffer/fbtk/fbtk.c
++++ b/netsurf/frontends/framebuffer/fbtk/fbtk.c
+@@ -293,6 +293,18 @@
+ 	parent = widget->parent;
+ 	if (parent != NULL) {
+ 
++		fbtk_widget_t *root = fbtk_get_root_widget(parent);
++		if (root->u.root.input == widget)
++			root->u.root.input = NULL;
++		if (root->u.root.prev == widget)
++			root->u.root.prev = NULL;
++		if (root->u.root.grabbed == widget)
++			root->u.root.grabbed = NULL;
++		if (root->u.root.caret.owner == widget) {
++			root->u.root.caret.owner = NULL;
++			root->u.root.caret.remove_cb = NULL;
++		}
++
+ 		/* unlink from siblings */
+ 		if (widget->prev != NULL) {
+ 			widget->prev->next = widget->next;
+--- a/netsurf/frontends/framebuffer/fetch.c
++++ b/netsurf/frontends/framebuffer/fetch.c
+@@ -67,6 +67,8 @@
+ 	int l;
+ 	NSLOG(netsurf, INFO, "unix path %s", unix_path);
+ 	l = strlen(unix_path);
++	if (l >= 3 && strcasecmp(unix_path + l - 3, ".js") == 0)
++		return "text/javascript";
+ 	if (2 < l && strcasecmp(unix_path + l - 3, "css") == 0)
+ 		return "text/css";
+ 	if (2 < l && strcasecmp(unix_path + l - 3, "f79") == 0)
+--- a/netsurf/frontends/framebuffer/font_internal.c
++++ b/netsurf/frontends/framebuffer/font_internal.c
+@@ -32,6 +32,8 @@
+ #include "framebuffer/font.h"
+ 
+ #include <font-ns-sans.h>
++#include "han.h"
++#include "shaping.h"
+ 
+ #define GLYPH_LEN		16
+ 
+@@ -348,6 +350,14 @@
+ }
+ 
+ 
++int fb_css_em(const plot_font_style_t *style)
++{
++    /* plot sizes are in points, at 96 CSS pixels per inch. */
++    int px = ((int64_t)style->size * 4 + 3*PLOT_STYLE_SCALE/2)/(3*PLOT_STYLE_SCALE);
++    if (style->size == 0) return 0;
++    return px < 1 ? 1 : px > 256 ? 256 : px;
++}
++
+ /* exported interface documented in framebuffer/freetype_font.h */
+ nserror
+ fb_font_width(const plot_font_style_t *fstyle,
+@@ -357,18 +367,28 @@
+ {
+         size_t nxtchr = 0;
+ 
++	const int px = fb_css_em(fstyle);
++	const int style = fb_get_font_style(fstyle) | (fstyle->family == PLOT_FONT_FAMILY_MONOSPACE ? 4 : 0);
+ 	*width = 0;
++        if (px == 0) return NSERROR_OK;
+         while (nxtchr < length) {
++            struct shaped_run run=ns_shape(string+nxtchr,length-nxtchr,px);
++            if (run.bytes) {
++                *width += run.width;
++                nxtchr+=run.bytes;
++                continue;
++            }
++
+ 		uint32_t ucs4;
+ 		ucs4 = utf8_to_ucs4(string + nxtchr, length - nxtchr);
+ 		if (codepoint_displayable(ucs4)) {
+-			*width += FB_FONT_WIDTH;
++			*width += ns_advance(ucs4, style, px);
+ 		}
+ 
+ 		nxtchr = utf8_next(string, length, nxtchr);
+         }
+ 
+-	*width *= fb_get_font_size(fstyle);
++
+ 	return NSERROR_OK;
+ }
+ 
+@@ -382,18 +402,33 @@
+ 		 size_t *char_offset,
+ 		 int *actual_x)
+ {
+-        const int width = fb_get_font_size(fstyle) * FB_FONT_WIDTH;
++        const int px = fb_css_em(fstyle);
++        const int style = fb_get_font_style(fstyle) | (fstyle->family == PLOT_FONT_FAMILY_MONOSPACE ? 4 : 0);
+         size_t nxtchr = 0;
+ 	int x_pos = 0;
++        if (px == 0) { *actual_x = 0; *char_offset = 0; return NSERROR_OK; }
+ 
+         while (nxtchr < length) {
++            struct shaped_run run=ns_shape(string+nxtchr,length-nxtchr,px);
++            if (run.bytes) {
++                if (x <= x_pos+run.width) {
++                    int pos;
++                    *char_offset=nxtchr+ns_shaped_caret(run,x-x_pos,&pos);
++                    *actual_x=x_pos+pos; return NSERROR_OK;
++                }
++                x_pos+=run.width;
++                nxtchr+=run.bytes;
++                continue;
++            }
++
+ 		uint32_t ucs4;
+-                if (abs(x_pos - x) <= (width / 2))
+-                        break;
++
+ 
+ 		ucs4 = utf8_to_ucs4(string + nxtchr, length - nxtchr);
+ 		if (codepoint_displayable(ucs4)) {
+-			x_pos += width;
++			int advance = ns_advance(ucs4, style, px);
++			if (x <= x_pos + advance / 2) break;
++			x_pos += advance;
+ 		}
+ 
+                 nxtchr = utf8_next(string, length, nxtchr);
+@@ -436,13 +471,27 @@
+ 	      size_t *char_offset,
+ 	      int *actual_x)
+ {
+-        const int width = fb_get_font_size(fstyle) * FB_FONT_WIDTH;
++        const int px = fb_css_em(fstyle);
++        const int style = fb_get_font_style(fstyle) | (fstyle->family == PLOT_FONT_FAMILY_MONOSPACE ? 4 : 0);
+         size_t nxtchr = 0;
+         int last_space_x = 0;
+         int last_space_idx = 0;
++        uint32_t previous = 0;
+ 
+         *actual_x = 0;
++        if (px == 0) { *char_offset = length; return NSERROR_OK; }
+         while (nxtchr < length) {
++            struct shaped_run run=ns_shape(string+nxtchr,length-nxtchr,px);
++            if (run.bytes) {
++                *actual_x+=run.width;
++                previous=0;
++                if (*actual_x>x && last_space_idx) {
++                    *char_offset=last_space_idx; *actual_x=last_space_x; return NSERROR_OK;
++                }
++                nxtchr+=run.bytes;
++                continue;
++            }
++
+ 		uint32_t ucs4;
+ 
+                 if (string[nxtchr] == ' ') {
+@@ -452,7 +501,12 @@
+ 
+ 		ucs4 = utf8_to_ucs4(string + nxtchr, length - nxtchr);
+ 		if (codepoint_displayable(ucs4)) {
+-			*actual_x += width;
++			if (ns_break_between(previous, ucs4)) {
++                last_space_x = *actual_x;
++                last_space_idx = nxtchr;
++            }
++            previous = ucs4;
++            *actual_x += ns_advance(ucs4, style, px);
+ 		}
+ 
+                 if (*actual_x > x && last_space_idx != 0) {
+--- a/netsurf/frontends/framebuffer/font_internal.h
++++ b/netsurf/frontends/framebuffer/font_internal.h
+@@ -38,6 +38,7 @@
+ };
+ 
+ enum fb_font_style fb_get_font_style(const plot_font_style_t *fstyle);
++int fb_css_em(const plot_font_style_t *style);
+ int fb_get_font_size(const plot_font_style_t *fstyle);
+ 
+ #define codepoint_displayable(u) \
+--- a/netsurf/frontends/framebuffer/framebuffer.c
++++ b/netsurf/frontends/framebuffer/framebuffer.c
+@@ -36,6 +36,8 @@
+ #include "netsurf/bitmap.h"
+ 
+ #include "framebuffer/gui.h"
++#include "han.h"
++#include "shaping.h"
+ #include "framebuffer/fbtk.h"
+ #include "framebuffer/framebuffer.h"
+ #include "framebuffer/font.h"
+@@ -483,14 +485,17 @@
+ 		size_t length)
+ {
+     enum fb_font_style style = fb_get_font_style(fstyle);
+-    int size = fb_get_font_size(fstyle);
++    int px = fb_css_em(fstyle);
++    if (px == 0) return NSERROR_OK;
++    int size = px >= 24 ? 2 : 1;
++    int latin_style = style | (fstyle->family == PLOT_FONT_FAMILY_MONOSPACE ? 4 : 0);
+     const uint8_t *chrp;
+     size_t nxtchr = 0;
+     nsfb_bbox_t loc;
+     uint32_t ucs4;
+     int p = FB_FONT_PITCH * size;
+     int w = FB_FONT_WIDTH * size;
+-    int h = FB_FONT_HEIGHT * size;
++    int h = px;
+ 
+     y -= ((h * 3) / 4);
+     /* the coord is the bottom-left of the pixels offset by 1 to make
+@@ -498,6 +503,18 @@
+     y += 1;
+ 
+     while (nxtchr < length) {
++        struct shaped_run run=ns_shape(text+nxtchr,length-nxtchr,px);
++        if (run.bytes) {
++            for (unsigned i=0;i<run.count;i++) {
++                struct shaped_glyph g=ns_shaped_glyph(i);
++                if (!g.mask) continue;
++                loc.x0=x+g.x; loc.y0=y+h*3/4+g.y;
++                loc.x1=loc.x0+g.width; loc.y1=loc.y0+g.height;
++                nsfb_plot_glyph8(nsfb,&loc,g.mask,g.width,fstyle->foreground);
++            }
++            x+=run.width; nxtchr+=run.bytes; continue;
++        }
++
+ 	ucs4 = utf8_to_ucs4(text + nxtchr, length - nxtchr);
+ 	nxtchr = utf8_next(text, length, nxtchr);
+ 
+@@ -509,10 +526,42 @@
+ 	loc.x1 = loc.x0 + w;
+ 	loc.y1 = loc.y0 + h;
+ 
+-	chrp = fb_get_glyph(ucs4, style, size);
++	const uint8_t *mask;
++        if ((px != 16 && px != 32) || (ucs4 >= 0xac00 && ucs4 <= 0xd7a3)) {
++            int stride;
++            mask = ns_outline_mask(ucs4, latin_style, px, &stride);
++            if (mask) {
++                loc.x0 -= px/8;
++                loc.x1 = loc.x0 + stride;
++                nsfb_plot_glyph8(nsfb, &loc, mask, stride, fstyle->foreground);
++                x += ns_advance(ucs4, latin_style, px);
++                continue;
++            }
++        }
++        w = size * FB_FONT_WIDTH;
++        loc.x1 = loc.x0 + w;
++        loc.y1 = loc.y0 + size * FB_FONT_HEIGHT;
++	int advance = lx_latin_glyph(ucs4, latin_style, size, &mask);
++	if (advance) {
++		loc.x0 -= 2 * size;
++		loc.x1 = loc.x0 + 20 * size;
++		nsfb_plot_glyph8(nsfb, &loc, mask, 20 * size, fstyle->foreground);
++		x += ns_advance(ucs4, latin_style, px);
++		continue;
++	}
++	if (ns_han_width(ucs4) == 2) {
++            const uint8_t *bits = ns_han_glyph(ucs4, size);
++            if (bits != NULL) {
++                loc.x1 += w;
++                nsfb_plot_glyph8(nsfb, &loc, bits, 16 * size, fstyle->foreground);
++                x += ns_advance(ucs4, latin_style, px);
++                continue;
++            }
++        }
++        chrp = fb_get_glyph(ucs4, style, size);
+ 	nsfb_plot_glyph1(nsfb, &loc, chrp, p, fstyle->foreground);
+ 
+-	x += w;
++	x += ns_advance(ucs4, latin_style, px);
+ 
+     }
+ 
+--- a/netsurf/frontends/framebuffer/gui.c
++++ b/netsurf/frontends/framebuffer/gui.c
+@@ -2177,7 +2177,7 @@
+  * /return The return code to the OS
+  */
+ int
+-main(int argc, char** argv)
++lixin_core_open(int argc, char** argv)
+ {
+ 	struct browser_window *bw;
+ 	char *options;
+@@ -2185,7 +2185,8 @@
+ 	nsurl *url;
+ 	nserror ret;
+ 	nsfb_t *nsfb;
+-	struct netsurf_table framebuffer_table = {
++	static struct netsurf_table framebuffer_table;
++	framebuffer_table = (struct netsurf_table) {
+ 		.misc = &framebuffer_misc_table,
+ 		.window = &framebuffer_window_table,
+ 		.clipboard = framebuffer_clipboard_table,
+@@ -2265,26 +2266,7 @@
+ 					      &bw);
+ 		nsurl_unref(url);
+ 	}
+-	if (ret != NSERROR_OK) {
+-		fb_warn_user("Errorcode:", messages_get_errorcode(ret));
+-	} else {
+-		framebuffer_run();
+-
+-		browser_window_destroy(bw);
+-	}
+-
+-	netsurf_exit();
+-
+-	if (fb_font_finalise() == false)
+-		NSLOG(netsurf, INFO, "Font finalisation failed.");
+-
+-	/* finalise options */
+-	nsoption_finalise(nsoptions, nsoptions_default);
+-
+-	/* finalise logging */
+-	nslog_finalise();
+-
+-	return 0;
++    return ret == NSERROR_OK ? 0 : 1;
+ }
+ 
+ void gui_resize(fbtk_widget_t *root, int width, int height)
+@@ -2321,3 +2303,5 @@
+  * c-basic-offset:8
+  * End:
+  */
++
++#include "hosted.inc"
+--- a/netsurf/frontends/framebuffer/schedule.c
++++ b/netsurf/frontends/framebuffer/schedule.c
+@@ -22,7 +22,15 @@
+ #include "utils/sys_time.h"
+ #include "utils/log.h"
+ 
+-#include "framebuffer/schedule.h"
++#include "framebuffer/schedule.h" 
++
++static void scheduler_now(struct timeval *tv)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    tv->tv_sec = ts.tv_sec;
++    tv->tv_usec = ts.tv_nsec / 1000;
++}
+ 
+ /* linked list of scheduled callbacks */
+ static struct nscallback *schedule_list = NULL;
+@@ -111,7 +119,7 @@
+ 
+ 	nscb = calloc(1, sizeof(struct nscallback));
+ 
+-	gettimeofday(&nscb->tv, NULL);
++	scheduler_now(&nscb->tv);
+ 	timeradd(&nscb->tv, &tv, &nscb->tv);
+ 
+ 	nscb->callback = callback;
+@@ -142,7 +150,7 @@
+         prev_nscb = NULL;
+ 	nexttime = cur_nscb->tv;
+ 
+-	gettimeofday(&tv, NULL);
++	scheduler_now(&tv);
+ 
+         while (cur_nscb != NULL) {
+                 if (timercmp(&tv, &cur_nscb->tv, >)) {
+@@ -198,7 +206,7 @@
+ 	struct timeval tv;
+         struct nscallback *cur_nscb;
+ 
+-	gettimeofday(&tv, NULL);
++	scheduler_now(&tv);
+ 
+         NSLOG(netsurf, INFO, "schedule list at %ld:%ld", tv.tv_sec,
+               tv.tv_usec);
+--- a/netsurf/resources/default.css
++++ b/netsurf/resources/default.css
+@@ -152,3 +152,6 @@
+ 	background: yellow;
+ 	color: black;
+ }
++
++/* HTML hidden content is omitted unless the author overrides display. */
++[hidden] { display: none; }
+--- a/netsurf/utils/config.h
++++ b/netsurf/utils/config.h
+@@ -135,7 +135,8 @@
+ #undef HAVE_STDOUT
+ #endif
+ 
+-#define HAVE_MMAP
++/* Guest mmap supports anonymous allocations. Use the stdio file fetcher. */
++#undef HAVE_MMAP
+ #if (defined(_WIN32) || defined(__riscos__) || defined(__HAIKU__) || defined(__BEOS__) || defined(__amigaos4__) || defined(__AMIGA__) || defined(__MINT__))
+ #undef HAVE_MMAP
+ #endif

@@ -1,0 +1,66 @@
+--- a/glib/gmappedfile.c
++++ b/glib/gmappedfile.c
+@@ -99,7 +99,9 @@
+ {
+   if (file->length)
+     {
+-#ifdef HAVE_MMAP
++#if defined (__lixinos__)
++      g_free (file->contents);
++#elif defined (HAVE_MMAP)
+       munmap (file->contents, file->length);
+ #endif
+ #ifdef G_OS_WIN32
+@@ -155,7 +157,51 @@
+ 
+   file->contents = MAP_FAILED;
+ 
+-#ifdef HAVE_MMAP
++#if defined (__lixinos__)
++  /* File-backed mmap is unavailable. Provide the private snapshot expected
++   * by users such as the GSettings schema reader, leaving fd's offset intact. */
++  if (!S_ISREG (st.st_mode) || st.st_size < 0 ||
++      (guint64) st.st_size > G_MAXSIZE)
++    errno = EINVAL;
++  else
++    {
++      gsize length = (gsize) st.st_size;
++      gchar *bytes = g_try_malloc (length);
++      gsize offset = 0;
++
++      if (bytes == NULL)
++        errno = ENOMEM;
++      else
++        {
++          while (offset < length)
++            {
++              gssize n = pread (fd, bytes + offset,
++                                MIN (length - offset, (gsize) G_MAXSSIZE), offset);
++              if (n < 0 && errno == EINTR)
++                continue;
++              if (n <= 0)
++                {
++                  if (n == 0)
++                    errno = EIO;
++                  break;
++                }
++              offset += n;
++            }
++
++          if (offset == length)
++            {
++              file->length = length;
++              file->contents = bytes;
++            }
++          else
++            {
++              int save_errno = errno;
++              g_free (bytes);
++              errno = save_errno;
++            }
++        }
++    }
++#elif defined (HAVE_MMAP)
+   if (sizeof (st.st_size) > sizeof (gsize) && st.st_size > (off_t) G_MAXSIZE)
+     {
+       errno = EINVAL;

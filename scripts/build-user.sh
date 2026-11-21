@@ -71,7 +71,7 @@ if [[ ! -f "$cache/agent-run.elf" || User/agent/run.c -nt "$cache/agent-run.elf"
 fi
 make -s -C User/foreground
 make -s -C User/core
-make -s -C User/desktop
+make -s -C User/desktop font ../../Kernel/target/user-build/nxeyes.elf ../../Kernel/target/user-build/stopwatch.elf
 
 links_version=2.30
 links_hash=c4631c6b5a11527cdc3cb7872fc23b7f2b25c2b021d596be410dadb40315f166

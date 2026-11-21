@@ -4,6 +4,116 @@ use super::*;
 use alloc::vec::Vec;
 const BORDER: usize = 6;
 const TITLE: usize = 44;
+const TAB_LEFT: usize = 164;
+const TAB_WIDTH: usize = 30;
+pub const MAX_TABS: usize = 4;
+
+#[derive(Clone, Copy)]
+pub enum TabAction { New, Select(usize), Close, Hide }
+
+struct TabBar {
+    count: usize,
+    action: Option<TabAction>,
+}
+static mut TAB_BARS: [Option<TabBar>; PANES] = [const { None }; PANES];
+static mut HIDDEN_TABS: [Vec<PopupScreen>; PANES] = [const { Vec::new() }; PANES];
+
+fn tab_bar() -> &'static mut Option<TabBar> {
+    unsafe { &mut (*addr_of_mut!(TAB_BARS))[ACTIVE] }
+}
+
+fn hidden_tabs() -> &'static mut Vec<PopupScreen> {
+    unsafe { &mut (*addr_of_mut!(HIDDEN_TABS))[ACTIVE] }
+}
+
+pub fn active_tab() -> Option<usize> { tab_bar().as_ref().map(|_| terminal_id()) }
+
+pub fn tab_input_allowed() -> bool {
+    let id = crate::scheduler::terminal_id();
+    if let Some(visible) = active_tab() { return id == visible; }
+    !hidden_tabs().iter().any(|screen| screen.3 == id)
+}
+
+pub(super) fn task_has_hidden_tab() -> bool {
+    let id = crate::scheduler::terminal_id();
+    id != 0 && hidden_tabs().iter().any(|screen| screen.3 == id)
+}
+
+pub(super) fn with_hidden_tab<T>(id: usize, f: impl FnOnce(&mut Terminal, &mut [u32], usize) -> T) -> Option<T> {
+    let PopupScreen(_, term, pixels, _) = hidden_tabs().iter_mut().find(|screen| screen.3 == id)?;
+    let start = 2 * (TITLE * term.stride + BORDER);
+    Some(f(term, &mut pixels[start..], term.cols * CW))
+}
+
+pub(super) fn write_hidden_tab(id: usize, byte: u8) -> bool {
+    with_hidden_tab(id, |term, pixels, _| {
+        let start = term.bar_rows() * CH * term.stride;
+        term.byte(&mut pixels[start..], byte);
+    }).is_some()
+}
+
+pub fn stash_tab() -> Option<(usize, usize)> {
+    *tab_bar() = None;
+    let mut screen = hide_popup(true)?;
+    let position = screen.0;
+    screen.1.stride = 2 * popup_width();
+    hidden_tabs().push(screen);
+    Some(position)
+}
+
+pub fn show_tab(id: usize, position: Option<(usize, usize)>) {
+    let tabs = hidden_tabs();
+    let Some(index) = tabs.iter().position(|tab| tab.3 == id) else { return };
+    let mut screen = tabs.swap_remove(index);
+    if let Some(pos) = position { screen.0 = pos; }
+    screen.1.stride = W;
+    show_popup(Some(screen), &[], false);
+}
+
+pub fn forget_tab(id: usize) {
+    hidden_tabs().retain(|screen| screen.3 != id);
+}
+
+pub fn set_tab_bar(active: usize, count: usize) {
+    *tab_bar() = Some(TabBar { count, action: None });
+    let _overlay = suspend_text_pointer();
+    let Some(win) = current() else { return };
+    let fb = framebuffer();
+    for index in 0..=MAX_TABS {
+        let x = win.position.0 + TAB_LEFT + index * TAB_WIDTH;
+        let y = win.position.1 + 8;
+        let start = offset((x, y));
+        let selected = index == active;
+        let exists = index < count || (index == count && count < MAX_TABS);
+        let bg = if selected { 0x395772 } else if exists { 0x202e38 } else { 0xe8eee8 };
+        for row in 0..56 {
+            let at = start + row * W;
+            fb[at..at + 2 * (TAB_WIDTH - 4)].fill(bg);
+        }
+        if exists {
+            let label = if index < count { b'1' + index as u8 } else { b'+' };
+            glyph(fb, offset((x + 8, y + 3)), CW, label, 0xf0f5fc, bg);
+        }
+    }
+}
+
+pub fn tab_action() -> Option<TabAction> {
+    let action = tab_bar().as_mut().and_then(|bar| bar.action.take());
+    let win = current()?;
+    if core::mem::take(&mut win.close) { Some(TabAction::Close) }
+    else if core::mem::take(&mut win.minimize) { Some(TabAction::Hide) }
+    else { action }
+}
+
+fn tab_click(x: usize, y: usize) -> bool {
+    let Some(bar) = tab_bar().as_mut() else { return false; };
+    if !(8..36).contains(&y) || x < TAB_LEFT { return false; }
+    let tab = (x - TAB_LEFT) / TAB_WIDTH;
+    if tab < bar.count { bar.action = Some(TabAction::Select(tab)); }
+    else if tab == bar.count && tab < MAX_TABS { bar.action = Some(TabAction::New); }
+    else { return false; }
+    true
+}
 fn popup_cols() -> usize { (display::size().cols - 8).min(76) }
 fn popup_rows() -> usize { ((canvas_h() - TITLE - BORDER) * 2 / CH).min(21) }
 fn popup_width() -> usize { popup_cols() * CW / 2 + 2 * BORDER }
@@ -18,12 +128,11 @@ pub(super) struct Window {
     editor: bool,
     selecting: bool,
     pointer_events: alloc::collections::VecDeque<u32>,
-    pointer_position: Option<Point>,
     down: bool,
     grab: Option<Point>,
-    cursor: Option<Point>,
     close: bool,
     minimize: bool,
+    paste: bool,
 }
 static mut WINDOWS: [Option<Window>; PANES] = [const { None }; PANES];
 pub struct PopupScreen(Point, Terminal, Vec<u32>, usize);
@@ -38,16 +147,19 @@ fn offset((x, y): Point) -> usize {
     BAR_PIXELS + unsafe { ACTIVE } * (pane_width() + CW) + 2 * (y * W + x)
 }
 fn framebuffer() -> &'static mut [u32] {
-    unsafe { &mut (*addr_of_mut!(FB)).0 }
+    unsafe { &mut (*FB).0 }
 }
 
 pub fn popup_active() -> bool {
     current().is_some()
 }
 pub fn columns() -> usize {
-    if popup_active() { popup_cols() } else { display::size().cols }
+    if task_has_hidden_tab() || popup_active() { popup_cols() } else { display::size().cols }
 }
 pub fn rows() -> usize {
+    if let Some(rows) = with_hidden_tab(crate::scheduler::terminal_id(), |term, _, _| term.rows) {
+        return rows;
+    }
     current().map_or_else(|| unsafe { TERMS[ACTIVE].rows }, |win| win.term.rows)
 }
 
@@ -65,7 +177,6 @@ pub fn title_strip(canvas: &Canvas, width: usize) -> Result<Vec<u32>, &'static s
 }
 impl Window {
     pub(super) fn with_terminal<T>(&mut self, f: impl FnOnce(&mut Terminal, &mut [u32], usize) -> T) -> T {
-        self.erase_pointer();
         let start = self.text_origin();
         let width = self.term.cols * CW;
         f(&mut self.term, &mut framebuffer()[start..], width)
@@ -82,11 +193,6 @@ impl Window {
         for (y, row) in self.underlay.chunks_exact_mut(2 * popup_width()).enumerate() {
             let begin = start + y * W;
             row.swap_with_slice(&mut fb[begin..begin + 2 * popup_width()]);
-        }
-    }
-    fn erase_pointer(&mut self) {
-        if let Some((x, y)) = self.cursor.take() {
-            toggle_pointer(x, y);
         }
     }
     fn move_to(&mut self, pos: Point) {
@@ -155,12 +261,10 @@ impl Window {
         self.position = pos;
     }
     fn input(&mut self, event: u64) {
-        self.erase_pointer();
         if event & (1 << 28) != 0 {
             self.down = false;
             self.grab = None;
             self.selecting = false;
-            self.pointer_position = None;
             return;
         }
         let x = (event & 4095) as usize;
@@ -186,7 +290,7 @@ impl Window {
                     && (popup_width() - 68..popup_width() - 40).contains(&dx)
                 {
                     self.minimize = true;
-                } else {
+                } else if !tab_click(dx, dy) {
                     self.grab = Some((dx, dy));
                 }
             }
@@ -195,7 +299,6 @@ impl Window {
         let point = (inside && (left..left + popup_cols() * CW / 2).contains(&x)
             && (top..top + popup_rows() * CH / 2).contains(&y))
             .then(|| ((x - left) * 2 / CW, (y - top) * 2 / CH));
-        self.pointer_position = inside.then_some((x,y));
         if self.editor {
             let press = down && !self.down && point.is_some();
             if press || self.selecting {
@@ -217,13 +320,10 @@ impl Window {
             self.term.select(pixels, body_point, down);
         }
         self.down = down;
-        if inside {
-            toggle_pointer(x, y);
-            self.cursor = Some((x, y));
-        }
     }
 }
 pub fn show_popup(saved: Option<PopupScreen>, title: &[u32], editor: bool) {
+    hide_text_pointer();
     reset_pointer();
     let mut win = Window {
         id: unsafe { let id=NEXT_WINDOW; NEXT_WINDOW+=1;id },
@@ -237,12 +337,11 @@ pub fn show_popup(saved: Option<PopupScreen>, title: &[u32], editor: bool) {
         editor,
         selecting: false,
         pointer_events: Default::default(),
-        pointer_position: None,
         down: false,
         grab: None,
-        cursor: None,
         close: false,
         minimize: false,
+        paste: false,
     };
     if let Some(PopupScreen(pos, term, pixels,id)) = saved {
         win.id=id;
@@ -283,7 +382,8 @@ pub fn show_popup(saved: Option<PopupScreen>, title: &[u32], editor: bool) {
 }
 pub fn hide_popup(save: bool) -> Option<PopupScreen> {
     let mut win = unsafe { WINDOWS[ACTIVE].take()? };
-    win.erase_pointer();
+    hide_text_pointer();
+    edit_menu::close();
     let start = win.text_origin() + win.term.bar_rows() * BAR_PIXELS;
     win.term.clear_selection(&mut framebuffer()[start..]);
     win.swap_pixels();
@@ -293,30 +393,55 @@ pub(super) fn write_popup(byte: u8) -> bool {
     let Some(win) = current() else {
         return false;
     };
-    win.erase_pointer();
     let start = win.text_origin() + win.term.bar_rows() * BAR_PIXELS;
     win.term.byte(&mut framebuffer()[start..], byte);
     true
 }
 pub fn poll_window() {
-    let Some(win) = current() else {
-        poll_console_selection();
+    if !pointer_focused() || task_has_hidden_tab() {
         return;
-    };
-    let mut event = pointer_event();
-    while event != u64::MAX {
-        let mut next = pointer_event();
-        // Once grabbed, skip stale motion with the same button/inside state.
-        // Deliver presses, releases and cancellations in their original order.
-        if win.grab.is_some() && event & (1 << 24) != 0 {
-            while next != u64::MAX && next >> 24 == event >> 24 {
-                event = next;
-                next = pointer_event();
-            }
-        }
-        win.input(event);
-        event = next;
     }
+    if crate::foreground::canvas_active() || (!popup_active() && unsafe { CANVAS_OPEN[ACTIVE] }) {
+        return;
+    }
+    loop {
+        let event = read_pointer();
+        if event == u64::MAX { break; }
+        hide_text_pointer();
+        let (event, action) = edit_menu::input(event, || editor_popup() || !copied_text().is_empty());
+        if let Some(win) = current() {
+            win.input(event);
+        } else {
+            console_selection(event);
+        }
+        match action {
+            Some(edit_menu::Action::Copy) if editor_popup() => {
+                if let Some(win) = current() { win.pointer_events.push_back(3); }
+            }
+            Some(edit_menu::Action::Copy) => crate::clipboard::copy(copied_text()),
+            Some(edit_menu::Action::Paste) if active_tab().is_some() => {
+                if let Some(win) = current() { win.paste = true; }
+            }
+            Some(edit_menu::Action::Paste) => crate::clipboard::paste(),
+            None => (),
+        }
+    }
+    show_text_pointer();
+}
+pub fn tab_paste() {
+    if active_tab().is_some() && current().is_some_and(|win| core::mem::take(&mut win.paste)) {
+        crate::clipboard::paste();
+    }
+}
+
+pub(super) fn over_text(x: usize, y: usize) -> bool {
+    if let Some(win) = current() {
+        let left = win.position.0 + BORDER;
+        let top = win.position.1 + TITLE + win.term.bar_rows() * CH / 2;
+        return (left..left + win.term.cols * CW / 2).contains(&x)
+            && (top..top + win.term.rows * CH / 2).contains(&y);
+    }
+    y >= unsafe { TERMS[ACTIVE].bar_rows() } * CH / 2
 }
 pub(super) fn popup_selection() -> Option<Vec<u8>> {
     Some(current()?.term.selection_text())
@@ -329,13 +454,8 @@ pub fn editor_popup() -> bool {
 }
 pub fn editor_event() -> u64 {
     loop {
+        poll_window();
         if let Some(win) = current() {
-            if win.cursor.is_none() {
-                if let Some((x,y)) = win.pointer_position {
-                    toggle_pointer(x,y);
-                    win.cursor = Some((x,y));
-                }
-            }
             if let Some(event) = win.pointer_events.pop_front() {
                 return u64::from(event);
             }
@@ -347,11 +467,11 @@ pub fn editor_event() -> u64 {
     }
 }
 pub fn terminal_closed() -> bool {
-    current().is_some_and(|w| !w.editor && w.close)
+    active_tab().is_none() && current().is_some_and(|w| !w.editor && w.close)
 }
 pub fn window_input() -> Option<u8> {
     let w = current()?;
-    if w.close {
+    if w.close && active_tab().is_none() {
         if w.editor {
             w.close = false;
             Some(17)
@@ -364,11 +484,11 @@ pub fn window_input() -> Option<u8> {
 }
 pub fn popup_key() -> u64 {
     loop {
+        if crate::scheduler::stopped() != 0 { return 4; }
         if let Some(c) = crate::poll_byte() {
-            return if c == 29 { 257 } else { u64::from(c) };
-        }
-        if current().is_some_and(|w| core::mem::take(&mut w.minimize)) {
-            return 257;
+            if c != 29 { return u64::from(c); }
+            if active_tab().is_none() { return 257; }
+            if let Some(w) = current() { w.minimize = true; }
         }
         crate::scheduler::sleep_ms(1);
     }

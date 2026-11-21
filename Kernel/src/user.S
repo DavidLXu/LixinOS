@@ -40,7 +40,7 @@ user_sync:
     b.eq resume_shell
     cmp x8, #32
     b.eq suspend_for_child
-    cmp x8, #54
+    cmp x8, #57
     b.hi unknown_call
     // The kernel uses the soft-float target (no SIMD registers). Preserve
     // the user integer context across the shared Rust console implementation.
@@ -66,6 +66,15 @@ user_sync:
     ldp x5, x6, [sp], #16
     ldp x3, x4, [sp], #16
     ldp x1, x2, [sp], #16
+    cmn x0, #4095
+    b.ne 3f
+    mov x0, #130
+    b resume_shell
+3:  cmn x0, #4094
+    b.ne 4f
+    mov x0, #137
+    b resume_shell
+4:
     // A closed desktop terminal unwinds the foreground process at a syscall.
     cmn x0, #1, lsl #12
     b.ne 1f
@@ -91,9 +100,7 @@ user_fault:
     mrs x3, sp_el0
     bl report_user_fault
     b resume_shell
-.global agent_timeout_exit
-agent_timeout_exit:
-    mov x0, #124
+.global resume_shell
 resume_shell:
     ldp x27, x28, [sp], #16
     ldp x25, x26, [sp], #16

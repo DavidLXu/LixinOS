@@ -18,7 +18,7 @@ static int transfer(int fd, void *buffer, size_t length, int writing) {
     for (int i = 0; i < 1500; i++) {
         int n = writing ? lx_tcp_write(fd, buffer, length) : lx_tcp_read(fd, buffer, length);
         if (n != LX_TCP_AGAIN) return n > 0 ? n : -1;
-        if (lx_timed_byte(8) == 3) break;
+        if (lx_transport_wait()) break;
     }
     return -1;
 }

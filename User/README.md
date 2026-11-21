@@ -31,6 +31,18 @@ in user space. The core directory builds the individual
 EL0 text utilities installed in /bin. Run `python3 scripts/test-foreground.py`
 and `python3 scripts/test-panes.py` on the host to exercise these interfaces.
 
+The optional [Node.js package](node/README.md) runs JavaScript with V8 and libuv.
+
+The optional [dte package](dte/README.md) adds a terminal code editor with
+multiple tabs, UTF-8 editing, and compiler diagnostic navigation.
+The optional [Lite XL package](lite-xl/README.md) adds a desktop code
+editor with a project tree, mouse editing, and Chinese font fallback.
+The optional [GTK 3 package](gtk3/README.md) adds a native window backend,
+a C demo, and a host-side static library sysroot for porting GTK applications.
+
+The [ClassiCube port](classicube/README.md) runs classic creative worlds in the
+graphical shell. Launch it with `classicube` after installing the package.
+
 ### LixinOS Bash
 
 The default login shell is a C program at `/bin/bash`. The stock `/bin/sh`

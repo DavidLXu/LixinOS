@@ -2,31 +2,16 @@
 #include <string.h>
 #include <stdlib.h>
 #include "unicode.h"
+#include "../gui/han-font.h"
 extern const unsigned char desktop_font[];
 enum { PAPER=0xffffff, INK=0x172e32, TOOL=0xe7efee, LINK=0x185e93, WALL=0x26494c };
 static void rect(struct browser_window *w,int x,int y,int width,int height,unsigned c) {
     lx_gui_rect(&w->canvas,w->x+x,w->y+y,width,height,c);
 }
-static unsigned char *han;
-static void load_han(void) {
-    const size_t bytes=0x7300*32;
-    int fd=lx_open("/src/links/han.font");
-    if (fd<0) return;
-    unsigned char *buf=malloc(bytes);
-    size_t n=0;
-    while (buf && n<bytes) {
-        int got=lx_read(fd,buf+n,bytes-n);
-        if (got<=0) break;
-        n+=got;
-    }
-    lx_close(fd);
-    if (n==bytes) han=buf; else free(buf);
-}
 static void glyph(struct browser_window *w,int x,int y,unsigned ch,unsigned color,unsigned bg) {
     if (ch==WIDE_TAIL) return;
-    int slot=han_slot(ch);
-    if (slot>=0 && han && x+18<=w->w) {
-        const unsigned char *bits=han+slot*32;
+    const unsigned char *bits=lx_han_glyph(ch);
+    if (bits && x+18<=w->w) {
         rect(w,x,y,18,22,bg);
         for (int j=0;j<16;j++) for (int i=0;i<16;i++)
             if (bits[j*2+i/8] & (128>>(i%8)))
@@ -52,12 +37,11 @@ static void label(struct browser_window *w,int x,int y,int width,const char *s,u
 }
 int window_open(struct browser_window *w) {
     if (lx_gui_open(&w->canvas)<0) return 0;
-    load_han();
     w->x=12; w->y=12; w->w=w->canvas.width-24; w->h=w->canvas.height-24;
     return 1;
 }
 void window_frame(struct browser_window *w,const char *title,const char *address,const char *status) {
-    lx_gui_rect(&w->canvas,0,0,w->canvas.width,w->canvas.height,WALL);
+    if (!w->hosted) lx_gui_rect(&w->canvas,0,0,w->canvas.width,w->canvas.height,WALL);
     rect(w,0,0,w->w,w->h,PAPER);
     rect(w,0,0,w->w,44,INK);
     label(w,14,11,60,"Links",PAPER,INK);
@@ -77,6 +61,7 @@ void window_char(struct browser_window *w,int col,int row,unsigned ch,int link) 
     if (link) rect(w,x,y+19,WEB_CHAR,1,LINK);
 }
 void window_present(struct browser_window *w) {
+    if (w->hosted) return;
     if (w->inside) for (int i=0;i<13;i++) {
         lx_gui_rect(&w->canvas,w->mouse_x,w->mouse_y+i,i/2+1,1,INK);
         if (i>3) lx_gui_rect(&w->canvas,w->mouse_x+1,w->mouse_y+i,i/2-1,1,PAPER);

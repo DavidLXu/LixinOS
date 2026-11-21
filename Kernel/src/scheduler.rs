@@ -20,6 +20,7 @@ enum State {
     Free,
     Ready,
     Waiting(usize),
+    Foreground(usize, u64),
     Channel(usize),
     Sleeping(u64),
     Exited(ExitStatus),
@@ -29,11 +30,16 @@ struct Task {
     pid: usize,
     pane: usize,
     parent: usize,
+    job: bool,
+    watching: bool,
+    stop: u8,
     background: bool,
     #[cfg(feature = "retina")]
     terminal: usize,
     sp: usize,
     ticks: u64,
+    idle: u64,
+    name: [u8;32],
     entry: Option<Entry>,
     stack: alloc::vec::Vec<u128>,
 }
@@ -43,11 +49,16 @@ impl Task {
         pid: 0,
         pane: 0,
         parent: 0,
+        job: false,
+        watching: false,
+        stop: 0,
         background: false,
         #[cfg(feature = "retina")]
         terminal: 0,
         sp: 0,
         ticks: 0,
+        idle: 0,
+        name: [0;32],
         entry: None,
         stack: alloc::vec::Vec::new(),
     };
@@ -93,6 +104,7 @@ static mut RETIRED: Option<usize> = None;
 static mut STARTUP_DEADLINE: u64 = 0;
 static mut ONLINE: bool = false;
 static mut START_TICKS: u64 = 0;
+static mut LAST_IDLE: u64 = 0;
 static mut LAST_SWITCH: u64 = 0;
 static mut TIMER_INTERRUPTS:u64=0;
 pub fn timer_interrupts()->u64 {unsafe {TIMER_INTERRUPTS}}
@@ -118,7 +130,7 @@ pub(crate) fn process_list() -> alloc::string::String {
             State::Free => continue,
             State::Ready if slot == active() => "running",
             State::Ready => "ready",
-            State::Waiting(_) | State::Channel(_) => "waiting",
+            State::Waiting(_) | State::Foreground(_, _) | State::Channel(_) => "waiting",
             State::Sleeping(_) => "sleeping",
             State::Exited(_) => "exited",
         };
@@ -126,6 +138,32 @@ pub(crate) fn process_list() -> alloc::string::String {
         writeln!(output, "{} {} {state} {mode}", task.pid, task.parent).unwrap();
     }
     output
+}
+pub fn set_task_name(path: &str) {
+    let name = &mut task(active()).name;
+    name.fill(0);
+    for (dst,src) in name[..31].iter_mut().zip(path.rsplit('/').next().unwrap_or("").bytes()) {
+        *dst = if src.is_ascii_graphic() { src } else { b'?' };
+    }
+}
+// ABI 29/9: wall ticks, idle ticks, RAM bytes; each row has six u64s and a 32-byte name.
+pub fn resource_snapshot(out: &mut [u64]) -> usize {
+    let now = crate::monitor::cpu_counters();
+    out[..3].copy_from_slice(&[now.ticks,now.idle_ticks,crate::inspect::ram_size().unwrap_or(0) as u64]);
+    let mut n=3;
+    for id in 0..CAPACITY {
+        let t=task(id);
+        let state=match t.state {
+            State::Free=>continue, State::Ready if id==active()=>1, State::Ready=>2,
+            State::Sleeping(_)=>3, State::Exited(_)=>5, _=>4,
+        };
+        let mut cpu=t.ticks.saturating_sub(t.idle);
+        if id==active() { unsafe { cpu+=(now.ticks-LAST_SWITCH).saturating_sub(now.idle_ticks-LAST_IDLE); } }
+        out[n..n+6].copy_from_slice(&[t.pid as u64,t.parent as u64,cpu,crate::user::private_bytes(id) as u64,state,t.background as u64]);
+        for (i,bytes) in t.name.chunks_exact(8).enumerate() { out[n+6+i]=u64::from_le_bytes(bytes.try_into().unwrap()); }
+        n+=10;
+    }
+    n*8
 }
 pub fn pane() -> usize {
     task(active()).pane
@@ -179,7 +217,7 @@ pub fn spawn(entry: Entry, pane: usize) -> Result<usize, &'static str> {
         parent: if pane == self::pane() { self::pid() } else { 0 },
         background: background(),
         #[cfg(feature = "retina")]
-        terminal: if background() {
+        terminal: if background() || terminal_id() != 0 {
             terminal_id()
         } else {
             crate::graphics::terminal_id()
@@ -260,6 +298,8 @@ extern "C" fn task_timer_irq() {
         }
     }
     if id == 27 {
+        #[cfg(feature = "retina")]
+        crate::graphics::poll_window();
         checkpoint();
         #[cfg(feature = "retina")]
         crate::graphics::sample();
@@ -285,7 +325,7 @@ pub fn finish(status: ExitStatus) -> ! {
     let slot = active();
     crate::user::release_image();
     let id = pid();
-    notify(|s| s == State::Waiting(id));
+    notify(|s| s == State::Waiting(id) || matches!(s, State::Foreground(child, _) if child == id));
     for i in 0..CAPACITY {
         if task(i).parent == id {
             task(i).parent = 0;
@@ -297,6 +337,77 @@ pub fn finish(status: ExitStatus) -> ! {
     crate::idle()
 }
 
+pub fn job(pid: usize) {
+    if let Some(i) = (1..CAPACITY).find(|&i| task(i).pid == pid && task(i).parent == self::pid()) {
+        task(i).job = true;
+    }
+}
+
+pub fn own_interrupt_key() { task(active()).job = false; }
+
+pub fn stopped() -> u8 { task(active()).stop }
+
+fn stop_tree(slot: usize, status: u8) {
+    if matches!(task(slot).state, State::Free | State::Exited(_)) { return; }
+    task(slot).stop = status;
+    let waiters = unsafe { &mut *addr_of_mut!(WAITERS) };
+    if let Some(i) = waiters.iter().position(|&id| id == slot) {
+        waiters.swap_remove(i);
+        runnable(slot);
+    }
+    let parent = task(slot).pid;
+    for i in 1..CAPACITY {
+        if task(i).parent == parent { stop_tree(i, status); }
+    }
+}
+
+pub fn stop_child(pid: usize) -> bool {
+    if let Some(i) = (1..CAPACITY).find(|&i| task(i).pid == pid && task(i).parent == self::pid()) {
+        stop_tree(i, 137);
+        true
+    } else { false }
+}
+
+fn interrupt_jobs(owner: usize) {
+    for i in 1..CAPACITY {
+        if task(i).job && task(i).parent == owner { stop_tree(i, 130); }
+    }
+}
+
+pub fn interrupt_reader() -> bool {
+    #[cfg(feature = "retina")]
+    if crate::graphics::editor_popup() { return false; }
+    #[cfg(feature = "retina")]
+    if crate::graphics::graphical_shortcuts() { return false; }
+    let mut slot = active();
+    while let Some(parent) = parent_slot(slot) {
+        if task(slot).job && task(parent).watching {
+            interrupt_jobs(task(parent).pid);
+            return true;
+        }
+        slot = parent;
+    }
+    false
+}
+
+fn foreground_input(child: usize) -> bool {
+    #[cfg(feature = "split")]
+    if pane() != focus() { return false; }
+    #[cfg(feature = "retina")]
+    if crate::graphics::editor_popup() || task(child).terminal != crate::graphics::terminal_id() || crate::graphics::graphical_shortcuts() { return false; }
+    // A nested shell owns input while waiting for its own foreground job.
+    for i in 1..CAPACITY {
+        if task(i).watching {
+            let mut ancestor = Some(i);
+            while let Some(slot) = ancestor {
+                if slot == child { return false; }
+                ancestor = parent_slot(slot);
+            }
+        }
+    }
+    crate::take_interrupt()
+}
+
 pub fn wait(pid: usize) -> Result<u8, &'static str> {
     let parent = self::pid();
     let slot = (1..CAPACITY)
@@ -304,10 +415,18 @@ pub fn wait(pid: usize) -> Result<u8, &'static str> {
         .ok_or("not a child process")?;
     loop {
         if let State::Exited(status) = task(slot).state {
+            task(active()).watching = false;
             *task(slot) = Task::EMPTY;
             return status;
         }
-        block(State::Waiting(pid));
+        if task(slot).job && !background() && !crate::process::agent_noninteractive() {
+            task(active()).watching = true;
+            if foreground_input(slot) { interrupt_jobs(parent); }
+            let deadline = crate::monitor::ticks() + crate::monitor::seconds_to_ticks(1) / 100;
+            block(State::Foreground(pid, deadline));
+        } else {
+            block(State::Waiting(pid));
+        }
     }
 }
 
@@ -351,7 +470,7 @@ pub fn schedule() {
     }
     let new = loop {
         let now = crate::monitor::ticks();
-        notify(|s| matches!(s,State::Sleeping(deadline) if deadline<=now));
+        notify(|s| matches!(s,State::Sleeping(deadline) | State::Foreground(_, deadline) if deadline<=now));
         if let Some(next) = unsafe { (&mut *addr_of_mut!(READY)).pop_front() } {
             if next == old {
                 return;
@@ -375,6 +494,9 @@ pub fn schedule() {
     let now = crate::monitor::ticks();
     unsafe {
         task(old).ticks += now.wrapping_sub(LAST_SWITCH);
+        let idle = crate::monitor::cpu_counters().idle_ticks;
+        task(old).idle += idle - LAST_IDLE;
+        LAST_IDLE = idle;
         LAST_SWITCH = now;
         if matches!(task(old).state, State::Exited(_)) {
             RETIRED = Some(old);
@@ -426,6 +548,12 @@ pub fn checkpoint() {
     if now.wrapping_sub(unsafe { LAST_SWITCH }) >= crate::monitor::seconds_to_ticks(1) / 100 {
         schedule();
     }
+}
+#[cfg(feature = "split")]
+pub fn take_key_interrupt() -> bool {
+    checkpoint();
+    let queue = unsafe { &mut *addr_of_mut!(INPUT[pane()]) };
+    queue.iter().position(|&k| k == 3).and_then(|i| queue.remove(i)).is_some()
 }
 #[cfg(feature = "split")]
 pub fn input() -> Option<u8> {

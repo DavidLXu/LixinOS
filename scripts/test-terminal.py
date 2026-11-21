@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import runpy
 import subprocess
+import time
 
 harness = runpy.run_path(str(Path(__file__).with_name("test-panes.py")))
 
@@ -19,12 +20,16 @@ def exercise(guest, control, directory):
                 assert "return" in reply, reply
                 return reply["return"]
 
-    def frame():
+    def frame(*, coordinates=None):
         path = directory / "terminal.ppm"
         qmp("screendump", filename=str(path))
         _, size, _, pixels = path.read_bytes().split(b"\n", 3)
-        _, height = map(int, size.split())
+        width, height = map(int, size.split())
         stride = len(pixels) // height
+        if coordinates:
+            x, y = coordinates
+            offset = y * stride + x * 3
+            return pixels[offset:offset+3], width, height
 
         def cells(row, column, width, start=0, end=44):
             return b"".join(
@@ -32,6 +37,22 @@ def exercise(guest, control, directory):
                 for y in range(44 + 44 * row + start, 44 + 44 * row + end)
             )
         return cells
+
+    def move_pointer(x, y):
+        _, width, height = frame(coordinates=(x, y))
+        qmp("input-send-event", events=[
+            {"type": "abs", "data": {"axis": axis, "value": round(pixel * 32767 / (bound - 1))}}
+            for axis, pixel, bound in (("x", x + 1, width), ("y", y + 1, height))
+        ])
+
+    def wait_for_pixel(x, y, expected):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            pixel, _, _ = frame(coordinates=(x, y))
+            if pixel == expected:
+                return
+            time.sleep(.04)
+        raise AssertionError(f"Pixel {(x, y)} is {pixel.hex()}, expected {expected.hex()}")
 
     qmp("qmp_capabilities")
     shell = harness["serial"]["SHELL"]
@@ -61,6 +82,12 @@ def exercise(guest, control, directory):
     reference = b"".join(palette[masks[((c-32)*44+y)*22+x]]
                          for y in range(44) for c in b"ORIGINAL" for x in range(22))
     assert original == reference, "terminal glyphs differ from the native-resolution Menlo atlas"
+    pointer = (220, 440)
+    next_pointer = (440, 440)
+    outline, fill = bytes.fromhex("1b2532"), bytes.fromhex("f7fbff")
+    move_pointer(*pointer)
+    wait_for_pixel(*pointer, outline)
+    wait_for_pixel(pointer[0] + 2, pointer[1] + 6, fill)
     guest.send(b"\r")
     guest.until(b"+-|+# ready")
     alternate = frame()
@@ -68,9 +95,17 @@ def exercise(guest, control, directory):
     assert alternate(1, 4, 5) == alternate(4, 0, 5), "cursor positioning or line graphics shifted"
     assert alternate(2, 0, 3) == alternate(2, 4, 3), "erase-to-start did not clear the row"
     assert alternate(4, 11, 1, 41, 44) == alternate(4, 12, 1, 41, 44), "cursor stays visible"
+    wait_for_pixel(*pointer, outline)
+    move_pointer(*next_pointer)
+    wait_for_pixel(*next_pointer, outline)
+    wait_for_pixel(*pointer, bg)
+    wait_for_pixel(pointer[0] + 2, pointer[1] + 6, bg)
     guest.send(b"\r")
     guest.until(b"\x1b[?1049l\x1b[?25h")
     assert frame()(0, 0, 8) == original, "leaving the alternate screen lost the main screen"
+    wait_for_pixel(*next_pointer, outline)
+    move_pointer(440, 20)
+    wait_for_pixel(*next_pointer, bg)
     guest.expect(b"\r", shell)
     guest.send(b"shutdown\r")
     assert guest.vm.wait(timeout=10) == 0
@@ -78,4 +113,4 @@ def exercise(guest, control, directory):
 
 if __name__ == "__main__":
     harness["test"](exercise, mode="--window")
-    print("Verified xterm positioning, line graphics, cursor hiding and screen restoration.")
+    print("Verified xterm rendering, screen restoration and mouse pointer persistence without trails.")

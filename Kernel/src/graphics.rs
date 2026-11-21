@@ -25,7 +25,9 @@ const WIDE_FOCUS: usize = 39 * CW;
 const FONT: &[u8; 95 * CW * CH] = include_bytes!(concat!(env!("OUT_DIR"), "/font.gray"));
 #[repr(align(4096))]
 struct Frame([u32; W * H]);
-static mut FB: Frame = Frame([0; W * H]);
+// QEMU scans out from this page-aligned physical allocation for the entire boot.
+// Keeping the 4K framebuffer out of .bss leaves room below the fixed EL0 image.
+static mut FB: *mut Frame = core::ptr::null_mut();
 
 fn display_config() -> (u16, i32) {
     let data = 0x0902_0000 as *const u8;
@@ -65,7 +67,7 @@ fn display_config() -> (u16, i32) {
 
 fn configure_ramfb(selector: u16, width: usize, height: usize) {
     let mut record = [0u8; 28];
-    record[..8].copy_from_slice(&(addr_of!(FB) as u64).to_be_bytes());
+    record[..8].copy_from_slice(&(unsafe { FB as u64 }).to_be_bytes());
     for (out, value) in record[8..].chunks_exact_mut(4).zip([
         u32::from_le_bytes(*b"XR24"),
         0,
@@ -100,6 +102,7 @@ fn configure_ramfb(selector: u16, width: usize, height: usize) {
 }
 
 struct Terminal {
+    stride: usize,
     cols: usize,
     rows: usize,
     bar: Option<top_bar::TopBar>,
@@ -133,6 +136,7 @@ struct Terminal {
 static mut ACTIVE: usize = 0;
 static mut CANVAS_OPEN: [bool; PANES] = [false; PANES];
 const INITIAL: Terminal = Terminal {
+    stride: W,
     cols: COLS, rows: ROWS,
     bar: None,
     x: 0,
@@ -166,9 +170,13 @@ static mut TERMS: [Terminal; PANES] = [const { INITIAL }; PANES];
 
 #[inline]
 fn glyph(fb: &mut [u32], offset: usize, width: usize, byte: u8, fg: u32, bg: u32) {
+    glyph_at(fb, W, offset, width, byte, fg, bg);
+}
+
+fn glyph_at(fb: &mut [u32], stride: usize, offset: usize, width: usize, byte: u8, fg: u32, bg: u32) {
     let glyph = &FONT[(byte - 32) as usize * CW * CH..];
     for row in 0..CH {
-        let start = offset + row * W;
+        let start = offset + row * stride;
         for (x, p) in fb[start..start + width].iter_mut().enumerate() {
             let a = glyph[row * CW + x * CW / width] as u32;
             let mix = |shift: u32| {
@@ -185,7 +193,7 @@ impl Terminal {
         } else {
             (self.color, self.background)
         };
-        glyph(fb, self.y * CH * W + self.x * CW, CW, byte, fg, bg);
+        glyph_at(fb, self.stride, self.y * CH * self.stride + self.x * CW, CW, byte, fg, bg);
         self.cells[self.y * self.cols + self.x] = byte;
         self.styles[self.y * self.cols + self.x] = (fg,bg);
     }
@@ -195,7 +203,7 @@ impl Terminal {
             let top = index / self.cols * CH;
             let left = index % self.cols * CW;
             for y in top..top + CH {
-                let offset = y * W + left;
+                let offset = y * self.stride + left;
                 for pixel in &mut fb[offset..offset + CW] { *pixel ^= 0x506070; }
             }
         }
@@ -249,25 +257,34 @@ impl Terminal {
     }
     fn cursor(&self, fb: &mut [u32]) {
         if !self.cursor_visible || self.history.offset != 0 { return; }
-        let start = ((self.y + 1) * CH - 3) * W + self.x * CW;
+        let start = ((self.y + 1) * CH - 3) * self.stride + self.x * CW;
         for p in &mut fb[start..start + CW] {
             *p ^= 0xb0b0b0;
         }
     }
 }
-pub fn put(byte: u8) {
+pub fn put(byte: u8) -> bool {
+    let id = crate::scheduler::terminal_id();
+    if id != 0 && popup::write_hidden_tab(id, byte) {
+        return false;
+    }
+    if (id != 0 || popup::active_tab().is_some()) && id != popup::terminal_id() {
+        return false;
+    }
     if crate::scheduler::background() {
         let id=popup::terminal_id();
-        if id!=crate::scheduler::terminal_id() || (id==0 && unsafe {CANVAS_OPEN[ACTIVE]}) {return;}
+        if id!=crate::scheduler::terminal_id() || (id==0 && unsafe {CANVAS_OPEN[ACTIVE]}) {return true;}
     }
     sample();
-    if popup::write_popup(byte) { return; }
+    let _pointer = suspend_text_pointer();
+    if popup::write_popup(byte) { return true; }
     unsafe {
-        let fb = &mut (*addr_of_mut!(FB)).0;
+        let fb = &mut (*FB).0;
         let term = &mut TERMS[ACTIVE];
         let start = (1 + term.bar_rows()) * BAR_PIXELS + ACTIVE * (pane_width() + CW);
         term.byte(&mut fb[start..], byte);
     }
+    true
 }
 
 #[cfg(feature = "split")]
@@ -277,8 +294,9 @@ pub fn switch_pane() {
 }
 #[cfg(feature = "split")]
 pub fn focus_changed() {
+    hide_text_pointer();
     reset_pointer();
-    unsafe { focus_label(&mut (&mut (*addr_of_mut!(FB)).0)[..BAR_PIXELS]); }
+    unsafe { focus_label(&mut (&mut (*FB).0)[..BAR_PIXELS]); }
 }
 #[cfg(feature = "split")]
 fn focus_label(bar: &mut [u32]) {
@@ -299,9 +317,14 @@ struct Keyboard {
 }
 static mut KEYBOARD: Option<Keyboard> = None;
 pub fn init() {
+    let layout = core::alloc::Layout::new::<Frame>();
+    unsafe {
+        FB = alloc::alloc::alloc_zeroed(layout).cast();
+        if FB.is_null() { alloc::alloc::handle_alloc_error(layout); }
+    }
     display::init();
     unsafe {
-        let fb = &mut (*addr_of_mut!(FB)).0;
+        let fb = &mut (*FB).0;
         fb.fill(BG);
         TERMS[0].cursor(&mut fb[BAR_PIXELS..]);
         if PANES == 2 {
@@ -323,7 +346,27 @@ pub fn init() {
     }
     crate::clipboard::init();
 }
+#[cfg(not(feature = "split"))]
+static mut KEY_INPUT: alloc::collections::VecDeque<u8> = alloc::collections::VecDeque::new();
+
+#[cfg(not(feature = "split"))]
+pub fn take_key_interrupt() -> bool {
+    let queue = unsafe { &mut *addr_of_mut!(KEY_INPUT) };
+    while queue.len() < 512 {
+        let Some(byte) = hardware_key() else { break };
+        if byte == 3 { return true; }
+        queue.push_back(byte);
+    }
+    false
+}
+
 pub fn key() -> Option<u8> {
+    #[cfg(not(feature = "split"))]
+    if let Some(key) = unsafe { (&mut *addr_of_mut!(KEY_INPUT)).pop_front() } { return Some(key); }
+    hardware_key()
+}
+
+fn hardware_key() -> Option<u8> {
     let k = unsafe { (&mut *addr_of_mut!(KEYBOARD)).as_mut()? };
     loop {
         if let Some((&first, rest)) = k.pending.split_first() {
@@ -488,6 +531,23 @@ fn memory_value(bytes: usize) -> alloc::string::String {
     }
 }
 
+fn ram_value(used: usize) -> alloc::string::String {
+    const MIB: usize = 1 << 20;
+    const GIB: usize = 1 << 30;
+    let Some(total) = crate::inspect::ram_size() else {
+        return alloc::format!("{}/--", memory_value(used));
+    };
+    let (unit, suffix) = if total >= GIB { (GIB, "GiB") } else { (MIB, "MiB") };
+    let used = (used * 10 + unit / 2) / unit;
+    let total = (total * 10 + unit / 2) / unit;
+    let capacity = if total % 10 == 0 {
+        alloc::format!("{}", total / 10)
+    } else {
+        alloc::format!("{}.{}", total / 10, total % 10)
+    };
+    alloc::format!("{}.{}/{capacity}{suffix}", used / 10, used % 10)
+}
+
 fn disk_value(usage: StorageUsage) -> alloc::string::String {
     const MIB: usize = 1024 * 1024;
     let used_kib = usage.used_bytes.div_ceil(1024);
@@ -532,8 +592,6 @@ fn draw_status(cpu: Option<u64>) {
     let (heap, _) = crate::monitor::heap_usage();
     // User images and process stacks are charged to the heap.
     let kernel_span = crate::monitor::kernel_span_bytes();
-    let used = kernel_span + heap;
-    let tenths_mib = (used * 10 + (1 << 19)) >> 20;
     let cpu = cpu.map_or_else(
         || alloc::string::String::from("--"),
         |n| alloc::format!("{n}%"),
@@ -543,11 +601,7 @@ fn draw_status(cpu: Option<u64>) {
     let disk = storage.map_or_else(|| "--".into(), disk_value);
     let metrics = [
         ("CPU", cpu, 0x8fbef4),
-        (
-            "RAM",
-            alloc::format!("{}.{}/{}MiB", tenths_mib / 10, tenths_mib % 10, crate::inspect::ram_size().unwrap_or(crate::MAPPED_RAM).min(crate::MAPPED_RAM) >> 20),
-            0x77d5d2,
-        ),
+        ("RAM", ram_value(kernel_span + heap), 0x77d5d2),
         ("HEAP", memory_value(heap), 0xc6aef2),
         ("STACK", stack, 0xe4b4aa),
         ("FILES", files, 0xa9d295),
@@ -579,7 +633,7 @@ fn draw_status(cpu: Option<u64>) {
         occupied += extra;
     }
     let mut x = right - occupied;
-    let fb = unsafe { &mut (*addr_of_mut!(FB)).0 };
+    let fb = unsafe { &mut (*FB).0 };
     let bar = &mut fb[..BAR_PIXELS];
     bar.fill(STATUS_BG);
     if clock_x >= 10 * CW {
@@ -629,7 +683,10 @@ struct Pointer {
     device: VirtIOInput<Dma, MmioTransport<'static>>,
     x: u32,
     y: u32,
+    position: Option<(u32, u32)>,
     left: bool,
+    right: bool,
+    right_press: bool,
     wheel: i32,
     suppress: bool,
     cancel: bool,
@@ -647,7 +704,10 @@ fn init_tablet() {
             device,
             x: 0,
             y: 0,
+            position: None,
             left: false,
+            right: false,
+            right_press: false,
             wheel: 0,
             suppress: false,
             cancel: false,
@@ -666,8 +726,14 @@ impl Pointer {
                         self.suppress = false;
                     }
                 }
+                (1, 273) => {
+                    let down = e.value != 0;
+                    self.right_press |= down && !self.right;
+                    self.right = down;
+                }
                 (2, 8) => self.wheel = (e.value as i32).signum(),
                 (0, 0) => {
+                    self.position = Some((self.x, self.y));
                     let x = self.x as usize * (display::size().width - 1) / 32767;
                     let y = self.y as usize * (display::size().height - 1) / 32767;
                     let left = unsafe { ACTIVE } * (pane_width() + CW);
@@ -675,13 +741,17 @@ impl Pointer {
                     let local_x = x.saturating_sub(left).min(pane_width() - 1) / 2;
                     let local_y = y.saturating_sub(CH).min(canvas_h() * 2 - 1) / 2;
                     let wheel = core::mem::take(&mut self.wheel);
+                    let mods = unsafe { (&*addr_of!(KEYBOARD)).as_ref().map_or(0, |k| k.modifiers) };
                     return Some(
                         local_x as u64
                             | ((local_y as u64) << 12)
                             | (u64::from(self.left && !self.suppress) << 24)
                             | (u64::from(inside) << 25)
                             | (u64::from(wheel > 0) << 26)
-                            | (u64::from(wheel < 0) << 27),
+                            | (u64::from(wheel < 0) << 27)
+                            | (u64::from(mods & 3 != 0) << 32)
+                            | (u64::from(mods & 12 != 0) << 33)
+                            | if core::mem::take(&mut self.right_press) { edit_menu::RIGHT_PRESS } else { 0 },
                     );
                 }
                 _ => (),
@@ -690,7 +760,13 @@ impl Pointer {
         None
     }
 }
+fn suppress_left() {
+    if let Some(p) = unsafe { (&mut *addr_of_mut!(POINTER)).as_mut() } {
+        p.suppress = p.left;
+    }
+}
 fn reset_pointer() {
+    edit_menu::close();
     if let Some(p) = unsafe { (&mut *addr_of_mut!(POINTER)).as_mut() } {
         while p.next().is_some() {}
         p.suppress = p.left;
@@ -698,6 +774,7 @@ fn reset_pointer() {
     }
 }
 pub fn begin_canvas() {
+    hide_text_pointer();
     reset_pointer();
 }
 pub fn canvas_size() -> u64 {
@@ -706,10 +783,8 @@ pub fn canvas_size() -> u64 {
     }
     canvas_w() as u64 | ((canvas_h() as u64) << 16)
 }
-pub fn pointer_event() -> u64 {
-    if crate::scheduler::background() {return u64::MAX;}
-    #[cfg(feature = "split")]
-    if crate::scheduler::pane() != crate::scheduler::focus() { return u64::MAX; }
+fn read_pointer() -> u64 {
+    if !pointer_focused() { return u64::MAX; }
     let Some(p) = (unsafe { (&mut *addr_of_mut!(POINTER)).as_mut() }) else {
         return u64::MAX;
     };
@@ -719,24 +794,55 @@ pub fn pointer_event() -> u64 {
     p.next().unwrap_or(u64::MAX)
 }
 
-fn poll_console_selection() {
-    if unsafe { CANVAS_OPEN[ACTIVE] } || crate::foreground::canvas_active() { return; }
-    loop {
-        let event = pointer_event();
-        if event == u64::MAX { return; }
-        let down = event & (1 << 24) != 0;
-        let inside = event & (1 << 25) != 0;
-        unsafe {
-            let fb = &mut (*addr_of_mut!(FB)).0;
-            let term = &mut TERMS[ACTIVE];
-            let start = (1 + term.bar_rows()) * BAR_PIXELS + ACTIVE * (pane_width() + CW);
-            let pixels = &mut fb[start..];
-            let row = ((event >> 12) & 4095) as usize * 2 / CH;
-            let point = inside.then_some(row).and_then(|row| row.checked_sub(term.bar_rows()))
-                .map(|row| (((event & 4095) as usize * 2) / CW, row));
-            if inside { term.wheel(pixels, event); }
-            term.select(pixels, point, down);
+pub fn pointer_event(options: u64) -> u64 {
+    // A canvas may route a secondary click itself, or delegate its menu back here.
+    let event = if options & 16 != 0 {
+        ((options >> 32) & 0xffffff) | (1 << 25) | edit_menu::RIGHT_PRESS
+    } else { read_pointer() };
+    if event == u64::MAX || event & (1 << 28) != 0 { return event; }
+    hide_text_pointer();
+    if options & 8 != 0 && event & edit_menu::RIGHT_PRESS != 0 {
+        edit_menu::close();
+        return event;
+    }
+    let (event, action) = edit_menu::input(event, || options & 2 != 0);
+    if edit_menu::active() { show_text_pointer(); }
+    match action {
+        Some(edit_menu::Action::Copy) => event | edit_menu::COPY_EVENT,
+        Some(edit_menu::Action::Paste) => {
+            crate::clipboard::paste_with_options(options);
+            event
         }
+        None => event,
+    }
+}
+
+pub fn dismiss_edit_menu(byte: u8) -> bool {
+    if byte != 27 || !edit_menu::active() { return false; }
+    hide_text_pointer();
+    edit_menu::close();
+    true
+}
+
+fn pointer_focused() -> bool {
+    #[cfg(feature = "split")]
+    if crate::scheduler::pane() != crate::scheduler::focus() { return false; }
+    !crate::scheduler::background()
+}
+
+fn console_selection(event: u64) {
+    let down = event & (1 << 24) != 0;
+    let inside = event & (1 << 25) != 0;
+    unsafe {
+        let fb = &mut (*FB).0;
+        let term = &mut TERMS[ACTIVE];
+        let start = (1 + term.bar_rows()) * BAR_PIXELS + ACTIVE * (pane_width() + CW);
+        let pixels = &mut fb[start..];
+        let row = ((event >> 12) & 4095) as usize * 2 / CH;
+        let point = inside.then_some(row).and_then(|row| row.checked_sub(term.bar_rows()))
+            .map(|row| (((event & 4095) as usize * 2) / CW, row));
+        if inside { term.wheel(pixels, event); }
+        term.select(pixels, point, down);
     }
 }
 
@@ -744,8 +850,21 @@ pub fn copied_text() -> alloc::vec::Vec<u8> {
     popup::popup_selection().unwrap_or_else(|| unsafe { TERMS[ACTIVE].selection_text() })
 }
 pub fn present(arena: &crate::user::UserArena) -> u64 {
-    // The caller supplies a tightly packed XRGB rectangle in its own arena.
-    let [address, x, y, w, h] = unsafe { crate::user::git_mailbox().cast::<[usize; 5]>().read() };
+    present_rect(arena, 0)
+}
+
+fn present_rect(arena: &crate::user::UserArena, generation: u64) -> u64 {
+    let mail = crate::user::git_mailbox().cast::<usize>();
+    let [address, x, y, w, h] = unsafe { mail.cast::<[usize; 5]>().read() };
+    let stride = if generation == 0 { w } else {
+        if generation != display::generation() { return (-2i64) as u64; }
+        unsafe { mail.add(5).read() }
+    };
+    let Some(bytes) = h.checked_sub(1)
+        .and_then(|rows| rows.checked_mul(stride))
+        .and_then(|offset| offset.checked_add(w))
+        .and_then(|pixels| pixels.checked_mul(4))
+    else { return u64::MAX; };
     if w == 0
         || h == 0
         || w > canvas_w()
@@ -753,15 +872,18 @@ pub fn present(arena: &crate::user::UserArena) -> u64 {
         || x > canvas_w() - w
         || y > canvas_h() - h
         || address % 4 != 0
-        || !arena.contains(address, w * h * 4)
+        || stride < w
+        || !arena.contains(address, bytes)
     {
         return u64::MAX;
     }
+    let _overlay = suspend_text_pointer();
     unsafe {
-        let pixels = core::slice::from_raw_parts(address as *const u32, w * h);
-        let fb = &mut (*addr_of_mut!(FB)).0;
+        let pixels = core::slice::from_raw_parts(address as *const u32, bytes / 4);
+        let fb = &mut (*FB).0;
         let start = BAR_PIXELS + ACTIVE * (pane_width() + CW) + 2 * (y * W + x);
-        for (row, src) in pixels.chunks_exact(w).enumerate() {
+        for row in 0..h {
+            let src = &pixels[row * stride..row * stride + w];
             let offset = start + 2 * row * W;
             for (pair, color) in fb[offset..offset + 2 * w].chunks_exact_mut(2).zip(src) {
                 pair.fill(*color);
@@ -779,35 +901,67 @@ pub struct Canvas {
     original: alloc::vec::Vec<u32>,
     pane: usize,
     underneath: bool,
+    pub resizable: bool,
 }
 impl Canvas {
-    pub fn open() -> Option<Self> {
-        if canvas_size() == 0 || canvas_w() < 460 || canvas_h() < 440 || popup_active() { return None; }
+    pub fn open(resizable: bool) -> Option<Self> {
+        let pane = unsafe { ACTIVE };
+        if canvas_size() == 0 || popup_active() || display::resizable_canvas(pane)
+            || (resizable && unsafe { CANVAS_OPEN[pane] })
+            || (!resizable && (canvas_w() < 460 || canvas_h() < 440))
+        {
+            return None;
+        }
         let mut arena = crate::user::UserArena::new();
         arena.grow((canvas_w() * canvas_h() + 20 * 24) * 4).ok()?;
-        let pane = unsafe { ACTIVE };
+        let mut original = alloc::vec::Vec::new();
+        if !resizable {
+            original.try_reserve_exact(pane_width() * canvas_h() * 2).ok()?;
+        }
+        begin_canvas();
         unsafe {
-            let fb = &mut (*addr_of_mut!(FB)).0;
+            let fb = &mut (*FB).0;
             let term = &mut TERMS[pane];
             let start = (1 + term.bar_rows()) * BAR_PIXELS + pane * (pane_width() + CW);
             term.clear_selection(&mut fb[start..]);
         }
-        let mut original = alloc::vec::Vec::new();
-        original.try_reserve_exact(pane_width() * canvas_h() * 2).ok()?;
-        let fb = unsafe { &(*addr_of!(FB)).0 };
-        let x = pane * (pane_width() + CW);
-        for row in fb[BAR_PIXELS..].chunks_exact(W).take(canvas_h() * 2) {
-            original.extend_from_slice(&row[x..x + pane_width()]);
+        if resizable {
+            display::save_canvas_screen(pane);
+        } else {
+            let fb = unsafe { &(*FB).0 };
+            let x = pane * (pane_width() + CW);
+            for row in fb[BAR_PIXELS..].chunks_exact(W).take(canvas_h() * 2) {
+                original.extend_from_slice(&row[x..x + pane_width()]);
+            }
         }
-        begin_canvas();
         let underneath = unsafe { core::mem::replace(&mut CANVAS_OPEN[pane], true) };
-        Some(Self { arena, original, pane, underneath })
+        Some(Self { arena, original, pane, underneath, resizable })
     }
+
+    pub fn geometry(&mut self) -> u64 {
+        if self.arena.grow(canvas_w() * canvas_h() * 4).is_err() { return u64::MAX; }
+        canvas_size() | (display::generation() << 32)
+    }
+
+    pub fn submit(&self, generation: u64) -> u64 {
+        if (generation != 0) != self.resizable { return u64::MAX; }
+        present_rect(&self.arena, generation)
+    }
+
 }
 impl Drop for Canvas {
     fn drop(&mut self) {
+        crate::clipboard::cancel_paste();
+        if unsafe { ACTIVE } == self.pane && pointer_focused() {
+            hide_text_pointer();
+            edit_menu::close();
+        }
         unsafe { CANVAS_OPEN[self.pane] = self.underneath; }
-        let fb = unsafe { &mut (*addr_of_mut!(FB)).0 };
+        if self.resizable {
+            display::restore_canvas_screen(self.pane);
+            return;
+        }
+        let fb = unsafe { &mut (*FB).0 };
         let x = self.pane * (pane_width() + CW);
         for (row, saved) in fb[BAR_PIXELS..].chunks_exact_mut(W).zip(self.original.chunks_exact(pane_width())) {
             row[x..x + pane_width()].copy_from_slice(saved);
@@ -821,18 +975,71 @@ mod display;
 pub(crate) use display::{apply_resize, request_resize};
 mod popup;
 pub use popup::*;
+
+/// The graphical client owns Ctrl+C while it can act on a selection.
+pub fn graphical_shortcuts() -> bool {
+    editor_popup() || (!popup_active() && unsafe { CANVAS_OPEN[ACTIVE] })
+}
 mod top_bar;
 pub(crate) use top_bar::{PinnedBar, TopBar, pin_bar, update_bar};
+mod mouse_cursor;
+mod edit_menu;
 
-// XOR a pointer only while the shell is waiting. Erase it before returning a
-// key so scrolling or saving the window never copies the pointer into its text.
-fn toggle_pointer(x: usize, y: usize) {
-    let fb = unsafe { &mut (*addr_of_mut!(FB)).0 };
-    let origin = BAR_PIXELS + unsafe { ACTIVE } * (pane_width()+CW);
-    for j in 0..16.min(canvas_h()-y) {
-        for i in 0..(1+j*2/3).min(canvas_w()-x) {
-            let p = origin + 2*((y+j)*W+x+i);
-            for offset in [0, 1, W, W+1] { fb[p+offset] ^= 0xffffff; }
+// Lift the overlay while updating or saving terminal pixels.
+type TextPointer = (usize, usize, bool);
+static mut TEXT_POINTER: Option<TextPointer> = None;
+static mut POINTER_OVERLAY: mouse_cursor::Overlay = mouse_cursor::Overlay::new();
+
+fn paint_pointer((x, y, text): TextPointer, show: bool) {
+    let fb = unsafe { &mut (*FB).0 };
+    let right = x / (pane_width() + CW) * (pane_width() + CW) + pane_width();
+    let bottom = CH + 2 * canvas_h();
+    unsafe {
+        (*addr_of_mut!(POINTER_OVERLAY)).paint(&mut fb[y * W + x..], W, right - x, bottom - y, text, show);
+    }
+}
+
+fn hide_text_pointer() {
+    if let Some(point) = unsafe { (&mut *addr_of_mut!(TEXT_POINTER)).take() } {
+        paint_pointer(point, false);
+    }
+}
+
+fn show_text_pointer() {
+    let position = unsafe { (&*addr_of!(POINTER)).as_ref().and_then(|p| p.position) };
+    let Some((x, y)) = position else { return; };
+    let size = display::size();
+    let x = (x as usize * (size.width - 1) / 32767) & !1;
+    let y = (y as usize * (size.height - 1) / 32767) & !1;
+    let left = unsafe { ACTIVE } * (pane_width() + CW);
+    let point = ((left..left + pane_width()).contains(&x) && (CH..CH + 2 * canvas_h()).contains(&y))
+        .then(|| {
+            let text = !edit_menu::active() && popup::over_text((x - left) / 2, (y - CH) / 2);
+            if text { (x.saturating_sub(8).max(left), y.saturating_sub(14).max(CH), true) }
+            else { (x, y, false) }
+        });
+    if point != unsafe { TEXT_POINTER } {
+        hide_text_pointer();
+        if let Some(point) = point {
+            paint_pointer(point, true);
+            unsafe { TEXT_POINTER = Some(point); }
         }
     }
+}
+
+struct SuspendedPointer(Option<TextPointer>, bool);
+impl Drop for SuspendedPointer {
+    fn drop(&mut self) {
+        if self.1 { edit_menu::show(); }
+        if let Some(point) = self.0 {
+            paint_pointer(point, true);
+            unsafe { TEXT_POINTER = Some(point); }
+        }
+    }
+}
+
+fn suspend_text_pointer() -> SuspendedPointer {
+    let saved = unsafe { TEXT_POINTER };
+    hide_text_pointer();
+    SuspendedPointer(saved, edit_menu::hide())
 }

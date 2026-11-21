@@ -31,9 +31,9 @@ enum { WORD, PIPE, READ, WRITE, APPEND, BACKGROUND };
 
 typedef struct { int kind; char *text; } Token;
 typedef struct { Token items[LINE+3]; int count; } Tokens;
-typedef struct { char *name, *value; } Variable;
+typedef struct { char *name, *value; int exported; } Variable;
 typedef struct Session {
-    int id, status, vars, histories, position, repeated_tab, skip_lf;
+    int id, status, vars, histories, position, repeated_tab, skip_lf, explicit_env;
     char cwd[LINE+1], previous_cwd[LINE+1], line[LINE+1], draft[LINE+1];
     Variable variables[64];
     char *history[64];
@@ -46,7 +46,7 @@ typedef struct Terminal {
 } Terminal;
 
 static const char help[]=
-    "Shell: cd command exit help history shell type unset\n"
+    "Shell: cd command edit exit export help history shell type unset\n"
     "Files: basename cat cp dirname find ls mkdir mv pwd rm rmdir stat touch tree\n"
     "Text: cmp cut diff echo grep head nl printf sed seq sort tail tee test tr uniq wc xargs\n"
     "System: clear cpuinfo date df du false htop netinfo ps sleep sysinfo true uname\n"
@@ -71,7 +71,7 @@ static int namechar(int c) {
 }
 static int shell_builtin(const char *name) {
     return equal(name,"history") || equal(name,"type") || equal(name,"command")
-        || equal(name,"unset") || equal(name,"exit");
+        || equal(name,"unset") || equal(name,"exit") || equal(name,"export");
 }
 static int request(int op, unsigned index, const char *s) {
     Size n=strlen(s);
@@ -105,9 +105,32 @@ static int assign(Session *s, const char *key, const char *val) {
         if (s->vars==64) return fail("too many variables");
         i=s->vars++;
         s->variables[i].name=copy(key);
+        s->variables[i].exported=0;
+        s->variables[i].value=0;
     }
     free(s->variables[i].value);
     s->variables[i].value=copy(val);
+    return 0;
+}
+static int binding(Session *s,char *arg,int exported) {
+    char *eq=strchr(arg,'=');
+    if (eq) *eq=0;
+    if (!*arg || digit(*arg) || equal(arg,"PWD")) return fail("invalid variable name");
+    for (char *c=arg;*c;c++) if (!namechar(*c)) return fail("invalid variable name");
+    if (eq || var_index(s,arg)<0) if (assign(s,arg,eq ? eq+1 : "")<0) return -1;
+    if (exported) { s->explicit_env=1; s->variables[var_index(s,arg)].exported=1; }
+    return 0;
+}
+static int environment(Session *s) {
+    int used=0;
+    for (int i=0;i<s->vars;i++) {
+        Variable *v=&s->variables[i];
+        if (!v->exported) continue;
+        int n=snprintf(MAIL+used,8192-used,"%s=%s",v->name,v->value);
+        if (n<0 || n>=8192-used) return fail("environment exceeds 8 KiB");
+        used+=n+1;
+    }
+    lx_console_call(56,used || s->explicit_env ? used : -1); /* Older kernels use launcher defaults. */
     return 0;
 }
 static Session *new_session(int id,const char *cwd) {
@@ -115,6 +138,16 @@ static Session *new_session(int id,const char *cwd) {
     s->id=id;
     strcpy(s->cwd,cwd);
     assign(s,"PATH","/bin");
+    long env=lx_console_call(53,0);
+    s->explicit_env=env>0;
+    if (env>1 && env<=8193) {
+        char *end=MAIL+env-1;
+        for (char *p=MAIL; p<end;) {
+            char *next=p+strlen(p)+1;
+            if (next>end) break;
+            binding(s,p,1); p=next;
+        }
+    }
     return s;
 }
 static void drop_session(Session *s) {
@@ -204,6 +237,7 @@ static const char *path_dir(const char *part,char *dir) {
     return end ? end+1 : 0;
 }
 static int program(Session *s,const char *name,char *path,char *kind) {
+    if (equal(name,"edit") && *value(s,"EDITOR")) name=value(s,"EDITOR");
     if (equal(name,"q")) name="shutdown";
     int explicit_path=strchr(name,'/')!=0;
     const char *part=value(s,"PATH");
@@ -321,7 +355,10 @@ static int execute(Session *s,Tokens *t) {
                 return 1;
             }
             s->status=0;
-            if (equal(name,"history")) {
+            if (equal(name,"export")) {
+                if (!operand) return fail("usage: export NAME[=VALUE] ...");
+                for (int j=1;j<st.argc;j++) if (binding(s,st.args[j],1)<0) return -1;
+            } else if (equal(name,"history")) {
                 if (operand) return fail("usage: history");
                 for (int j=0;j<s->histories;++j) printf("%d  %s\n",j+1,s->history[j]);
             } else if (equal(name,"unset")) {
@@ -356,6 +393,7 @@ static int execute(Session *s,Tokens *t) {
         if (equal(st.args[0],"cd") || equal(st.args[0],"help") || strchr(st.args[0],'=')) builtin=1;
         start=i+1;
     }
+    if (environment(s)<0) return -1;
     if (pipeline || background || (concurrent && !builtin)) return run_jobs(s,t,background);
     if (service(CLEAR_STREAM,0,"")<0) return -1;
     for (int start=0;start<t->count;) {
@@ -369,10 +407,7 @@ static int execute(Session *s,Tokens *t) {
         s->status=0;
         char *eq=strchr(name,'='), *slash=strchr(name,'/');
         if (eq && (!slash || slash>eq)) {
-            *eq=0;
-            if (st.argc!=1 || !*name || digit(*name) || equal(name,"PWD")) return fail("invalid variable name");
-            for (char *c=name;*c;c++) if (!namechar(*c)) return fail("invalid variable name");
-            if (assign(s,name,eq+1)<0 || service(CLEAR_STREAM,0,"")<0) return -1;
+            if (st.argc!=1 || binding(s,name,0)<0 || service(CLEAR_STREAM,0,"")<0) return -1;
         } else {
             char path[LINE+1],kind[64];
             if (program(s,name,path,kind)<0) return -1;
@@ -380,7 +415,7 @@ static int execute(Session *s,Tokens *t) {
                 if (st.argc>2) return fail("expected one argument");
                 int previous=st.argc==2 && equal(st.args[1],"-");
                 if (previous && !*s->previous_cwd) return fail("no previous directory");
-                const char *target=previous ? s->previous_cwd : st.argc==2 ? st.args[1] : "/";
+                const char *target=previous ? s->previous_cwd : st.argc==2 ? st.args[1] : *value(s,"HOME") ? value(s,"HOME") : "/";
                 char *cwd=query(CHDIR,0,target);
                 if (!cwd) return fail("directory not found");
                 strcpy(s->previous_cwd,s->cwd);
@@ -520,7 +555,8 @@ static int read_key(Session *s) {
     int repeat=s->repeated_tab && c==9;
     s->repeated_tab=c==9;
     Size n=strlen(s->line);
-    if (c==9) completion(s,repeat);
+    if (c==3) { s->line[0]=s->draft[0]=0; s->position=s->histories; s->status=130; puts("^C"); prompt(s); }
+    else if (c==9) completion(s,repeat);
     else if (c=='\n' || c=='\r') { s->skip_lf=c=='\r'; putchar('\n'); return 1; }
     else if (c==16 || c==14) {
         int next=s->position+(c==16 ? -1 : 1);
@@ -538,9 +574,54 @@ static int read_key(Session *s) {
     else if (c>=32 && c<=126 && n<LINE) { s->line[n]=c; s->line[n+1]=0; putchar(c); }
     return 0;
 }
-static Terminal *new_terminal(int id,const char *cwd) {
+static Session *login_session(int id,const char *cwd) {
+    Session *s=new_session(id,cwd);
+    const char *home="/home/lixin";
+    if (lx_stat(home)!=LX_DIR) return s;
+    char *dir=query(CHDIR,0,home);
+    if (!dir) return s;
+    strcpy(s->cwd,dir); assign(s,"HOME",home);
+    int fd=lx_open("/home/lixin/.profile");
+    if (fd<0) return s;
+    char block[256],line[LINE+1];
+    int used=0,number=0,n;
+    do {
+        n=lx_read(fd,block,sizeof(block));
+        for (int i=0;i<n || (n==0 && used);i++) {
+            int c=n ? block[i] : '\n';
+            if (c=='\r') continue;
+            if (c!='\n') { if (used<=LINE) { if (used<LINE) line[used]=c; used++; } continue; }
+            number++;
+            Tokens t={0};
+            int ok=used<=LINE;
+            if (ok) { line[used]=0; ok=lex(s,line,&t,0,0)>=0; }
+            if (ok && t.count) {
+                int exp=equal(t.items[0].text ? t.items[0].text : "","export");
+                if (!exp && t.count==2 && t.items[0].text && equal(t.items[0].text,"cd") && t.items[1].text) {
+                    char *d=query(CHDIR,0,t.items[1].text);
+                    if (d) strcpy(s->cwd,d); else ok=0;
+                } else {
+                    ok=t.count>exp && (exp || t.count==1);
+                    for (int j=exp;ok && j<t.count;j++)
+                        ok=t.items[j].kind==WORD && strchr(t.items[j].text,'=') && binding(s,t.items[j].text,exp)==0;
+                }
+            }
+            if (!ok) printf(".profile: invalid line %d\n",number);
+            clear_tokens(&t); used=0;
+        }
+    } while (n>0);
+    lx_close(fd);
+    return s;
+}
+static Terminal *new_terminal(int id,const char *cwd,int login) {
+    char inherited[LINE+1];
+    strcpy(inherited,cwd);
     Terminal *t=checked(calloc(1,sizeof(*t)));
-    t->id=id; t->next_id=2; t->first=t->active=new_session(1,cwd);
+    t->id=id; t->next_id=2; t->first=t->active=login_session(1,cwd);
+    if (!login) {
+        char *dir=query(CHDIR,0,inherited);
+        if (dir) strcpy(t->active->cwd,dir);
+    }
     return t;
 }
 static void restore(Session *s) {
@@ -558,7 +639,7 @@ static int manage(Terminal *t,Tokens *tokens) {
             if (t->next_id==2147483647) return fail("shell IDs exhausted");
             Session **tail=&t->first;
             while (*tail) tail=&(*tail)->next;
-            *tail=new_session(t->next_id++,"/"); select_session(t,*tail); return 0;
+            *tail=login_session(t->next_id++,"/"); select_session(t,*tail); return 0;
         }
         if (n==2 && equal(op,"list")) {
             for (Session *s=t->first;s;s=s->next) printf("%c %d  %s\n",s==t->active?'*':' ',s->id,s->cwd);
@@ -626,8 +707,10 @@ int main(int argc,char **argv) {
         lx_error("Bash requires an interactive terminal\n");
         return 1;
     }
+    unsigned flags=lx_start_flags();
     char *cwd=query(CHDIR,0,".");
-    Terminal *terminals=new_terminal(1,cwd ? cwd : "/"), *active=terminals;
+    lx_console_call(57,0); /* The interactive line editor handles its own Ctrl+C. */
+    Terminal *terminals=new_terminal(1,cwd ? cwd : "/",flags&2), *active=terminals;
     Session *initial=active->active;
     for (int i=0;i<64;i++) {
         char *line=query(HISTORY_GET,i,"");
@@ -635,7 +718,6 @@ int main(int argc,char **argv) {
         remember(initial,line);
     }
     initial->position=initial->histories;
-    unsigned flags=lx_start_flags();
     unsigned long screen=lx_geometry();
     if ((flags&2) && (screen>>32) && (screen&65535)>=60) {
         printf("\033[2J\033[H\033[36m  L I X I N O S   SYSTEM CONSOLE\033[0m\n");
@@ -656,7 +738,7 @@ int main(int argc,char **argv) {
             Terminal **ptr=&terminals;
             while (*ptr && (*ptr)->id!=id) ptr=&(*ptr)->next;
             if (!*ptr && (event&(1u<<30))) {
-                *ptr=new_terminal(id,"/");
+                *ptr=new_terminal(id,"/",1);
                 puts(shell_identity); prompt((*ptr)->active);
             }
             if (*ptr!=active) { active=*ptr; if (active) restore(active->active); }

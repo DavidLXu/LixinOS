@@ -97,8 +97,9 @@ static int event(struct input_queue *q, struct event *out) {
     return 1;
 }
 
+static unsigned modifiers;
 int keyboard_poll(void) {
-    static unsigned modifiers, caps;
+    static unsigned caps;
     static const char *pending = "";
     static const char normal[] = "1234567890-=\0\0qwertyuiop[]\0\0asdfghjkl;'`\0\\zxcvbnm,./";
     static const char shifted[] = "!@#$%^&*()_+\0\0QWERTYUIOP{}\0\0ASDFGHJKL:\"~\0|ZXCVBNM<>?";
@@ -167,8 +168,16 @@ int keyboard_poll(void) {
     return -1;
 }
 
+static unsigned pointer_down, suppress_pointer, pointer_x, pointer_y;
+static int pointer_seen, right_down, right_press;
+long tablet_position(unsigned width, unsigned height, unsigned bar) {
+    if (!pointer_seen)
+        return -1;
+    unsigned x = pointer_x * (width - 1) / 32767, y = pointer_y * (height - 1) / 32767;
+    return x / 2 | ((y >= bar ? (y - bar) / 2 : 0) << 12) | (y >= bar) << 25;
+}
 long tablet_poll(unsigned width, unsigned height, unsigned bar) {
-    static unsigned x, y, down;
+    static unsigned x, y;
     static int wheel;
     struct event e;
     while (event(&tablet, &e)) {
@@ -176,17 +185,34 @@ long tablet_poll(unsigned width, unsigned height, unsigned bar) {
             x = e.value > 32767 ? 32767 : e.value;
         if (e.type == 3 && e.code == 1)
             y = e.value > 32767 ? 32767 : e.value;
-        if (e.type == 1 && e.code == 272)
-            down = !!e.value;
+        if (e.type == 1 && e.code == 272) {
+            pointer_down = !!e.value;
+            if (!pointer_down) suppress_pointer = 0;
+        }
+        if (e.type == 1 && e.code == 273) {
+            right_press |= e.value && !right_down;
+            right_down = !!e.value;
+        }
         if (e.type == 2 && e.code == 8)
             wheel = (int)e.value;
         if (e.type == 0 && e.code == 0) {
-            unsigned px = x * (width - 1) / 32767, py = y * (height - 1) / 32767;
-            long val = px / 2 | ((py > bar ? (py - bar) / 2 : 0) << 12) | down << 24 |
-                       (py >= bar) << 25 | (wheel > 0) << 26 | (wheel < 0) << 27;
+            pointer_seen = 1;
+            pointer_x = x;
+            pointer_y = y;
+            long val = tablet_position(width, height, bar) | (pointer_down && !suppress_pointer) << 24 |
+                       (wheel > 0) << 26 | (wheel < 0) << 27 | (long)right_press << 29 |
+                       (long)!!(modifiers & 3) << 32 | (long)!!(modifiers & 12) << 33;
+            right_press = 0;
             wheel = 0;
             return val;
         }
     }
     return -1;
+}
+
+void suppress_tablet_left(void) { suppress_pointer = pointer_down; }
+
+void reset_tablet(unsigned width, unsigned height, unsigned bar) {
+    while (tablet_poll(width, height, bar) >= 0) {}
+    suppress_pointer = pointer_down;
 }

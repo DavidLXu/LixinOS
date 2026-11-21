@@ -111,6 +111,22 @@ pub fn poll() -> Option<u8> {
     }
 }
 
+pub fn take_interrupt() -> bool {
+    let mux = unsafe { &mut *SLOT.0.get() };
+    mux.pump();
+    if let Some((frame, pos)) = mux.frames.iter().enumerate().find_map(|(i, f)| {
+        (f.id == mux.active).then(|| f.data.iter().position(|&b| b == 3)).flatten().map(|j| (i, j))
+    }) {
+        mux.frames[frame].data.remove(pos);
+        if mux.frames[frame].data.is_empty() {
+            mux.frames.remove(frame);
+            control(2, mux.active);
+        }
+        return true;
+    }
+    false
+}
+
 pub fn close() {
     let mux = unsafe { &mut *SLOT.0.get() };
     mux.frames.retain(|frame| frame.id != mux.active);

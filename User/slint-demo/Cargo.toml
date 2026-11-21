@@ -1,0 +1,19 @@
+[package]
+name = "slint-demo"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+publish = false
+
+[dependencies]
+slint = { version = "=1.19.0", default-features = false, features = ["compat-1-2", "libm", "renderer-software", "unsafe-single-threaded"] }
+
+[build-dependencies]
+slint-build = "=1.19.0"
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

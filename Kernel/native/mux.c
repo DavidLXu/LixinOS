@@ -111,6 +111,18 @@ int mux_key(void) {
     }
     return c;
 }
+int mux_interrupt(void) {
+    pump();
+    struct packet *p = first(1);
+    if (!p) return 0;
+    for (unsigned i = p->pos; i < p->size; i++) {
+        if (p->data[i] != 3) continue;
+        for (unsigned j = i+1; j < p->size; j++) p->data[j-1] = p->data[j];
+        if (--p->size == p->pos) { p->sequence = 0; control(DATA, active); }
+        return 1;
+    }
+    return 0;
+}
 void mux_close(void) {
     for (unsigned i = 0; i < SLOTS; i++)
         if (packets[i].id == active)

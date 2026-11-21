@@ -1,4 +1,6 @@
 #![no_std]
+extern crate alloc;
+mod sftp;
 use base64ct::{Base64, Base64Unpadded, Encoding};
 use core::{
     fmt::{self, Write},
@@ -109,7 +111,7 @@ impl<'a> Target<'a> {
     fn parse(args: &'a [u8]) -> Option<Self> {
         let mut words = str::from_utf8(args).ok()?.strip_suffix('\0')?.split('\0');
         let first = words.next()?;
-        let (addr, port) = if first == "-p" {
+        let (addr, port) = if matches!(first, "-p" | "-P") {
             let port = words.next()?.parse::<u16>().ok()?;
             (words.next()?, port)
         } else {
@@ -166,7 +168,7 @@ fn public_key() -> sunset::Result<u8> {
     Ok(0)
 }
 
-fn gpu20() -> sunset::Result<u8> {
+fn gpu20(transfer: bool) -> sunset::Result<u8> {
     let mut buf = [0; 160];
     let n = unsafe { ssh_file(PROFILE.as_ptr(), buf.as_mut_ptr(), buf.len()) };
     if n < 0 {
@@ -193,6 +195,7 @@ fn gpu20() -> sunset::Result<u8> {
             port: 22,
         },
         Some((fingerprint, identity(false)?)),
+        transfer,
     )
 }
 
@@ -254,7 +257,11 @@ fn verify_host(
     Ok(())
 }
 
-fn session(t: Target, profile: Option<(&str, sunset::SignKey)>) -> sunset::Result<u8> {
+fn session(
+    t: Target,
+    profile: Option<(&str, sunset::SignKey)>,
+    transfer: bool,
+) -> sunset::Result<u8> {
     let mut terminal = TerminalModes(false);
     let mut addr = String::<16>::new();
     write!(addr, "{}\0", t.ip).unwrap();
@@ -314,19 +321,23 @@ fn session(t: Target, profile: Option<(&str, sunset::SignKey)>) -> sunset::Resul
                 authenticated = true;
             }
             Event::Cli(CliEvent::SessionOpened(mut e)) => {
-                let dims = unsafe { lx_geometry() };
-                pty_size = ((dims & 65535) as u32, ((dims >> 16) & 65535) as u32);
-                e.pty(Pty {
-                    term: "xterm".try_into().unwrap(),
-                    cols: pty_size.0,
-                    rows: pty_size.1,
-                    width: 0,
-                    height: 0,
-                    modes: Default::default(),
-                })?;
-                e.shell()?;
+                if transfer {
+                    e.subsystem("sftp")?;
+                } else {
+                    let dims = unsafe { lx_geometry() };
+                    pty_size = ((dims & 65535) as u32, ((dims >> 16) & 65535) as u32);
+                    e.pty(Pty {
+                        term: "xterm".try_into().unwrap(),
+                        cols: pty_size.0,
+                        rows: pty_size.1,
+                        width: 0,
+                        height: 0,
+                        modes: Default::default(),
+                    })?;
+                    e.shell()?;
+                    terminal.0 = true;
+                }
                 opened = true;
-                terminal.0 = true;
             }
             Event::Cli(CliEvent::SessionExit(e)) => {
                 status = Some(match e {
@@ -372,12 +383,25 @@ fn session(t: Target, profile: Option<(&str, sunset::SignKey)>) -> sunset::Resul
             }
         }
         if let Some(c) = &chan {
+            if transfer && opened {
+                return sftp::run(&mut ssh, c, fd, &buf[start..end]);
+            }
             if opened {
                 let dims = unsafe { lx_geometry() };
                 let size = ((dims & 65535) as u32, ((dims >> 16) & 65535) as u32);
-                if size != pty_size && ssh.term_window_change(c, &sunset::packets::WinChange {
-                    cols: size.0, rows: size.1, width: 0, height: 0,
-                }).is_ok() {
+                if size != pty_size
+                    && ssh
+                        .term_window_change(
+                            c,
+                            &sunset::packets::WinChange {
+                                cols: size.0,
+                                rows: size.1,
+                                width: 0,
+                                height: 0,
+                            },
+                        )
+                        .is_ok()
+                {
                     pty_size = size;
                     moved = true;
                 }
@@ -433,7 +457,7 @@ fn session(t: Target, profile: Option<(&str, sunset::SignKey)>) -> sunset::Resul
     }
 }
 #[unsafe(no_mangle)]
-unsafe extern "C" fn ssh_main(args: *const u8, n: usize) -> i32 {
+unsafe extern "C" fn ssh_main(args: *const u8, n: usize, transfer: i32) -> i32 {
     // Kernel mailboxes are reused by the client; copy arguments before any I/O.
     let mut saved = [0; 512];
     if n <= saved.len() {
@@ -441,19 +465,28 @@ unsafe extern "C" fn ssh_main(args: *const u8, n: usize) -> i32 {
             core::ptr::copy_nonoverlapping(args, saved.as_mut_ptr(), n);
         }
         let result = match &saved[..n] {
-            b"--public-key\0gpu20\0" => Some(public_key()),
-            b"gpu20\0" => Some(gpu20()),
-            args => Target::parse(args).map(|target| session(target, None)),
+            b"--public-key\0gpu20\0" if transfer == 0 => Some(public_key()),
+            b"gpu20\0" => Some(gpu20(transfer != 0)),
+            args => Target::parse(args).map(|target| session(target, None, transfer != 0)),
         };
         if let Some(result) = result {
             return match result {
                 Ok(code) => code.into(),
                 Err(e) => {
-                    write!(Console, "ssh: {e}\r\n").unwrap();
+                    write!(
+                        Console,
+                        "{}: {e}\r\n",
+                        if transfer != 0 { "sftp" } else { "ssh" }
+                    )
+                    .unwrap();
                     255
                 }
             };
         }
+    }
+    if transfer != 0 {
+        output(b"usage: sftp [-P PORT] user@IPv4 | sftp gpu20\r\n");
+        return 2;
     }
     output(b"usage: ssh [-p PORT] user@IPv4 | ssh gpu20 | ssh --public-key gpu20\r\n");
     2

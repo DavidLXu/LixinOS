@@ -36,7 +36,7 @@ long pipe_read(struct pipe *p, u8 *dst, unsigned size) {
     if (!size)
         return 0;
     while (p->read == p->write) {
-        if (!p->writers)
+        if (!p->writers || task_stopped())
             return 0;
         schedule();
     }
@@ -50,7 +50,7 @@ long pipe_read(struct pipe *p, u8 *dst, unsigned size) {
 long pipe_write(struct pipe *p, const u8 *src, unsigned size) {
     unsigned done = 0;
     while (done < size) {
-        if (!p->readers)
+        if (!p->readers || task_stopped())
             return done ? (long)done : -1;
         unsigned room = PIPE_BYTES - (p->write - p->read);
         if (!room) {

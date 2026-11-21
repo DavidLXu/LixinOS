@@ -1,0 +1,12 @@
+50:image/bmp:*.bmp
+50:image/gif:*.gif
+50:image/jpeg:*.jpe
+50:image/jpeg:*.jpeg
+50:image/jpeg:*.jpg
+50:image/png:*.png
+50:image/vnd.microsoft.icon:*.ico
+50:image/x-portable-anymap:*.pnm
+50:image/x-portable-bitmap:*.pbm
+50:image/x-portable-graymap:*.pgm
+50:image/x-portable-pixmap:*.ppm
+50:image/x-xpixmap:*.xpm

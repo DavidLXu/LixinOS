@@ -161,7 +161,7 @@ pub fn io(value: u64, op: u64) -> u64 {
                 };
                 crate::graphics::present(&file.arena)
             }
-            _ => crate::graphics::pointer_event(),
+            _ => crate::graphics::pointer_event(0),
         };
     }
     if op == 37 {

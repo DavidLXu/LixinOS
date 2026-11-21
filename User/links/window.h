@@ -3,7 +3,7 @@
 
 struct browser_window {
     struct lx_canvas canvas;
-    int x, y, w, h, mouse_x, mouse_y, inside, down, dragging, dx, dy;
+    int hosted, x, y, w, h, mouse_x, mouse_y, inside, down, dragging, dx, dy;
 };
 enum { WEB_MARGIN=14, WEB_TOP=84, WEB_LINE=22, WEB_CHAR=9 };
 int window_open(struct browser_window *);

@@ -155,8 +155,18 @@ user_sync:
     ldp x5,x6,[sp],#16
     ldp x3,x4,[sp],#16
     ldp x1,x2,[sp],#16
+    .long 0xb13ffc1f // cmn x0,#4095
+    beq interrupted_user
+    .long 0xb13ff81f // cmn x0,#4094
+    beq stopped_user
     ldp x9,x30,[sp],#16
     ERET
+interrupted_user:
+    mov x0,#130
+    b finish_user
+stopped_user:
+    mov x0,#137
+    b finish_user
 bad_user:
     mov x0,#255
     b finish_user

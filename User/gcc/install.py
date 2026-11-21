@@ -1,25 +1,38 @@
-"""Install a native toolchain into an idle LixinOS disk via its inactive snapshot."""
+"""Install a native package into an idle LixinOS disk via its inactive snapshot."""
 import argparse
-import fcntl
 import hashlib
 import json
-import os
 from pathlib import Path
 import struct
-import subprocess
 import sys
 import time
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]/"scripts"))
-from disk_image import BUILD_HEADER, HEADER, SECTOR, SLOT, build_slot, checksum, snapshot_headers
+from disk_image import edit_files
 
 PACKAGES = {
+    "app-store": ("/bin/app-store.win3",),
+    "classicube": ("/bin/classicube",),
+    "2048": ("/bin/2048.win3",),
+    "node": ("/bin/node",),
     "gcc": ("/bin/gcc", "/bin/as", "/bin/ld"),
     "rust": ("/bin/rustc", "/bin/cargo"),
+    "slint-demo": ("/bin/slint-demo", "/bin/slint-editor"),
+    "netsurf": ("/bin/netsurf", "/bin/desktop"),
+    "settings": ("/bin/settings.win2", "/bin/settings.win3"),
+    "nano-x": ("/bin/nano-x",),
+    "dte": ("/bin/dte",),
+    "lite-xl": ("/bin/lite-xl.win3",),
+    "gtk3": ("/bin/gtk3-demo.win3", "/bin/mousepad.win3"),
+    "tetravex": ("/bin/tetravex.win3",),
+    "mahjongg": ("/bin/mahjongg.win3",),
+    "mines": ("/bin/mines.win3",),
+    "nautilus": ("/bin/nautilus.win3",),
+    "ristretto": ("/bin/ristretto.win3",),
 }
 
 
-def install(package, disk, name="gcc"):
+def package_edit(package, name):
     library = "/lib/" + name
     binaries = PACKAGES[name]
     manifest_path = (library + "/installed.json").encode()
@@ -30,35 +43,7 @@ def install(package, disk, name="gcc"):
                 and path.encode() != manifest_path)
 
     package = package.resolve(strict=True)
-    with disk.open("r+b") as f:
-        fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        owners = subprocess.run(["lsof","-t","--",str(disk)],capture_output=True)
-        if owners.returncode not in (0,1) or owners.stderr or any(int(p)!=os.getpid() for p in owners.stdout.split()):
-            raise ValueError(f"{disk} may be in use")
-        layout = f.read(SECTOR)
-        slot_size = build_slot(os.fstat(f.fileno()).st_size) if layout == BUILD_HEADER else {HEADER: SLOT}.get(layout)
-        if slot_size is None:
-            raise ValueError("requires a LIXDISK4 or LIXBLD01 volume")
-        gen, base, n, digest, header = snapshot_headers(f)[0]
-        f.seek(base+SECTOR)
-        data = f.read(n)
-        if header[:8] != b"LIXINFS3" or checksum(data) != digest:
-            raise ValueError("invalid source snapshot")
-        count, = struct.unpack_from("<I",data)
-        offset = 4
-        rows = {}
-        for _ in range(count):
-            length,size = struct.unpack_from("<II", data, offset)
-            times = data[offset+8:offset+16]
-            path = data[offset+16:offset+16+length]
-            offset += 16+length
-            value = None if size == 0xffffffff else data[offset:offset+size]
-            if value is not None:
-                offset += size
-            if offset>n or path in rows:
-                raise ValueError("damaged filesystem records")
-            rows[path] = times,value
-        tail = data[offset:]
+    def edit(rows):
         now = struct.pack("<I",int(time.time()))
         manifest = json.loads(rows.get(manifest_path,(None,b"{}"))[1])
         if not isinstance(manifest, dict) or any(not tool_path(key) or not isinstance(value, str)
@@ -69,7 +54,12 @@ def install(package, disk, name="gcc"):
             times,old = rows.get(path,(now*2,None))
             if path in rows and old == value:
                 return
-            if path in rows and path != manifest_path and (old is None or manifest.get(path.decode()) != hashlib.sha256(old).hexdigest()):
+            digest = hashlib.sha256(old).hexdigest() if old is not None else None
+            # Also accept the bundled .5 desktop and the separately installed wallpaper build.
+            stock_desktop = (name == "netsurf" and path == b"/bin/desktop" and
+                             digest in {"8a641fa9f380c4a6378ee152c5ee298951aa017412892d228a5bb59d778ef55f",
+                                        "c3e66c3d453be6d561d2de1f0e61ec835680b5b22486c8a3a76b9cb0995e01d9"})
+            if path in rows and path != manifest_path and not stock_desktop and (old is None or manifest.get(path.decode()) != digest):
                 raise ValueError(f"local file conflicts with package: {path!r}")
             rows[path] = times[:4]+now,value
         for item in sorted(package.rglob("*")):
@@ -85,33 +75,12 @@ def install(package, disk, name="gcc"):
             if prior and prior[1] is not None and hashlib.sha256(prior[1]).hexdigest()==manifest[path]:
                 del rows[path.encode()]
         put(manifest_path,json.dumps(fresh,sort_keys=True).encode())
-        body = bytearray(struct.pack("<I",len(rows)))
-        for path,(times,value) in sorted(rows.items()):
-            body += struct.pack("<II",len(path),0xffffffff if value is None else len(value))+times+path
-            if value is not None:
-                body += value
-        body += tail
-        if body == data:
-            return
-        if len(body)>slot_size-SECTOR:
-            raise ValueError("insufficient snapshot capacity")
-        target = SECTOR + ((gen+1)%2)*slot_size
-        if target == base:
-            raise ValueError("invalid snapshot parity")
-        commit = b"LIXINFS3"+struct.pack("<QII",gen+1,len(body),checksum(body))
-        commit = (commit+struct.pack("<I",checksum(commit))).ljust(SECTOR,b"\0")
-        f.seek(target+SECTOR)
-        f.write(body)
-        f.flush()
-        os.fsync(f.fileno())
-        f.seek(target+SECTOR)
-        if f.read(len(body)) != body:
-            raise IOError("failed to verify package before commit")
-        f.seek(target)
-        f.write(commit)
-        f.flush()
-        os.fsync(f.fileno())
-        print(f"{disk}: installed {len(fresh)} files, generation {gen+1}", flush=True)
+    return edit
+
+
+def install(package, disk, name="gcc"):
+    generation = edit_files(disk, package_edit(package, name))
+    print(f"{disk}: installed {name}, generation {generation}", flush=True)
 
 if __name__=="__main__":
     parser=argparse.ArgumentParser(description=__doc__)

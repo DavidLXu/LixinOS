@@ -57,6 +57,71 @@ class ModelReplyError(BridgeError):
     """A malformed model reply that the guest can ask the model to regenerate."""
 
 
+def desktop_function(name, description, properties, required):
+    return {"type": "function", "function": {
+        "name": name, "description": description, "parameters": {
+            "type": "object", "properties": properties, "required": required,
+            "additionalProperties": False,
+        },
+    }}
+
+
+EDIT_TARGET = {"type": "string", "enum": ["source", "tests"]}
+TEXT = {"type": "string"}
+LINE = {"type": "integer", "minimum": 1}
+DESKTOP_FUNCTIONS = [
+    desktop_function("read_file", "Read numbered lines. Omit both bounds for the first 20 lines. "
+                     "With bounds, returns up to 40 lines from start. Omit bounds for guide.", {
+                         "target": {"type": "string", "enum": ["source", "tests", "sdk", "guide"]},
+                         "start": LINE, "end": LINE,
+                     }, ["target"]),
+    desktop_function("write_file", "Replace app.c or tests.json. Keep each write under 4000 UTF-8 bytes.",
+                     {"target": EDIT_TARGET, "text": TEXT}, ["target", "text"]),
+    desktop_function("apply_patch", "Replace text that occurs exactly once. Keep replacements small.",
+                     {"target": EDIT_TARGET, "old": TEXT, "new": TEXT}, ["target", "old", "new"]),
+    desktop_function("check_app", "Build the draft, run its tests and installed regressions, and save a passing candidate.", {}, []),
+    desktop_function("app_status", "Inspect the installed versions and candidate.", {}, []),
+    desktop_function("finish", "End this turn with a factual summary of the observed results.",
+                     {"summary": TEXT}, ["summary"]),
+]
+DESKTOP_SCHEMAS = {tool["function"]["name"]: tool["function"]["parameters"] for tool in DESKTOP_FUNCTIONS}
+
+
+def desktop_reply(choice):
+    calls = choice["message"].get("tool_calls")
+    if choice["finish_reason"] != "tool_calls" or not isinstance(calls, list) or not calls:
+        raise ModelReplyError("DeepSeek did not return a desktop tool call")
+    # The guest executes one operation and supplies its result before the model chooses the next.
+    call = calls[0]
+    if call["type"] != "function":
+        raise ModelReplyError("DeepSeek returned an invalid desktop tool call")
+    name = call["function"]["name"]
+    schema = DESKTOP_SCHEMAS.get(name)
+    if schema is None:
+        raise ModelReplyError("DeepSeek requested an unknown desktop tool")
+    args = json.loads(call["function"]["arguments"])
+    props = schema["properties"]
+    if not isinstance(args, dict) or args.keys() - props.keys() or set(schema["required"]) - args.keys():
+        raise ModelReplyError(f"DeepSeek returned invalid {name} parameters")
+    for key, value in args.items():
+        rule = props[key]
+        valid = type(value) is int and value >= 1 if rule["type"] == "integer" else (
+            isinstance(value, str) and ("enum" not in rule or value in rule["enum"])
+            and all(char.isprintable() or char in "\n\t" for char in value)
+        )
+        if not valid:
+            raise ModelReplyError(f"DeepSeek returned an invalid {name} parameter: {key}")
+    if name == "read_file" and len(args) > 1:
+        start, end = args.get("start"), args.get("end")
+        if start is None or end is None or start > end or args["target"] == "guide":
+            raise ModelReplyError("read_file needs both bounds in order. Omit bounds for guide.")
+        args["end"] = min(end, start + 39)
+    argv = [str(args[key]) for key in props if key in args]
+    if len("\0".join(argv).encode()) > (4000 if name != "finish" else 4096):
+        raise ModelReplyError(f"DeepSeek returned too much text for {name}. Use small patches.")
+    return {"tool": name, "args": argv}
+
+
 class DeepSeek:
     def __init__(self, key, model, open_url=urllib.request.urlopen):
         self.key = key
@@ -64,16 +129,21 @@ class DeepSeek:
         self.open_url = open_url
 
     def __call__(self, instruction, data):
+        desktop = instruction.startswith("You are the LixinOS desktop app agent.") and "conversation" in data
         payload = {
             "model": self.model,
             "thinking": {"type": "disabled"},
             "max_tokens": 8192,
-            "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": instruction},
                 {"role": "user", "content": json.dumps(data, ensure_ascii=False)},
             ],
         }
+        if desktop:
+            payload.update(tools=DESKTOP_FUNCTIONS, tool_choice="required")
+            payload["messages"][0]["content"] += "\nUse the API function tools. Call exactly one per response."
+        else:
+            payload["response_format"] = {"type": "json_object"}
         request = urllib.request.Request(
             ENDPOINT,
             data=json.dumps(payload).encode("utf-8"),
@@ -81,10 +151,14 @@ class DeepSeek:
         )
         try:
             with self.open_url(request, timeout=45) as response:
-                message = json.loads(response.read(512 * 1024 + 1))
-            choice = message["choices"][0]
+                body = response.read(MAX_FRAME + 1)
+            if len(body) > MAX_FRAME:
+                raise ModelReplyError("DeepSeek response exceeds its size limit")
+            choice = json.loads(body)["choices"][0]
             if choice["finish_reason"] == "length":
                 raise ModelReplyError("DeepSeek response reached its token limit")
+            if desktop:
+                return desktop_reply(choice)
             if choice["finish_reason"] != "stop":
                 raise BridgeError("DeepSeek did not complete the JSON response")
             result = json.loads(choice["message"]["content"])

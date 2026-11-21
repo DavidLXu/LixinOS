@@ -217,7 +217,7 @@ impl Bridge {
     }
 }
 
-fn decode(field: &[u8]) -> Result<String> {
+pub(crate) fn decode(field: &[u8]) -> Result<String> {
     let digit = |byte| match byte {
         b'0'..=b'9' => Ok(byte - b'0'),
         b'a'..=b'f' => Ok(byte - b'a' + 10),

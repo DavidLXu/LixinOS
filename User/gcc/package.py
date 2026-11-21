@@ -6,6 +6,7 @@ import os
 import shutil
 import struct
 import subprocess
+import zlib
 
 port = Path(__file__).resolve().parent
 root = port.parents[1]
@@ -20,7 +21,7 @@ sdk = py/"sysroot"
 def run(*args):
     subprocess.run(args, check=True)
 
-def tool(package, name, elf, library="/lib/gcc", launcher_flag="-DLX_GCC", build_dir=work):
+def tool(package, name, elf, library="/lib/gcc", launcher_flag="-DLX_GCC", build_dir=work, deflate=False):
     data = elf.read_bytes()
     entry, phoff = struct.unpack_from("<QQ", data, 24)
     phsize, n = struct.unpack_from("<HH", data, 54)
@@ -41,8 +42,12 @@ def tool(package, name, elf, library="/lib/gcc", launcher_flag="-DLX_GCC", build
         block = data[seg[2]:seg[2]+seg[5]]
         if not block:
             continue
-        filename = hashlib.sha256(block).hexdigest()[:24]
-        (contents/filename).write_bytes(block)
+        payload = block
+        if deflate:
+            compressor = zlib.compressobj(level=9, wbits=-15)
+            payload = compressor.compress(block) + compressor.flush()
+        filename = hashlib.sha256(payload).hexdigest()[:24]
+        (contents/filename).write_bytes(payload)
         digest = 2166136261
         for b in block:
             digest = ((digest ^ b) * 16777619) & 0xffffffff
@@ -53,7 +58,9 @@ def tool(package, name, elf, library="/lib/gcc", launcher_flag="-DLX_GCC", build
     run("aarch64-none-elf-gcc","-Os","-ffreestanding","-fno-builtin","-fdata-sections","-ffunction-sections",
         "-nostdlib","-Wl,--gc-sections,--build-id=none,-z,max-page-size=4096,-s","-T",port.parent/"ls/link.ld",
         launcher_flag,f'-DLX_ARGV0="{name}"',"-I",layout,port.parent/"cpython/loader.c",
-        port.parent/"tcc/api.c","-o",target)
+        port.parent/"tcc/api.c",
+        *(["-DLX_DEFLATE", "-I", sdk/"include", sdk/"lib/libz.a"]
+          if deflate else []), "-o",target)
 
 def package_tools(directory):
     library = directory/"lib/gcc"

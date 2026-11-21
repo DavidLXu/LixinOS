@@ -16,7 +16,10 @@ pub fn installed(name: &str) -> Option<&'static [u8]> {
         "grep" => include_bytes!("../target/user-build/core-grep.elf"),
         "wc" => include_bytes!("../target/user-build/core-wc.elf"),
         "ssh" => include_bytes!("../target/user-build/ssh.elf"),
+        "sftp" => include_bytes!("../target/user-build/sftp.elf"),
         "desktop" => include_bytes!("../target/user-build/desktop.elf"),
+        "stopwatch.win2" => include_bytes!("../target/user-build/stopwatch.elf"),
+        "nxeyes" => include_bytes!("../target/user-build/nxeyes.elf"),
         "netinfo" => include_bytes!("../target/user-build/core-netinfo.elf"),
         "cpuinfo" => include_bytes!("../target/user-build/core-cpuinfo.elf"),
         "sysinfo" => include_bytes!("../target/user-build/core-sysinfo.elf"),
@@ -97,7 +100,7 @@ pub(super) struct Streams {
     buffer: Rc<RefCell<StreamData>>,
     closed:[bool;3],
     null:[bool;3],
-    environment: Option<Rc<[u8]>>,
+    pub(super) environment: Option<Rc<[u8]>>,
     pub input_pipe: Option<Rc<crate::pipe::Reader>>,
     pub error_pipe: Option<Rc<crate::pipe::Writer>>,
     pub output_pipe: Option<Rc<crate::pipe::Writer>>,
@@ -186,6 +189,8 @@ pub(super) struct Context {
     pub allow_canvas: bool,
     #[cfg(feature = "retina")]
     pub canvas: Option<crate::graphics::Canvas>,
+    #[cfg(feature = "retina")]
+    clipboard_options: u64,
     #[cfg(feature="retina")]
     pub popup_shell: bool,
     cursor: Option<DirectoryCursor>,
@@ -219,6 +224,11 @@ pub(super) fn owns_canvas() -> bool {
     unsafe { (&*SLOTS[user::bank()].0.get()).as_ref().is_some_and(|io| io.canvas.is_some()) }
 }
 
+#[cfg(feature = "retina")]
+pub(super) fn clipboard_options() -> u64 {
+    unsafe { (&*SLOTS[user::bank()].0.get()).as_ref() }.map_or(0, |io| io.clipboard_options)
+}
+
 impl Context {
     pub fn new(cwd: &str, volume: Rc<RefCell<Volume>>, streams: Streams) -> Self {
         Self {
@@ -226,6 +236,8 @@ impl Context {
             allow_canvas: false,
             #[cfg(feature = "retina")]
             canvas: None,
+            #[cfg(feature = "retina")]
+            clipboard_options: 0,
             #[cfg(feature="retina")]
             popup_shell: false,
             heap: user::UserArena::for_browser_heap(),
@@ -239,6 +251,7 @@ impl Context {
     // Each suspended process therefore retains its own descriptors.
     pub fn enter<T>(self, launch: impl FnOnce() -> T) -> (Self, T) {
         let slot = SLOTS[user::bank()].0.get();
+        crate::scheduler::set_task_name(&self.executable);
         self.heap.set_mapped(true);
         self.extended.set_mapped(true);
         self.program.set_mapped(true);
@@ -384,16 +397,39 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
         46 => Some(if context.heap.seal_text(value as usize) { 0 } else { u64::MAX }),
         45 => Some(fs_batch_call(context, value)),
         #[cfg(feature = "retina")]
+        34 if context.canvas.is_some() && (1..=4096).contains(&value) => {
+            let bytes = unsafe { slice::from_raw_parts(user::git_mailbox(), value as usize) };
+            crate::clipboard::copy(bytes.to_vec());
+            Some(0)
+        }
+        #[cfg(feature = "retina")]
+        35 if context.canvas.is_some() && value == 1 => {
+            crate::clipboard::cancel_paste();
+            Some(0)
+        }
+        #[cfg(feature = "retina")]
+        35 if context.canvas.is_some() && value == 0 => {
+            let Some(bytes) = crate::clipboard::take_text() else { return Some(u64::MAX); };
+            unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), user::git_mailbox(), bytes.len()); }
+            Some(bytes.len() as u64)
+        }
+        #[cfg(feature = "retina")]
         19..=21 if context.allow_canvas => {
             if context.streams.redirected() { return Some(u64::MAX); }
             if operation == 19 && context.canvas.is_none() {
-                context.canvas = crate::graphics::Canvas::open();
+                if value > 1 { return Some(u64::MAX); }
+                context.canvas = crate::graphics::Canvas::open(value == 1);
             }
-            let Some(canvas) = &context.canvas else { return Some(u64::MAX) };
+            let Some(canvas) = &mut context.canvas else { return Some(u64::MAX) };
             Some(match operation {
-                19 => crate::graphics::canvas_size(),
-                20 => crate::graphics::present(&canvas.arena),
-                _ => crate::graphics::pointer_event(),
+                19 if value == 1 && canvas.resizable => canvas.geometry(),
+                19 if value == 0 && !canvas.resizable => crate::graphics::canvas_size(),
+                19 => u64::MAX,
+                20 => canvas.submit(value),
+                _ => {
+                    context.clipboard_options = value & 5;
+                    crate::graphics::pointer_event(value)
+                }
             })
         }
         0 => {
@@ -547,7 +583,7 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
                         *socket << 32 | count as u64,
                         buffer,
                     );
-                    if result != -2 {
+                    if result != -2 || crate::scheduler::stopped() != 0 {
                         break Some(result as u64);
                     }
                     crate::scheduler::sleep_ms(2);
@@ -655,7 +691,7 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
                         None => return Some(u64::MAX),
                     },
                 } & mask;
-                if ready != 0 || (timeout != u32::MAX && crate::monitor::ticks() >= deadline) {
+                if ready != 0 || crate::scheduler::stopped() != 0 || (timeout != u32::MAX && crate::monitor::ticks() >= deadline) {
                     return Some(ready.into());
                 }
                 crate::scheduler::sleep_ms(1);
@@ -681,6 +717,10 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
             let Some(Handle::Socket(socket))=(value>>32).checked_sub(3)
                 .and_then(|fd|context.handles.get(fd as usize)).and_then(Option::as_ref) else{return Some(u64::MAX);};
             Some(context.connections.call(operation,*socket<<32|value as u32 as u64,mail) as u64)
+        }
+        29 if value == 9 => {
+            let mail = unsafe { slice::from_raw_parts_mut(user::utility_mailbox().cast::<u64>(), 512) };
+            Some(crate::scheduler::resource_snapshot(mail) as u64)
         }
         29 => {
             use crate::inspect;
@@ -725,6 +765,14 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
                 2 => ticks,
                 _ => u64::MAX,
             })
+        }
+        56 => {
+            if value == u64::MAX { context.streams.environment = None; return Some(0); }
+            if value > 8192 { return Some(u64::MAX); }
+            let env = unsafe { slice::from_raw_parts(user::git_mailbox(), value as usize) };
+            if !env.is_empty() && env.last() != Some(&0) { return Some(u64::MAX); }
+            context.streams.environment = Some(Rc::from(env));
+            Some(0)
         }
         54 => Some(crate::scheduler::pid() as u64),
         53 => Some(match context.streams.environment.as_ref() {
@@ -856,10 +904,10 @@ fn fs_batch_call(context: &mut Context, value: u64) -> u64 {
             7 => { context.fs_batch = None; }
             8 => return context.fs_batch.as_ref().ok_or("no filesystem transaction")?
                 .exists(&context.volume.borrow(), fs_batch_path(&mail[..513])?).map(u64::from),
-            1..=5 => {
+            1..=5 | 9 => {
                 let (first, second) = mail.split_at(513);
                 let path = fs_batch_path(first)?;
-                let other = if op >= 4 { fs_batch_path(second)? } else { "" };
+                let other = if op >= 4 { fs_batch_path(&second[..513])? } else { "" };
                 context.fs_batch.as_mut().ok_or("no filesystem transaction")?
                     .edit(&context.volume.borrow(), &context.cwd, op, flags, path, other)?;
             }

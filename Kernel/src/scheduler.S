@@ -94,7 +94,7 @@ user_timer_irq:
     stp x28, x29, [sp, #-16]!
     stp x30, xzr, [sp, #-16]!
     bl task_timer_irq
-    bl agent_command_interrupted
+    bl user_interrupt_status
     cbnz w0, 2f
     ldp x30, xzr, [sp], #16
     ldp x28, x29, [sp], #16
@@ -115,4 +115,4 @@ user_timer_irq:
     eret
 2:
     add sp, sp, #256
-    b agent_timeout_exit
+    b resume_shell

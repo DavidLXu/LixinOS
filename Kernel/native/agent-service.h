@@ -2,6 +2,7 @@
  * live in EL0. A candidate interpreter never receives these capabilities. */
 int agent_test_expired(void) {
   struct process *p = &processes[bank];
+  if (task_stopped()) return task_stopped();
   if ((p->test.deadline || p->command_deadline) && console_ready()) {
     int k = console_key();
     if (k == 3 || k == 7) return 125;

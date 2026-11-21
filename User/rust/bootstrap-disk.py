@@ -13,36 +13,10 @@ import tomllib
 port = Path(__file__).resolve().parent
 root = port.parents[1]
 sys.path.insert(0, str(root / "scripts"))
-from disk_image import BUILD_HEADER, BUILD_SLOT, HISTORY_BYTES, SECTOR, checksum, snapshot_headers
+from disk_image import BUILD_HEADER, BUILD_SLOT, HISTORY_BYTES, SECTOR, checksum, disk_entries
 
 work = root / "Kernel/target/rust-port"
 stamp = struct.pack("<II", 1, 1)
-
-
-def disk_entries(seed):
-    # Read an APFS clone or an idle image, never write to the source volume.
-    with seed.open("rb") as src:
-        _, base, size, digest, hdr = snapshot_headers(src)[0]
-        src.seek(base + SECTOR)
-        body = src.read(size)
-    if hdr[:8] != b"LIXINFS3" or checksum(body) != digest:
-        raise ValueError(f"{seed}: expected a checksummed LIXINFS3 snapshot")
-    rows = {}
-    pos = 4
-    for _ in range(struct.unpack_from("<I", body)[0]):
-        n, size = struct.unpack_from("<II", body, pos)
-        time = body[pos+8:pos+16]
-        pos += 16
-        name = body[pos:pos+n].decode()
-        pos += n
-        data = None
-        if size != 0xffffffff:
-            data = memoryview(body)[pos:pos+size]
-            pos += size
-        if pos > len(body) or name in rows:
-            raise ValueError(f"{seed}: invalid filesystem records")
-        rows[name] = time, data
-    return rows, body[pos:]
 
 
 def seed_entries(seed):

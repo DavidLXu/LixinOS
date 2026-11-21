@@ -40,6 +40,9 @@ mod ui;
 pub(crate) use ui::tool as print_tool;
 #[path = "agent_report.rs"]
 mod report;
+#[path = "agent_trace.rs"]
+mod trace;
+pub(crate) use trace::list as list_traces;
 use report::{Checks, Delivery, RunTarget};
 pub(crate) use report::{ToolReport, ToolStatus};
 
@@ -99,6 +102,7 @@ struct Turn {
     policy: String,
     conversation: Option<String>,
     auto_approve: bool,
+    trace: Option<trace::Handle>,
 }
 
 struct Slot(UnsafeCell<Option<Turn>>);
@@ -111,6 +115,7 @@ pub(crate) fn active() -> bool {
 }
 
 fn poll_operator() -> Option<&'static str> {
+    if crate::scheduler::stopped() != 0 { return Some(CANCELLED); }
     match poll_byte() {
         Some(3 | 7) => Some(CANCELLED),
         Some(16) => Some(PAUSED),
@@ -133,6 +138,7 @@ fn operator_prompt(updates: &mut String, chat: &mut Option<ChatTurn<'_>>) -> Res
         updates.push('\n');
         if let Some(chat) = chat {
             writeln!(chat.transcript, "User follow-up: {}", visible(note.trim(), 512)).unwrap();
+            chat.trace.borrow_mut().emit("follow_up", trace::text(note.trim(), 512));
         }
     }
     print("agent: resumed\n");
@@ -289,9 +295,6 @@ pub fn exchange(value: u64) -> u64 {
 
 fn ask(turn: &mut Turn, instruction: String) -> Result<String> {
     let mut borrowed = turn.bridge.try_borrow_mut().map_err(|_| "agent is busy")?;
-    if borrowed.is_none() {
-        *borrowed = Some(Bridge::connect()?);
-    }
     let instruction = if turn.conversation.is_some() {
         chat_instruction(turn.auto_approve)
     } else {
@@ -305,31 +308,48 @@ fn ask(turn: &mut Turn, instruction: String) -> Result<String> {
     } else {
         "project-session-context"
     };
-    let bridge = borrowed.as_mut().unwrap();
-    let request = |bridge: &mut Bridge, fields: &[&str]| {
-        let mut next_poll = 0;
-        let poll_interval = crate::monitor::seconds_to_ticks(1) / 100;
-        let mut waiting = (turn.conversation.is_some() && !ui::activity("Thinking", None))
-            .then(ui::ModelWait::new);
-        let result = bridge.request_interruptible(action, fields, &mut || {
-            let now = crate::monitor::ticks();
-            if now < next_poll { return Ok(()); }
-            next_poll = now + poll_interval;
-            if let Some(waiting) = &mut waiting { waiting.tick(now); }
-            poll_operator().map_or(Ok(()), Err)
-        });
-        if let Some(waiting) = waiting { waiting.clear(); }
-        result
+    let mut request = |attempt, fields: &[&str]| {
+        let remaining = turn.fields[2].parse().unwrap_or_default();
+        if let Some(trace) = &turn.trace {
+            trace.borrow_mut().emit("model_started", trace::Model { attempt, remaining, result: None });
+        }
+        let started = crate::monitor::ticks();
+        let result = (|| {
+            if borrowed.is_none() { *borrowed = Some(Bridge::connect()?); }
+            let mut next_poll = 0;
+            let poll_interval = crate::monitor::seconds_to_ticks(1) / 100;
+            let mut waiting = (turn.conversation.is_some() && !ui::activity("Thinking", None))
+                .then(ui::ModelWait::new);
+            let result = borrowed.as_mut().unwrap().request_interruptible(action, fields, &mut || {
+                let now = crate::monitor::ticks();
+                if now < next_poll { return Ok(()); }
+                next_poll = now + poll_interval;
+                if let Some(waiting) = &mut waiting { waiting.tick(now); }
+                poll_operator().map_or(Ok(()), Err)
+            });
+            if let Some(waiting) = waiting { waiting.clear(); }
+            result
+        })();
+        let duration_ms = trace::elapsed_ms(started);
+        let failure = borrowed.as_mut().and_then(Bridge::take_model_error);
+        if let Some(trace) = &turn.trace {
+            let status = trace::outcome(result.as_ref().map(|_| ()).map_err(|error| *error));
+            let error = failure.as_ref().map(|error| visible(&error.detail, 512))
+                .or_else(|| result.as_ref().err().map(|error| (*error).into()));
+            trace.borrow_mut().emit("model_finished", trace::Model { attempt, remaining,
+                result: Some(trace::Completion { status, duration_ms, detail: error.as_deref() }) });
+        }
+        (result, failure)
     };
-    let mut reply = request(bridge, &fields);
-    let mut failure = bridge.take_model_error();
+    let (mut reply, mut failure) = request(1, &fields);
     if turn.conversation.is_some() && failure.as_ref().is_some_and(|error| error.retryable) {
         print("agent: retrying the model reply\n");
         let repair = format!("{instruction}\n\nRegenerate your reply as one JSON object \
             with exactly the two keys tool and args. Use an array of strings for args.");
         fields[0] = &repair;
-        reply = request(bridge, &fields);
-        failure = bridge.take_model_error().or(failure);
+        let (retried, retry_failure) = request(2, &fields);
+        reply = retried;
+        failure = retry_failure.or(failure);
     }
     turn.model_error = failure.map(|error| error.detail);
     let reply = reply?;
@@ -401,6 +421,7 @@ pub fn chat(
     let mut auto_approve = true;
     let _header = ui::welcome(root, budget);
     let mut history = VecDeque::<String>::new();
+    let mut session_id = None;
     let mut input_history = VecDeque::new();
     let mut log = ChatLog::default();
     loop {
@@ -419,6 +440,10 @@ pub fn chat(
             if input_history.len() == CHAT_INPUT_HISTORY { input_history.pop_front(); }
             input_history.push_back(task.into());
         }
+        if task == "/trace" {
+            list_traces(root, &volume.borrow())?;
+            continue;
+        }
         if task == "/bypass" {
             auto_approve = !auto_approve;
             ui::mode(auto_approve);
@@ -426,6 +451,7 @@ pub fn chat(
         }
         if task == "/help" {
             ui::help();
+            print("/trace lists recent structured traces in this project.\n");
             continue;
         }
         if task == "/prompt" {
@@ -443,9 +469,13 @@ pub fn chat(
         let conversation = history.iter().map(String::as_str).collect::<Vec<_>>().join("\n");
         let mut memory = String::new();
         let mut transcript = format!("User: {}\n", visible(task, 2048));
+        let trace = trace::Trace::start(volume.clone(), root, task, &mut session_id, auto_approve);
         ui::activity("Thinking", Some((0, budget)));
-        match run_session(root, task, volume.clone(), bridge.clone(), false,
-            Some(ChatTurn { conversation: &conversation, memory: &mut memory, transcript: &mut transcript, started, auto_approve })) {
+        let outcome = run_session(root, task, volume.clone(), bridge.clone(), false,
+            Some(ChatTurn { conversation: &conversation, memory: &mut memory, transcript: &mut transcript,
+                started, auto_approve, trace: trace.clone() }));
+        trace.borrow_mut().finish(outcome);
+        match outcome {
             Ok(()) => (),
             Err(CANCELLED) => {
                 let message = "turn cancelled. Discarded staged scripts.";
@@ -524,6 +554,7 @@ struct ChatTurn<'a> {
     transcript: &'a mut String,
     started: u64,
     auto_approve: bool,
+    trace: trace::Handle,
 }
 
 pub fn system(task: &str, volume: Rc<RefCell<Volume>>, bridge: BridgeSlot) -> Result<()> {
@@ -578,7 +609,7 @@ fn run_session(
             .to_vec();
         let (steps, preview) = policy_values(policy_source(&volume)).unwrap();
         let mode = if root == "/" { 's' } else if tuning { 't' } else { 'p' };
-        (image, volume.disk.revision(), format!("{mode}{steps} {preview}"),
+        (image, volume.agent_revision(), format!("{mode}{steps} {preview}"),
             visible(crate::agent::git_reference(&volume.files), 2048), steps.parse::<usize>().unwrap())
     };
     if chat.is_none() {
@@ -621,6 +652,7 @@ fn run_session(
                 policy: policy.clone(),
                 conversation: chat.as_ref().map(|turn| turn.conversation.into()),
                 auto_approve: chat.as_ref().is_some_and(|turn| turn.auto_approve),
+                trace: chat.as_ref().map(|turn| turn.trace.clone()),
             });
         }
         let status = if let Some(memory) = memory.take() {
@@ -707,6 +739,7 @@ fn run_session(
                 }
             };
             ui::reply(summary);
+            chat.trace.borrow_mut().emit("assistant", trace::text(summary, MAX_TEXT));
             writeln!(chat.transcript, "Agent: {summary}").unwrap();
             let receipt_notes: Vec<_> = receipts.iter().map(|(path, receipt)| {
                 print("\n");
@@ -731,6 +764,12 @@ fn run_session(
         let tool = action.first().map_or("", String::as_str);
         let command = matches!(tool, "exec" | "terminal") && chat.is_some();
         let step = observations.len() + 1;
+        let target = trace::target(&action);
+        if let Some(chat) = &chat {
+            chat.trace.borrow_mut().emit("tool_started", trace::Tool { step, call_id: step,
+                tool: &visible(tool, 32), target: target.as_deref(), duration_ms: None, result: None });
+        }
+        let tool_started = crate::monitor::ticks();
         if chat.is_some() {
             let status = match tool {
                 "exec" => "Running",
@@ -761,7 +800,7 @@ fn run_session(
         let mut stopped_repeating = false;
         let outcome = if command {
             let limit = if turn.modern { budget } else { LEGACY_STEPS };
-            let scope = (project.volume.borrow().disk.revision(), updates.len());
+            let scope = (project.volume.borrow().agent_revision(), updates.len());
             if scope != failure_scope {
                 failed_commands.clear();
                 failure_scope = scope;
@@ -776,7 +815,7 @@ fn run_session(
                 let run_target = RunTarget::before(&project, &action[1..]);
                 let outcome = run_command(&mut project, &action[1..], tool == "terminal",
                     (step, limit), chat.as_mut().unwrap());
-                let after = project.volume.borrow().disk.revision();
+                let after = project.volume.borrow().agent_revision();
                 changed_by_tools |= tool == "exec" && scope.0 != after;
                 if let Some(target) = run_target
                     && let Ok(report) = &outcome
@@ -811,7 +850,14 @@ fn run_session(
                     "Tool paused before completion. Run it again before finishing."
                 }))
             }
-            Err(CANCELLED) => return Err(CANCELLED),
+            Err(CANCELLED) => {
+                if let Some(chat) = &chat {
+                    let report = ToolReport::new(ToolStatus::Cancelled, CANCELLED);
+                    chat.trace.borrow_mut().emit("tool_finished", trace::Tool { step, call_id: step, tool,
+                        target: target.as_deref(), duration_ms: Some(trace::elapsed_ms(tool_started)), result: Some(&report) });
+                }
+                return Err(CANCELLED);
+            }
             Err(error) => {
                 if command { print(&format!("agent: command failed: {error}\n")); }
                 let status = match error {
@@ -825,6 +871,10 @@ fn run_session(
         let read_size = (tag == '+' && tool == "read").then_some(report.detail.len());
         changed_by_tools |= tool == "apply" && report.status == ToolStatus::Saved;
         report.detail = visible(&report.detail, MAX_TEXT);
+        if let Some(chat) = &chat {
+            chat.trace.borrow_mut().emit("tool_finished", trace::Tool { step, call_id: step, tool: &visible(tool, 32),
+                target: target.as_deref(), duration_ms: Some(trace::elapsed_ms(tool_started)), result: Some(&report) });
+        }
         let result = &report.detail;
         if let Some(chat) = &mut chat {
             writeln!(chat.transcript, "Result: {result}").unwrap();
@@ -894,9 +944,9 @@ fn run_command(
     {
         return Err("expected a guest command and literal arguments, at most 4096 bytes");
     }
-    let before = project.volume.borrow().disk.revision();
+    let before = project.volume.borrow().agent_revision();
     let outcome = crate::process::agent_command(
-        project.root, project.volume.clone(), chat.started, argv.to_vec(), interactive, progress, |full| {
+        project.root, project.volume.clone(), chat.started, argv.to_vec(), interactive, false, progress, |full| {
             if chat.auto_approve && !interactive {
                 writeln!(chat.transcript, "Approval: auto-approved guest command").unwrap();
                 return Ok(true);
@@ -924,7 +974,7 @@ fn run_command(
     );
     // Approved commands can write through their normal filesystem APIs. Never
     // rebase staged changes across writes performed outside their review.
-    let after = project.volume.borrow().disk.revision();
+    let after = project.volume.borrow().agent_revision();
     if after != before {
         if project.pending.is_empty() {
             project.generation = after;
@@ -1211,7 +1261,7 @@ impl Project<'_> {
             if plan.is_empty() { return Ok(Review::Empty); }
             if !review_confirmation("Apply these system filesystem changes? [y/N] ", false, |expanded| {
                 let volume = self.volume.borrow();
-                if volume.disk.revision() != self.generation {
+                if volume.agent_revision() != self.generation {
                     return Err("filesystem changed during the system task");
                 }
                 plan.preview(&volume, if expanded { visible } else { preview_text });
@@ -1221,7 +1271,7 @@ impl Project<'_> {
                 return Ok(Review::Declined);
             }
             let mut volume = self.volume.borrow_mut();
-            if volume.disk.revision() != self.generation {
+            if volume.agent_revision() != self.generation {
                 return Err("filesystem changed during review");
             }
             plan.apply(&mut volume)?;
@@ -1236,7 +1286,7 @@ impl Project<'_> {
         }
         if !review_confirmation("Apply the staged scripts to disk? [y/N] ", delivery.is_some(), |expanded| {
             let volume = self.volume.borrow();
-            if volume.disk.revision() != self.generation {
+            if volume.agent_revision() != self.generation {
                 return Err("filesystem changed during the project task");
             }
             let preview = if expanded { visible } else { preview_text };
@@ -1260,7 +1310,7 @@ impl Project<'_> {
             return Ok(Review::Declined);
         }
         let mut volume = self.volume.borrow_mut();
-        if volume.disk.revision() != self.generation {
+        if volume.agent_revision() != self.generation {
             return Err("filesystem changed during review");
         }
         if self.tuning {
@@ -1293,7 +1343,7 @@ impl Project<'_> {
             }
             return Err(error);
         }
-        self.generation = volume.disk.revision();
+        self.generation = volume.agent_revision();
         let saved = core::mem::take(&mut self.pending);
         if let Some(delivery) = delivery {
             for (path, candidate) in saved {

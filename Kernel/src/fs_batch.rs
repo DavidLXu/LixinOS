@@ -93,7 +93,7 @@ impl Batch {
         let files = &volume.files;
         if flags > 1 { return Err("invalid filesystem flags"); }
         if op != 4 { volume.require_writable(path)?; }
-        if op >= 4 { volume.require_writable(other)?; }
+        if matches!(op, 4 | 5) { volume.require_writable(other)?; }
         if path == "/" {
             return Err(if op == 1 { "already exists" } else { "cannot remove the working directory or root" });
         }
@@ -166,6 +166,9 @@ impl Batch {
                     self.changes.insert(dest, Some(value.clone()));
                 }
             }
+            // Create a small path record alongside a move in the same transaction.
+            9 if kind.is_none() => { self.changes.insert(path.into(), Some(Some(other.as_bytes().to_vec()))); }
+            9 => return Err("destination exists"),
             _ => return Err("unknown filesystem operation"),
         }
         if self.changes.len() > ENTRY_LIMIT * 2 { return Err("filesystem full"); }

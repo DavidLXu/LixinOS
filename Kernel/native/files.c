@@ -78,6 +78,12 @@ long file_operation(int slot, const char *cwd, u64 value, char *mail) {
             return fail(slot, mail, "directory not empty");
         ok = batch_set(slot, mail, 0);
     }
+    if (op == 9) {
+        if (exists || !canonical_path(other))
+            return fail(slot,mail,"invalid or occupied path record");
+        struct file record={(const u8 *)other,strlen(other)};
+        ok=batch_set(slot,mail,&record);
+    }
     if (op == 4 || op == 5) {
         if (!exists || !canonical_path(other) || inside(mail, other) || inside(other, mail))
             return fail(slot, mail, "invalid source or target");
@@ -111,7 +117,7 @@ long git_call(int slot, const char *meta, unsigned op) {
         return *(volatile u32 *)0x09010000;
     if (!canonical_path(m->path))
         return -22;
-    if (op >= 3 && op <= 6 && !inside(m->path, meta))
+    if (((op >= 3 && op <= 6) || op == 9) && !inside(m->path, meta))
         return -13;
     int found = batch_lookup(slot, m->path, &f);
     switch (op) {
@@ -134,6 +140,29 @@ long git_call(int slot, const char *meta, unsigned op) {
             return -27;
         memcpy(m->bytes, f.data, f.size);
         return f.size;
+    case 8:
+    case 9: {
+        if (!found || f.size == DIR) return found ? -21 : -2;
+        unsigned off = m->number, n = m->length;
+        if (m->number < 0 || n > sizeof(m->bytes)) return -22;
+        if (op == 8) {
+            if (off >= f.size) return 0;
+            if (n > f.size - off) n = f.size - off;
+            memcpy(m->bytes, f.data + off, n);
+            return n;
+        }
+        if (off > NATIVE_FILE_LIMIT - n) return -27;
+        unsigned size = f.size > off+n ? f.size : off+n;
+        u8 *buf = file_buffer(size);
+        if (!buf) return -12;
+        memcpy(buf, f.data, f.size);
+        if (off > f.size) memset(buf + f.size, 0, off-f.size);
+        memcpy(buf + off, m->bytes, n);
+        struct file item = {buf, size};
+        int ok = batch_set(slot, m->path, &item);
+        release_buffer(buf, size);
+        return ok ? 0 : -5;
+    }
     case 3:
     case 4: {
         if (op == 4 && found)

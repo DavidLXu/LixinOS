@@ -1,0 +1,6 @@
+libxfce4util-4.20.1 tar.bz2 84bfc4daab9e466193540c3665eee42b2cf4d24e3f38fc3e8d1e0a2bebe3b8f1 https://archive.xfce.org/src/xfce/libxfce4util/4.20
+xfconf-4.20.0 tar.bz2 8bc43c60f1716b13cf35fc899e2a36ea9c6cdc3478a8f051220eef0f53567efd https://archive.xfce.org/src/xfce/xfconf/4.20
+libxfce4ui-4.20.2 tar.bz2 5d3d67b1244a10cee0e89b045766c05fe1035f7938f0410ac6a3d8222b5df907 https://archive.xfce.org/src/xfce/libxfce4ui/4.20
+exo-4.20.0 tar.bz2 4277f799245f1efde01cd917fd538ba6b12cf91c9f8a73fe2035fd5456ec078d https://archive.xfce.org/src/xfce/exo/4.20
+libexif-0.6.26 tar.bz2 0830ed253fceeb60444fb309598bc8a9491d3007dc054aad3a50a347c5597c57 https://github.com/libexif/libexif/releases/download/v0.6.26
+ristretto-0.14.0 tar.xz 502cf1577de14b38132dc89e56884c5e10f86f6a028d8dde379a8839110fda55 https://archive.xfce.org/src/apps/ristretto/0.14

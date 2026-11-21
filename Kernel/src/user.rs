@@ -206,6 +206,11 @@ impl Drop for ImageMemory {
 }
 static mut IMAGES: [Option<ImageMemory>; BANKS] = [const { None }; BANKS];
 
+static mut ARENA_BYTES: [usize; BANKS] = [0; BANKS];
+pub fn private_bytes(slot: usize) -> usize {
+    unsafe { ARENA_BYTES[slot] + if (*addr_of_mut!(IMAGES))[slot].is_some() {USER_REGION_BYTES} else {0} }
+}
+
 fn replace_image(image: Option<ImageMemory>) -> Option<ImageMemory> {
     let slot = bank();
     let base = image.as_ref().map(|mem| mem.0.as_ptr() as usize);
@@ -546,6 +551,7 @@ impl UserArena {
                 asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
             }
             self.blocks.push(block);
+            unsafe { ARENA_BYTES[self.bank] += BLOCK; }
         }
         Ok(())
     }
@@ -559,6 +565,7 @@ impl Drop for UserArena {
                 *self.entry(i) = 0;
             }
             asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
+            ARENA_BYTES[self.bank] -= self.blocks.len()*BLOCK;
             for block in self.blocks.drain(..) {
                 alloc::alloc::dealloc(block.as_ptr(), layout);
             }
@@ -624,9 +631,6 @@ pub(crate) fn saved_mailbox(memory: &mut ImageMemory) -> &mut [u8] {
 }
 pub(crate) fn suspend_process() -> ImageMemory {
     replace_image(None).expect("suspending a running process")
-}
-pub(crate) fn resume_process(memory: ImageMemory) -> Result<u16, &'static str> {
-    resume_with_flags(memory, 0)
 }
 pub(crate) fn resume_agent(memory: ImageMemory) -> Result<u16, &'static str> {
     resume_with_flags(memory, 65536)

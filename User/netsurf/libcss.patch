@@ -1,0 +1,1294 @@
+--- a/libcss/include/libcss/computed.h
++++ b/libcss/include/libcss/computed.h
+@@ -187,6 +187,28 @@
+ uint8_t css_computed_list_style_image(
+ 		const css_computed_style *style,
+ 		lwc_string **url);
++uint8_t css_computed_grid_template_columns(
++		const css_computed_style *style,
++		lwc_string **url);
++uint8_t css_computed_grid_template_rows(
++		const css_computed_style *style,
++		lwc_string **url);
++uint8_t css_computed_grid_column(
++		const css_computed_style *style,
++		lwc_string **url);
++uint8_t css_computed_row_gap(
++		const css_computed_style *style,
++		lwc_string **url);
++uint8_t css_computed_inset_inline_start(
++		const css_computed_style *style,
++		lwc_string **url);
++uint8_t css_computed_inset_inline_end(
++		const css_computed_style *style,
++		lwc_string **url);
++uint8_t css_computed_transform(
++		const css_computed_style *style,
++		lwc_string **url);
++
+ 
+ uint8_t css_computed_quotes(
+ 		const css_computed_style *style,
+@@ -224,6 +246,8 @@
+ 		const css_computed_style *style,
+ 		css_color *color);
+ 
++uint8_t css_computed_background_size(const css_computed_style *style);
++
+ uint8_t css_computed_box_sizing(
+ 		const css_computed_style *style);
+ 
+@@ -310,6 +334,9 @@
+ 		const css_computed_style *style);
+ 
+ uint8_t css_computed_padding_top(
++		const css_computed_style *style,
++		css_fixed *length, css_unit *unit);
++uint8_t css_computed_border_radius(
+ 		const css_computed_style *style,
+ 		css_fixed *length, css_unit *unit);
+ 
+--- a/libcss/include/libcss/properties.h
++++ b/libcss/include/libcss/properties.h
+@@ -141,6 +141,15 @@
+ 	CSS_PROP_FILL_OPACITY			= 0x07c,
+ 	CSS_PROP_STROKE_OPACITY			= 0x07d,
+ 
++	CSS_PROP_GRID_TEMPLATE_COLUMNS,
++	CSS_PROP_GRID_TEMPLATE_ROWS,
++	CSS_PROP_GRID_COLUMN,
++	CSS_PROP_ROW_GAP,
++	CSS_PROP_INSET_INLINE_START,
++	CSS_PROP_INSET_INLINE_END,
++	CSS_PROP_TRANSFORM,
++CSS_PROP_BORDER_RADIUS,
++	CSS_PROP_BACKGROUND_SIZE,
+ 	CSS_N_PROPERTIES
+ };
+ 
+@@ -249,6 +258,11 @@
+ 	CSS_BOTTOM_INHERIT			= 0x0,
+ 	CSS_BOTTOM_SET				= 0x1,
+ 	CSS_BOTTOM_AUTO				= 0x2
++};
++
++enum css_background_size_e {
++	CSS_BACKGROUND_SIZE_INHERIT, CSS_BACKGROUND_SIZE_AUTO,
++	CSS_BACKGROUND_SIZE_CONTAIN, CSS_BACKGROUND_SIZE_COVER
+ };
+ 
+ enum css_box_sizing_e {
+@@ -444,7 +458,8 @@
+ 	CSS_DISPLAY_FLEX			= 0x11,
+ 	CSS_DISPLAY_INLINE_FLEX			= 0x12,
+ 	CSS_DISPLAY_GRID			= 0x13,
+-	CSS_DISPLAY_INLINE_GRID			= 0x14
++	CSS_DISPLAY_INLINE_GRID			= 0x14,
++	CSS_DISPLAY_CONTENTS = 0x15
+ };
+ 
+ enum css_empty_cells_e {
+--- a/libcss/include/libcss/select.h
++++ b/libcss/include/libcss/select.h
+@@ -148,6 +148,9 @@
+ 	 */
+ 	css_error (*get_libcss_node_data)(void *pw, void *node,
+ 			void **libcss_node_data);
++	/* Is there a descendant at this one-based element sibling index? */
++	css_error (*has_descendant_at_index)(void *pw, void *node,
++			uint32_t index, bool *match);
+ } css_select_handler;
+ 
+ /**
+--- a/libcss/src/bytecode/opcodes.h
++++ b/libcss/src/bytecode/opcodes.h
+@@ -334,7 +334,8 @@
+ 	DISPLAY_FLEX			= 0x0010,
+ 	DISPLAY_INLINE_FLEX		= 0x0011,
+ 	DISPLAY_GRID			= 0x0012,
+-	DISPLAY_INLINE_GRID		= 0x0013
++	DISPLAY_INLINE_GRID		= 0x0013,
++	DISPLAY_CONTENTS = 0x0014
+ };
+ 
+ enum op_elevation {
+--- a/libcss/src/parse/language.c
++++ b/libcss/src/parse/language.c
+@@ -7,6 +7,7 @@
+ 
+ #include <assert.h>
+ #include <string.h>
++#include <strings.h>
+ 
+ #include <parserutils/utils/stack.h>
+ 
+@@ -1312,6 +1313,8 @@
+ 		{ DISABLED, CSS_SELECTOR_PSEUDO_CLASS },
+ 		{ CHECKED, CSS_SELECTOR_PSEUDO_CLASS },
+ 		{ NOT, CSS_SELECTOR_PSEUDO_CLASS },
++		{ WHERE, CSS_SELECTOR_PSEUDO_CLASS },
++		{ HAS, CSS_SELECTOR_PSEUDO_CLASS },
+ 
+ 		{ FIRST_LINE, CSS_SELECTOR_PSEUDO_ELEMENT },
+ 		{ FIRST_LETTER, CSS_SELECTOR_PSEUDO_ELEMENT },
+@@ -1374,7 +1377,10 @@
+ 
+ 	/* :not() and pseudo elements are not permitted in :not() */
+ 	if (in_not && (type == CSS_SELECTOR_PSEUDO_ELEMENT ||
+-			pseudo_lut[lut_idx].index == NOT))
++			(pseudo_lut[lut_idx].index == NOT || pseudo_lut[lut_idx].index == WHERE)))
++		return CSS_INVALID;
++
++	if (pseudo_lut[lut_idx].index == HAS && token->type != CSS_TOKEN_FUNCTION)
+ 		return CSS_INVALID;
+ 
+ 	if (token->type == CSS_TOKEN_FUNCTION) {
+@@ -1391,6 +1397,21 @@
+ 			detail_value.string = token->idata;
+ 			value_type = CSS_SELECTOR_DETAIL_VALUE_STRING;
+ 
++			consumeWhitespace(vector, ctx);
++		} else if (fun_type == HAS) {
++			/* Relative descendant selector :has(:nth-child(An+B)). */
++			token = parserutils_vector_iterate(vector, ctx);
++			if (!token || !tokenIsChar(token, ':')) return CSS_INVALID;
++			token = parserutils_vector_iterate(vector, ctx);
++			if (!token || token->type != CSS_TOKEN_FUNCTION ||
++			    lwc_string_caseless_isequal(token->idata, c->strings[NTH_CHILD], &match) != lwc_error_ok ||
++			    !match) return CSS_INVALID;
++			consumeWhitespace(vector, ctx);
++			error = parseNth(c, vector, ctx, &detail_value);
++			if (error != CSS_OK) return error;
++			value_type = CSS_SELECTOR_DETAIL_VALUE_NTH;
++			token = parserutils_vector_iterate(vector, ctx);
++			if (!token || !tokenIsChar(token, ')')) return CSS_INVALID;
+ 			consumeWhitespace(vector, ctx);
+ 		} else if (fun_type == NTH_CHILD ||
+ 				fun_type == NTH_LAST_CHILD ||
+@@ -1402,7 +1423,7 @@
+ 				return error;
+ 
+ 			value_type = CSS_SELECTOR_DETAIL_VALUE_NTH;
+-		} else if (fun_type == NOT) {
++		} else if (fun_type == NOT || fun_type == WHERE) {
+ 			/* type_selector | specific */
+ 			token = parserutils_vector_peek(vector, *ctx);
+ 			if (token == NULL)
+@@ -1443,7 +1464,7 @@
+ 				value_type = det.value_type;
+ 			}
+ 
+-			negate = true;
++			negate = fun_type == NOT;
+ 
+ 			consumeWhitespace(vector, ctx);
+ 		}
+@@ -1453,9 +1474,11 @@
+ 			return CSS_INVALID;
+ 	}
+ 
+-	return css__stylesheet_selector_detail_init(c->sheet,
+-			type, &qname, detail_value, value_type,
+-			negate, specific);
++	error = css__stylesheet_selector_detail_init(c->sheet,
++			type, &qname, detail_value, value_type, negate, specific);
++	if (error == CSS_OK && pseudo_lut[lut_idx].index == WHERE)
++		specific->zero_specificity = 1;
++	return error;
+ }
+ 
+ css_error parseSpecific(css_language *c,
+@@ -1842,6 +1865,36 @@
+  * Property parsing functions						      *
+  ******************************************************************************/
+ 
++/* A fully transparent top layer leaves the sprite underneath unchanged. */
++static bool next_keyword(const parserutils_vector *v, int32_t *pos,
++		css_token_type type, const char *name)
++{
++	consumeWhitespace(v, pos);
++	const css_token *t = parserutils_vector_iterate(v, pos);
++	return t && t->type == type && lwc_string_length(t->idata) == strlen(name) &&
++			strncasecmp(lwc_string_data(t->idata), name, strlen(name)) == 0;
++}
++
++static bool next_punctuation(const parserutils_vector *v, int32_t *pos, char ch)
++{
++	consumeWhitespace(v, pos);
++	const css_token *t = parserutils_vector_iterate(v, pos);
++	return t && tokenIsChar(t, ch);
++}
++
++static void skip_transparent_layer(const parserutils_vector *v, int32_t *ctx)
++{
++	int32_t pos = *ctx;
++	if (next_keyword(v, &pos, CSS_TOKEN_FUNCTION, "linear-gradient") &&
++	    next_keyword(v, &pos, CSS_TOKEN_IDENT, "transparent") &&
++	    next_punctuation(v, &pos, ',') &&
++	    next_keyword(v, &pos, CSS_TOKEN_IDENT, "transparent") &&
++	    next_punctuation(v, &pos, ')') && next_punctuation(v, &pos, ',')) {
++		consumeWhitespace(v, &pos);
++		*ctx = pos;
++	}
++}
++
+ css_error parseProperty(css_language *c, const css_token *property,
+ 		const parserutils_vector *vector, int32_t *ctx, css_rule *rule)
+ {
+@@ -1876,6 +1929,7 @@
+ 	assert (style != NULL);
+ 
+ 	/* Call the handler */
++	if (i == BACKGROUND_IMAGE) skip_transparent_layer(vector, ctx);
+ 	error = handler(c, vector, ctx, style);
+ 	if (error != CSS_OK) {
+ 		css__stylesheet_style_destroy(style);
+--- a/libcss/src/parse/properties/background.c
++++ b/libcss/src/parse/properties/background.c
+@@ -7,11 +7,35 @@
+ 
+ #include <assert.h>
+ #include <string.h>
++#include <strings.h>
+ 
+ #include "bytecode/bytecode.h"
+ #include "bytecode/opcodes.h"
+ #include "parse/properties/properties.h"
+ #include "parse/properties/utils.h"
++
++css_error css__parse_background_size(css_language *c,
++		const parserutils_vector *v, int32_t *ctx, css_style *result)
++{
++	int32_t pos = *ctx;
++	const css_token *t = parserutils_vector_iterate(v, &pos);
++	if (!t || t->type != CSS_TOKEN_IDENT) return CSS_INVALID;
++	enum flag_value flag = get_css_flag_value(c, t);
++	css_error err;
++	if (flag != FLAG_VALUE__NONE) {
++		err = css_stylesheet_style_flag_value(result, flag, CSS_PROP_BACKGROUND_SIZE);
++	} else {
++		const char *s = lwc_string_data(t->idata);
++		uint16_t value;
++		if (!strcasecmp(s, "cover")) value = CSS_BACKGROUND_SIZE_COVER;
++		else if (!strcasecmp(s, "contain")) value = CSS_BACKGROUND_SIZE_CONTAIN;
++		else if (!strcasecmp(s, "auto")) value = CSS_BACKGROUND_SIZE_AUTO;
++		else return CSS_INVALID;
++		err = css__stylesheet_style_appendOPV(result, CSS_PROP_BACKGROUND_SIZE, 0, value);
++	}
++	if (err == CSS_OK) *ctx = pos;
++	return err;
++}
+ 
+ /**
+  * Parse background
+@@ -39,7 +63,7 @@
+ 	bool color = true;
+ 	bool image = true;
+ 	bool position = true;
+-	bool repeat = true;
++	bool repeat = true, size_set = false;
+ 	css_style * attachment_style;
+ 	css_style * color_style;
+ 	css_style * image_style;
+@@ -55,6 +79,8 @@
+ 	flag_value = get_css_flag_value(c, token);
+ 
+ 	if (flag_value != FLAG_VALUE__NONE) {
++		error = css_stylesheet_style_flag_value(result, flag_value, CSS_PROP_BACKGROUND_SIZE);
++		if (error != CSS_OK) return error;
+ 		error = css_stylesheet_style_flag_value(result, flag_value,
+ 				CSS_PROP_BACKGROUND_ATTACHMENT);
+ 		if (error != CSS_OK)
+@@ -147,6 +173,15 @@
+ 			   (error = css__parse_background_position(c, vector, ctx,
+ 					position_style)) == CSS_OK) {
+ 			position = false;
++			consumeWhitespace(vector, ctx);
++			const css_token *slash = parserutils_vector_peek(vector, *ctx);
++			if (slash && tokenIsChar(slash, '/')) {
++				parserutils_vector_iterate(vector, ctx);
++				consumeWhitespace(vector, ctx);
++				error = css__parse_background_size(c, vector, ctx, result);
++				if (error != CSS_OK) goto css__parse_background_cleanup;
++				size_set = true;
++			}
+ 		} else if ((repeat) &&
+ 			   (error = css__parse_background_repeat(c, vector, ctx,
+ 					repeat_style)) == CSS_OK) {
+@@ -163,6 +198,12 @@
+ 		}
+ 	} while (*ctx != prev_ctx && token != NULL);
+ 
++	if (!size_set) {
++		error = css__stylesheet_style_appendOPV(result, CSS_PROP_BACKGROUND_SIZE,
++				0, CSS_BACKGROUND_SIZE_AUTO);
++		if (error != CSS_OK) goto css__parse_background_cleanup;
++	}
++
+ 	if (attachment) {
+ 		error = css__stylesheet_style_appendOPV(attachment_style,
+ 				CSS_PROP_BACKGROUND_ATTACHMENT, 0,
+--- a/libcss/src/parse/properties/properties.c
++++ b/libcss/src/parse/properties/properties.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include "parse/properties/properties.h"
++#include "grid_parse.inc"
+ 
+ /**
+  * Dispatch table of property handlers, indexed by property enum
+@@ -158,7 +159,19 @@
+ 	css__parse_width,
+ 	css__parse_word_spacing,
+ 	css__parse_writing_mode,
+-	css__parse_z_index
++	css__parse_z_index,
++	parse_grid_template_columns,
++	parse_grid_template_rows,
++	parse_grid_column,
++	parse_row_gap,
++	parse_inset_inline_start,
++	parse_inset_inline_end,
++	parse_transform,
++	parse_border_radius,
++	css__parse_background_size,
++	parse_gap,
++	parse_padding_block,
++	parse_padding_inline,
+ };
+ 
+ /** Mapping from property bytecode index to bytecode unit class mask. */
+--- a/libcss/src/parse/properties/properties.gen
++++ b/libcss/src/parse/properties/properties.gen
+@@ -16,7 +16,7 @@
+ 
+ direction:CSS_PROP_DIRECTION IDENT:( INHERIT: INITIAL: REVERT: UNSET: LTR:0,DIRECTION_LTR RTL:0,DIRECTION_RTL IDENT:)
+ 
+-display:CSS_PROP_DISPLAY IDENT:( INHERIT: INITIAL: REVERT: UNSET: INLINE:0,DISPLAY_INLINE BLOCK:0,DISPLAY_BLOCK LIST_ITEM:0,DISPLAY_LIST_ITEM RUN_IN:0,DISPLAY_RUN_IN INLINE_BLOCK:0,DISPLAY_INLINE_BLOCK TABLE:0,DISPLAY_TABLE INLINE_TABLE:0,DISPLAY_INLINE_TABLE TABLE_ROW_GROUP:0,DISPLAY_TABLE_ROW_GROUP TABLE_HEADER_GROUP:0,DISPLAY_TABLE_HEADER_GROUP TABLE_FOOTER_GROUP:0,DISPLAY_TABLE_FOOTER_GROUP TABLE_ROW:0,DISPLAY_TABLE_ROW TABLE_COLUMN_GROUP:0,DISPLAY_TABLE_COLUMN_GROUP TABLE_COLUMN:0,DISPLAY_TABLE_COLUMN TABLE_CELL:0,DISPLAY_TABLE_CELL TABLE_CAPTION:0,DISPLAY_TABLE_CAPTION NONE:0,DISPLAY_NONE FLEX:0,DISPLAY_FLEX INLINE_FLEX:0,DISPLAY_INLINE_FLEX GRID:0,DISPLAY_GRID INLINE_GRID:0,DISPLAY_INLINE_GRID IDENT:)
++display:CSS_PROP_DISPLAY IDENT:( INHERIT: INITIAL: REVERT: UNSET: INLINE:0,DISPLAY_INLINE BLOCK:0,DISPLAY_BLOCK LIST_ITEM:0,DISPLAY_LIST_ITEM RUN_IN:0,DISPLAY_RUN_IN INLINE_BLOCK:0,DISPLAY_INLINE_BLOCK TABLE:0,DISPLAY_TABLE INLINE_TABLE:0,DISPLAY_INLINE_TABLE TABLE_ROW_GROUP:0,DISPLAY_TABLE_ROW_GROUP TABLE_HEADER_GROUP:0,DISPLAY_TABLE_HEADER_GROUP TABLE_FOOTER_GROUP:0,DISPLAY_TABLE_FOOTER_GROUP TABLE_ROW:0,DISPLAY_TABLE_ROW TABLE_COLUMN_GROUP:0,DISPLAY_TABLE_COLUMN_GROUP TABLE_COLUMN:0,DISPLAY_TABLE_COLUMN TABLE_CELL:0,DISPLAY_TABLE_CELL TABLE_CAPTION:0,DISPLAY_TABLE_CAPTION NONE:0,DISPLAY_NONE FLEX:0,DISPLAY_FLEX INLINE_FLEX:0,DISPLAY_INLINE_FLEX GRID:0,DISPLAY_GRID INLINE_GRID:0,DISPLAY_INLINE_GRID CONTENTS:0,DISPLAY_CONTENTS IDENT:)
+ 
+ empty_cells:CSS_PROP_EMPTY_CELLS IDENT:( INHERIT: INITIAL: REVERT: UNSET: SHOW:0,EMPTY_CELLS_SHOW HIDE:0,EMPTY_CELLS_HIDE IDENT:)
+ 
+--- a/libcss/src/parse/properties/properties.h
++++ b/libcss/src/parse/properties/properties.h
+@@ -34,6 +34,9 @@
+ css_error css__parse_azimuth(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_style *result);
++css_error css__parse_background_size(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx, css_style *result);
++
+ css_error css__parse_background(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_style *result);
+--- a/libcss/src/parse/properties/utils.c
++++ b/libcss/src/parse/properties/utils.c
+@@ -1,3 +1,4 @@
++#include <strings.h>
+ /*
+  * This file is part of LibCSS.
+  * Licensed under the MIT License,
+@@ -365,9 +366,9 @@
+  * Post condition: \a *ctx is updated with the next token to process
+  *                 If the input is invalid, then \a *ctx remains unchanged.
+  */
+-css_error css__parse_colour_specifier(css_language *c,
++static css_error parse_colour_depth(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+-		uint16_t *value, uint32_t *result)
++		uint16_t *value, uint32_t *result, unsigned depth)
+ {
+ 	int32_t orig_ctx = *ctx;
+ 	const css_token *token;
+@@ -440,7 +441,22 @@
+ 		else
+ 			goto invalid;
+ 	} else if (token->type == CSS_TOKEN_FUNCTION) {
+-		uint8_t r = 0, g = 0, b = 0, a = 0xff;
++		/* This framebuffer advertises a light document colour scheme. */
++        if (lwc_string_length(token->idata)==10 &&
++                strncasecmp(lwc_string_data(token->idata),"light-dark",10)==0) {
++            uint32_t dark; uint16_t dark_type;
++            if (depth >= 12 || parse_colour_depth(c,vector,ctx,value,result,depth+1)!=CSS_OK)
++                goto invalid;
++            consumeWhitespace(vector,ctx);
++            token=parserutils_vector_iterate(vector,ctx);
++            if (!token || !tokenIsChar(token,',')) goto invalid;
++            if (parse_colour_depth(c,vector,ctx,&dark_type,&dark,depth+1)!=CSS_OK) goto invalid;
++            consumeWhitespace(vector,ctx);
++            token=parserutils_vector_iterate(vector,ctx);
++            if (!token || !tokenIsChar(token,')')) goto invalid;
++            return CSS_OK;
++        }
++        uint8_t r = 0, g = 0, b = 0, a = 0xff;
+ 		int colour_channels = 0;
+ 
+ 		if ((lwc_string_caseless_isequal(
+@@ -1333,3 +1349,10 @@
+ 
+ 	return error;
+ }
++
++css_error css__parse_colour_specifier(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		uint16_t *value, uint32_t *result)
++{
++    return parse_colour_depth(c,vector,ctx,value,result,0);
++}
+--- a/libcss/src/parse/propstrings.c
++++ b/libcss/src/parse/propstrings.c
+@@ -80,6 +80,8 @@
+ 	SMAP("disabled"),
+ 	SMAP("checked"),
+ 	SMAP("not"),
++	SMAP("where"),
++	SMAP("has"),
+ 
+ 	SMAP("first-line"),
+ 	SMAP("first-letter"),
+@@ -233,6 +235,19 @@
+ 	SMAP("word-spacing"),
+ 	SMAP("writing-mode"),
+ 	SMAP("z-index"),
++	SMAP("grid-template-columns"),
++	SMAP("grid-template-rows"),
++	SMAP("grid-column"),
++	SMAP("row-gap"),
++	SMAP("inset-inline-start"),
++	SMAP("inset-inline-end"),
++	SMAP("transform"),
++	SMAP("border-radius"),
++	SMAP("background-size"),
++	SMAP("gap"),
++	SMAP("padding-block"),
++	SMAP("padding-inline"),
++
+ 
+ 	SMAP("inherit"),
+ 	SMAP("unset"),
+@@ -490,6 +505,7 @@
+ 	SMAP("infinite"),
+ 	SMAP("grid"),
+ 	SMAP("inline-grid"),
++	SMAP("contents"),
+ 	SMAP("sticky"),
+ 
+ 	SMAP("aliceblue"),
+--- a/libcss/src/parse/propstrings.h
++++ b/libcss/src/parse/propstrings.h
+@@ -30,7 +30,7 @@
+ 	/* LEFT, RIGHT, -- already in properties */ FIRST,
+ 	ROOT, NTH_CHILD, NTH_LAST_CHILD, NTH_OF_TYPE, NTH_LAST_OF_TYPE,
+ 	LAST_CHILD, FIRST_OF_TYPE, LAST_OF_TYPE, ONLY_CHILD,
+-	ONLY_OF_TYPE, EMPTY, TARGET, ENABLED, DISABLED, CHECKED, NOT,
++	ONLY_OF_TYPE, EMPTY, TARGET, ENABLED, DISABLED, CHECKED, NOT, WHERE, HAS,
+ 
+ 	/* Pseudo elements */
+ 	FIRST_LINE, FIRST_LETTER, BEFORE, AFTER,
+@@ -69,7 +69,8 @@
+ 	VERTICAL_ALIGN, VISIBILITY, VOICE_FAMILY, VOLUME, WHITE_SPACE, WIDOWS,
+ 	WIDTH, WORD_SPACING, WRITING_MODE, Z_INDEX,
+ 
+-	LAST_PROP = Z_INDEX,
++	PROP_GRID_TEMPLATE_COLUMNS, PROP_GRID_TEMPLATE_ROWS, PROP_GRID_COLUMN, PROP_ROW_GAP, PROP_INSET_INLINE_START, PROP_INSET_INLINE_END, PROP_TRANSFORM, PROP_BORDER_RADIUS, PROP_BACKGROUND_SIZE, PROP_GAP, PROP_PADDING_BLOCK, PROP_PADDING_INLINE,
++	LAST_PROP = PROP_PADDING_INLINE,
+ 
+ 	/* Other keywords */
+ 	INHERIT, UNSET, IMPORTANT, NONE, BOTH, FIXED, SCROLL, TRANSPARENT,
+@@ -110,7 +111,7 @@
+ 	VERTICAL_LR, CONTENT_BOX, BORDER_BOX, STRETCH, INLINE_FLEX, FLEX_START,
+ 	FLEX_END, SPACE_BETWEEN, SPACE_AROUND, SPACE_EVENLY, ROW, ROW_REVERSE,
+ 	COLUMN_REVERSE, WRAP_STRING, WRAP_REVERSE, AND, OR, ONLY, INFINITE,
+-	GRID, INLINE_GRID, STICKY,
++	GRID, INLINE_GRID, CONTENTS, STICKY,
+ 
+ 	/* Named colours */
+ 	FIRST_COLOUR,
+--- a/libcss/src/select/computed.c
++++ b/libcss/src/select/computed.c
+@@ -35,7 +35,8 @@
+ static css_error compute_absolute_clip(css_computed_style *style,
+ 		const css_hint_length *ex_size);
+ static css_error compute_absolute_line_height(css_computed_style *style,
+-		const css_hint_length *ex_size);
++		const css_hint_length *font, const css_unit_ctx *ctx,
++		const css_computed_style *root);
+ static css_error compute_absolute_margins(css_computed_style *style,
+ 		const css_hint_length *ex_size);
+ static css_error compute_absolute_padding(css_computed_style *style,
+@@ -185,6 +186,21 @@
+ 
+ 	if (style->i.list_style_image != NULL)
+ 		lwc_string_unref(style->i.list_style_image);
++	if (style->i.grid_template_columns != NULL)
++		lwc_string_unref(style->i.grid_template_columns);
++	if (style->i.grid_template_rows != NULL)
++		lwc_string_unref(style->i.grid_template_rows);
++	if (style->i.grid_column != NULL)
++		lwc_string_unref(style->i.grid_column);
++	if (style->i.row_gap != NULL)
++		lwc_string_unref(style->i.row_gap);
++	if (style->i.inset_inline_start != NULL)
++		lwc_string_unref(style->i.inset_inline_start);
++	if (style->i.inset_inline_end != NULL)
++		lwc_string_unref(style->i.inset_inline_end);
++	if (style->i.transform != NULL)
++		lwc_string_unref(style->i.transform);
++
+ 
+ 	if (style->i.background_image != NULL)
+ 		lwc_string_unref(style->i.background_image);
+@@ -445,6 +461,42 @@
+ {
+ 	return get_list_style_image(style, url);
+ }
++uint8_t css_computed_grid_template_columns(const css_computed_style *style,
++		lwc_string **url)
++{
++	return get_grid_template_columns(style, url);
++}
++uint8_t css_computed_grid_template_rows(const css_computed_style *style,
++		lwc_string **url)
++{
++	return get_grid_template_rows(style, url);
++}
++uint8_t css_computed_grid_column(const css_computed_style *style,
++		lwc_string **url)
++{
++	return get_grid_column(style, url);
++}
++uint8_t css_computed_row_gap(const css_computed_style *style,
++		lwc_string **url)
++{
++	return get_row_gap(style, url);
++}
++uint8_t css_computed_inset_inline_start(const css_computed_style *style,
++		lwc_string **url)
++{
++	return get_inset_inline_start(style, url);
++}
++uint8_t css_computed_inset_inline_end(const css_computed_style *style,
++		lwc_string **url)
++{
++	return get_inset_inline_end(style, url);
++}
++uint8_t css_computed_transform(const css_computed_style *style,
++		lwc_string **url)
++{
++	return get_transform(style, url);
++}
++
+ 
+ uint8_t css_computed_quotes(const css_computed_style *style,
+ 		lwc_string ***quotes)
+@@ -603,6 +655,11 @@
+ 	return get_border_left_color(style, color);
+ }
+ 
++uint8_t css_computed_background_size(const css_computed_style *style)
++{
++	return get_background_size(style);
++}
++
+ uint8_t css_computed_box_sizing(const css_computed_style *style)
+ {
+ 	return get_box_sizing(style);
+@@ -769,6 +826,11 @@
+ 		css_fixed *length, css_unit *unit)
+ {
+ 	return get_padding_top(style, length, unit);
++}
++uint8_t css_computed_border_radius(const css_computed_style *style,
++		css_fixed *length, css_unit *unit)
++{
++	return get_border_radius(style, length, unit);
+ }
+ 
+ uint8_t css_computed_padding_right(const css_computed_style *style,
+@@ -1226,7 +1288,8 @@
+ 		return error;
+ 
+ 	/* Fix up line-height (must be before vertical-align) */
+-	error = compute_absolute_line_height(style, &ex_size.data.length);
++	error = compute_absolute_line_height(style, &size.data.length, unit_ctx,
++			parent ? unit_ctx->root_style : style);
+ 	if (error != CSS_OK)
+ 		return error;
+ 
+@@ -1572,14 +1635,12 @@
+ }
+ 
+ /**
+- * Compute absolute line-height
+- *
+- * \param style      Style to process
+- * \param ex_size    Ex size, in ems
++ * Compute absolute line-height using the declaring element's computed font.
+  * \return CSS_OK on success
+  */
+ css_error compute_absolute_line_height(css_computed_style *style,
+-		const css_hint_length *ex_size)
++		const css_hint_length *font, const css_unit_ctx *ctx,
++		const css_computed_style *root)
+ {
+ 	css_fixed length = 0;
+ 	css_unit unit = CSS_UNIT_PX;
+@@ -1589,9 +1650,19 @@
+ 	type = get_line_height(style, &length, &unit);
+ 
+ 	if (type == CSS_LINE_HEIGHT_DIMENSION) {
+-		if (unit == CSS_UNIT_EX) {
+-			length = FMUL(length, ex_size->value);
+-			unit = ex_size->unit;
++		/* Lengths and percentages inherit as computed lengths. Unitless
++		 * multipliers remain numbers and scale with the child's font. */
++		if (unit == CSS_UNIT_EM || unit == CSS_UNIT_EX || unit == CSS_UNIT_CH ||
++		    unit == CSS_UNIT_REM || unit == CSS_UNIT_PCT) {
++			css_hint resolved = { .status = CSS_FONT_SIZE_DIMENSION };
++			resolved.data.length.value = length;
++			resolved.data.length.unit = unit;
++			error = css_unit_compute_absolute_font_size(font, root,
++					ctx->font_size_default, &resolved);
++			if (error != CSS_OK)
++				return error;
++			length = resolved.data.length.value;
++			unit = resolved.data.length.unit;
+ 		}
+ 
+ 		error = set_line_height(style, type, length, unit);
+--- a/libcss/src/select/dispatch.c
++++ b/libcss/src/select/dispatch.c
+@@ -522,5 +522,15 @@
+ 	{
+ 		PROPERTY_FUNCS(stroke_opacity),
+ 		1,
+-	}
++	},
++	{ PROPERTY_FUNCS(grid_template_columns), 0 },
++	{ PROPERTY_FUNCS(grid_template_rows), 0 },
++	{ PROPERTY_FUNCS(grid_column), 0 },
++	{ PROPERTY_FUNCS(row_gap), 0 },
++	{ PROPERTY_FUNCS(inset_inline_start), 0 },
++	{ PROPERTY_FUNCS(inset_inline_end), 0 },
++	{ PROPERTY_FUNCS(transform), 0 },
++	{ PROPERTY_FUNCS(border_radius), 0 },
++	{ PROPERTY_FUNCS(background_size), 0 },
++
+ };
+--- a/libcss/src/select/properties/box_sizing.c
++++ b/libcss/src/select/properties/box_sizing.c
+@@ -73,3 +73,56 @@
+ 			result);
+ }
+ 
++
++css_error css__cascade_background_size(uint32_t opv, css_style *style,
++		css_select_state *state)
++{
++	uint16_t value = CSS_BACKGROUND_SIZE_INHERIT;
++
++	UNUSED(style);
++
++	if (hasFlagValue(opv) == false) {
++		value = getValue(opv);
++	}
++
++	if (css__outranks_existing(getOpcode(opv), isImportant(opv), state,
++			getFlagValue(opv))) {
++		return set_background_size(state->computed, value);
++	}
++
++	return CSS_OK;
++}
++
++css_error css__set_background_size_from_hint(const css_hint *hint,
++		css_computed_style *style)
++{
++	return set_background_size(style, hint->status);
++}
++
++css_error css__initial_background_size(css_select_state *state)
++{
++	return set_background_size(state->computed, CSS_BACKGROUND_SIZE_AUTO);
++}
++
++css_error css__copy_background_size(
++		const css_computed_style *from,
++		css_computed_style *to)
++{
++	if (from == to) {
++		return CSS_OK;
++	}
++
++	return set_background_size(to, get_background_size(from));
++}
++
++css_error css__compose_background_size(const css_computed_style *parent,
++		const css_computed_style *child,
++		css_computed_style *result)
++{
++	uint8_t type = get_background_size(child);
++
++	return css__copy_background_size(
++			type == CSS_BACKGROUND_SIZE_INHERIT ? parent : child,
++			result);
++}
++
+--- a/libcss/src/select/properties/display.c
++++ b/libcss/src/select/properties/display.c
+@@ -80,6 +80,9 @@
+ 		case DISPLAY_GRID:
+ 			value = CSS_DISPLAY_GRID;
+ 			break;
++		case DISPLAY_CONTENTS:
++			value = CSS_DISPLAY_CONTENTS;
++			break;
+ 		case DISPLAY_INLINE_GRID:
+ 			value = CSS_DISPLAY_INLINE_GRID;
+ 			break;
+--- a/libcss/src/select/properties/list_style_image.c
++++ b/libcss/src/select/properties/list_style_image.c
+@@ -65,3 +65,360 @@
+ 			result);
+ }
+ 
++css_error css__cascade_grid_template_columns(uint32_t opv, css_style *style,
++		css_select_state *state)
++{
++	return css__cascade_uri_none(opv, style, state, set_grid_template_columns);
++}
++
++css_error css__set_grid_template_columns_from_hint(const css_hint *hint,
++		css_computed_style *style)
++{
++	css_error error;
++
++	error = set_grid_template_columns(style, hint->status, hint->data.string);
++
++	if (hint->data.string != NULL)
++		lwc_string_unref(hint->data.string);
++
++	return error;
++}
++
++css_error css__initial_grid_template_columns(css_select_state *state)
++{
++	return set_grid_template_columns(state->computed,
++			CSS_LIST_STYLE_IMAGE_NONE, NULL);
++}
++
++css_error css__copy_grid_template_columns(
++		const css_computed_style *from,
++		css_computed_style *to)
++{
++	lwc_string *url;
++	uint8_t type = get_grid_template_columns(from, &url);
++
++	if (from == to) {
++		return CSS_OK;
++	}
++
++	return set_grid_template_columns(to, type, url);
++}
++
++css_error css__compose_grid_template_columns(const css_computed_style *parent,
++		const css_computed_style *child,
++		css_computed_style *result)
++{
++	lwc_string *url;
++	uint8_t type = get_grid_template_columns(child, &url);
++
++	return css__copy_grid_template_columns(
++			type == CSS_LIST_STYLE_IMAGE_INHERIT ? parent : child,
++			result);
++}
++
++css_error css__cascade_grid_template_rows(uint32_t opv, css_style *style,
++		css_select_state *state)
++{
++	return css__cascade_uri_none(opv, style, state, set_grid_template_rows);
++}
++
++css_error css__set_grid_template_rows_from_hint(const css_hint *hint,
++		css_computed_style *style)
++{
++	css_error error;
++
++	error = set_grid_template_rows(style, hint->status, hint->data.string);
++
++	if (hint->data.string != NULL)
++		lwc_string_unref(hint->data.string);
++
++	return error;
++}
++
++css_error css__initial_grid_template_rows(css_select_state *state)
++{
++	return set_grid_template_rows(state->computed,
++			CSS_LIST_STYLE_IMAGE_NONE, NULL);
++}
++
++css_error css__copy_grid_template_rows(
++		const css_computed_style *from,
++		css_computed_style *to)
++{
++	lwc_string *url;
++	uint8_t type = get_grid_template_rows(from, &url);
++
++	if (from == to) {
++		return CSS_OK;
++	}
++
++	return set_grid_template_rows(to, type, url);
++}
++
++css_error css__compose_grid_template_rows(const css_computed_style *parent,
++		const css_computed_style *child,
++		css_computed_style *result)
++{
++	lwc_string *url;
++	uint8_t type = get_grid_template_rows(child, &url);
++
++	return css__copy_grid_template_rows(
++			type == CSS_LIST_STYLE_IMAGE_INHERIT ? parent : child,
++			result);
++}
++
++css_error css__cascade_grid_column(uint32_t opv, css_style *style,
++		css_select_state *state)
++{
++	return css__cascade_uri_none(opv, style, state, set_grid_column);
++}
++
++css_error css__set_grid_column_from_hint(const css_hint *hint,
++		css_computed_style *style)
++{
++	css_error error;
++
++	error = set_grid_column(style, hint->status, hint->data.string);
++
++	if (hint->data.string != NULL)
++		lwc_string_unref(hint->data.string);
++
++	return error;
++}
++
++css_error css__initial_grid_column(css_select_state *state)
++{
++	return set_grid_column(state->computed,
++			CSS_LIST_STYLE_IMAGE_NONE, NULL);
++}
++
++css_error css__copy_grid_column(
++		const css_computed_style *from,
++		css_computed_style *to)
++{
++	lwc_string *url;
++	uint8_t type = get_grid_column(from, &url);
++
++	if (from == to) {
++		return CSS_OK;
++	}
++
++	return set_grid_column(to, type, url);
++}
++
++css_error css__compose_grid_column(const css_computed_style *parent,
++		const css_computed_style *child,
++		css_computed_style *result)
++{
++	lwc_string *url;
++	uint8_t type = get_grid_column(child, &url);
++
++	return css__copy_grid_column(
++			type == CSS_LIST_STYLE_IMAGE_INHERIT ? parent : child,
++			result);
++}
++
++css_error css__cascade_row_gap(uint32_t opv, css_style *style,
++		css_select_state *state)
++{
++	return css__cascade_uri_none(opv, style, state, set_row_gap);
++}
++
++css_error css__set_row_gap_from_hint(const css_hint *hint,
++		css_computed_style *style)
++{
++	css_error error;
++
++	error = set_row_gap(style, hint->status, hint->data.string);
++
++	if (hint->data.string != NULL)
++		lwc_string_unref(hint->data.string);
++
++	return error;
++}
++
++css_error css__initial_row_gap(css_select_state *state)
++{
++	return set_row_gap(state->computed,
++			CSS_LIST_STYLE_IMAGE_NONE, NULL);
++}
++
++css_error css__copy_row_gap(
++		const css_computed_style *from,
++		css_computed_style *to)
++{
++	lwc_string *url;
++	uint8_t type = get_row_gap(from, &url);
++
++	if (from == to) {
++		return CSS_OK;
++	}
++
++	return set_row_gap(to, type, url);
++}
++
++css_error css__compose_row_gap(const css_computed_style *parent,
++		const css_computed_style *child,
++		css_computed_style *result)
++{
++	lwc_string *url;
++	uint8_t type = get_row_gap(child, &url);
++
++	return css__copy_row_gap(
++			type == CSS_LIST_STYLE_IMAGE_INHERIT ? parent : child,
++			result);
++}
++
++css_error css__cascade_inset_inline_start(uint32_t opv, css_style *style,
++		css_select_state *state)
++{
++	return css__cascade_uri_none(opv, style, state, set_inset_inline_start);
++}
++
++css_error css__set_inset_inline_start_from_hint(const css_hint *hint,
++		css_computed_style *style)
++{
++	css_error error;
++
++	error = set_inset_inline_start(style, hint->status, hint->data.string);
++
++	if (hint->data.string != NULL)
++		lwc_string_unref(hint->data.string);
++
++	return error;
++}
++
++css_error css__initial_inset_inline_start(css_select_state *state)
++{
++	return set_inset_inline_start(state->computed,
++			CSS_LIST_STYLE_IMAGE_NONE, NULL);
++}
++
++css_error css__copy_inset_inline_start(
++		const css_computed_style *from,
++		css_computed_style *to)
++{
++	lwc_string *url;
++	uint8_t type = get_inset_inline_start(from, &url);
++
++	if (from == to) {
++		return CSS_OK;
++	}
++
++	return set_inset_inline_start(to, type, url);
++}
++
++css_error css__compose_inset_inline_start(const css_computed_style *parent,
++		const css_computed_style *child,
++		css_computed_style *result)
++{
++	lwc_string *url;
++	uint8_t type = get_inset_inline_start(child, &url);
++
++	return css__copy_inset_inline_start(
++			type == CSS_LIST_STYLE_IMAGE_INHERIT ? parent : child,
++			result);
++}
++
++css_error css__cascade_inset_inline_end(uint32_t opv, css_style *style,
++		css_select_state *state)
++{
++	return css__cascade_uri_none(opv, style, state, set_inset_inline_end);
++}
++
++css_error css__set_inset_inline_end_from_hint(const css_hint *hint,
++		css_computed_style *style)
++{
++	css_error error;
++
++	error = set_inset_inline_end(style, hint->status, hint->data.string);
++
++	if (hint->data.string != NULL)
++		lwc_string_unref(hint->data.string);
++
++	return error;
++}
++
++css_error css__initial_inset_inline_end(css_select_state *state)
++{
++	return set_inset_inline_end(state->computed,
++			CSS_LIST_STYLE_IMAGE_NONE, NULL);
++}
++
++css_error css__copy_inset_inline_end(
++		const css_computed_style *from,
++		css_computed_style *to)
++{
++	lwc_string *url;
++	uint8_t type = get_inset_inline_end(from, &url);
++
++	if (from == to) {
++		return CSS_OK;
++	}
++
++	return set_inset_inline_end(to, type, url);
++}
++
++css_error css__compose_inset_inline_end(const css_computed_style *parent,
++		const css_computed_style *child,
++		css_computed_style *result)
++{
++	lwc_string *url;
++	uint8_t type = get_inset_inline_end(child, &url);
++
++	return css__copy_inset_inline_end(
++			type == CSS_LIST_STYLE_IMAGE_INHERIT ? parent : child,
++			result);
++}
++
++css_error css__cascade_transform(uint32_t opv, css_style *style,
++		css_select_state *state)
++{
++	return css__cascade_uri_none(opv, style, state, set_transform);
++}
++
++css_error css__set_transform_from_hint(const css_hint *hint,
++		css_computed_style *style)
++{
++	css_error error;
++
++	error = set_transform(style, hint->status, hint->data.string);
++
++	if (hint->data.string != NULL)
++		lwc_string_unref(hint->data.string);
++
++	return error;
++}
++
++css_error css__initial_transform(css_select_state *state)
++{
++	return set_transform(state->computed,
++			CSS_LIST_STYLE_IMAGE_NONE, NULL);
++}
++
++css_error css__copy_transform(
++		const css_computed_style *from,
++		css_computed_style *to)
++{
++	lwc_string *url;
++	uint8_t type = get_transform(from, &url);
++
++	if (from == to) {
++		return CSS_OK;
++	}
++
++	return set_transform(to, type, url);
++}
++
++css_error css__compose_transform(const css_computed_style *parent,
++		const css_computed_style *child,
++		css_computed_style *result)
++{
++	lwc_string *url;
++	uint8_t type = get_transform(child, &url);
++
++	return css__copy_transform(
++			type == CSS_LIST_STYLE_IMAGE_INHERIT ? parent : child,
++			result);
++}
++
+--- a/libcss/src/select/properties/padding_top.c
++++ b/libcss/src/select/properties/padding_top.c
+@@ -60,3 +60,50 @@
+ 			result);
+ }
+ 
++
++css_error css__cascade_border_radius(uint32_t opv, css_style *style,
++		css_select_state *state)
++{
++	return css__cascade_length(opv, style, state, set_border_radius);
++}
++
++css_error css__set_border_radius_from_hint(const css_hint *hint,
++		css_computed_style *style)
++{
++	return set_border_radius(style, hint->status,
++			hint->data.length.value, hint->data.length.unit);
++}
++
++css_error css__initial_border_radius(css_select_state *state)
++{
++	return set_border_radius(state->computed, CSS_PADDING_SET, 0, CSS_UNIT_PX);
++}
++
++css_error css__copy_border_radius(
++		const css_computed_style *from,
++		css_computed_style *to)
++{
++	css_fixed length = 0;
++	css_unit unit = CSS_UNIT_PX;
++	uint8_t type = get_border_radius(from, &length, &unit);
++
++	if (from == to) {
++		return CSS_OK;
++	}
++
++	return set_border_radius(to, type, length, unit);
++}
++
++css_error css__compose_border_radius(const css_computed_style *parent,
++		const css_computed_style *child,
++		css_computed_style *result)
++{
++	css_fixed length = 0;
++	css_unit unit = CSS_UNIT_PX;
++	uint8_t type = get_border_radius(child, &length, &unit);
++
++	return css__copy_border_radius(
++			type == CSS_PADDING_INHERIT ? parent : child,
++			result);
++}
++
+--- a/libcss/src/select/properties/properties.h
++++ b/libcss/src/select/properties/properties.h
+@@ -90,6 +90,16 @@
+ PROPERTY_FUNCS(letter_spacing);
+ PROPERTY_FUNCS(line_height);
+ PROPERTY_FUNCS(list_style_image);
++PROPERTY_FUNCS(grid_template_columns);
++PROPERTY_FUNCS(grid_template_rows);
++PROPERTY_FUNCS(grid_column);
++PROPERTY_FUNCS(row_gap);
++PROPERTY_FUNCS(inset_inline_start);
++PROPERTY_FUNCS(inset_inline_end);
++PROPERTY_FUNCS(transform);
++PROPERTY_FUNCS(border_radius);
++PROPERTY_FUNCS(background_size);
++
+ PROPERTY_FUNCS(list_style_position);
+ PROPERTY_FUNCS(list_style_type);
+ PROPERTY_FUNCS(margin_top);
+--- a/libcss/src/select/select.c
++++ b/libcss/src/select/select.c
+@@ -2510,7 +2510,16 @@
+ 		if (error != CSS_OK)
+ 			return error;
+ 
+-		if (is_root == false &&
++		if (detail->qname.name == ctx->str.has) {
++			/* A sibling list contains all indices up to its length.
++			 * Only the smallest positive solution of An+B matters. */
++			int64_t a = detail->value.nth.a, b = detail->value.nth.b;
++			if (a > 0 && b < 1) b += ((1 - b + a - 1) / a) * a;
++			if (a < 0 && b > 0) b = 1 + (b - 1) % -a;
++			*match = false;
++			if (b > 0 && state->handler->has_descendant_at_index)
++				error = state->handler->has_descendant_at_index(state->pw, node, b, match);
++		} else if (is_root == false &&
+ 				detail->qname.name == ctx->str.first_child) {
+ 			int32_t num_before = 0;
+ 
+--- a/libcss/src/select/select_config.py
++++ b/libcss/src/select/select_config.py
+@@ -36,6 +36,7 @@
+     ('border_bottom_style', 4),
+     ('border_left_style', 4),
+     ('box_sizing', 2),
++    ('background_size', 2),
+     ('caption_side', 2),
+     ('clear', 3),
+     ('direction', 2),
+@@ -86,6 +87,14 @@
+     ('height', 2, 'length', 'CSS_HEIGHT_SET'),
+     ('line_height', 2, 'length', None, None, None, 'get'),
+     ('list_style_image', 1, 'string'),
++    ('grid_template_columns', 1, 'string'),
++    ('grid_template_rows', 1, 'string'),
++    ('grid_column', 1, 'string'),
++    ('row_gap', 1, 'string'),
++    ('inset_inline_start', 1, 'string'),
++    ('inset_inline_end', 1, 'string'),
++    ('transform', 1, 'string'),
++
+     ('margin_top', 2, 'length', 'CSS_MARGIN_SET'),
+     ('margin_right', 2, 'length', 'CSS_MARGIN_SET'),
+     ('margin_bottom', 2, 'length', 'CSS_MARGIN_SET'),
+@@ -99,6 +108,7 @@
+     ('stroke_opacity', 1, 'fixed', 'CSS_STROKE_OPACITY_SET'),
+     ('order', 1, 'integer', 'CSS_ORDER_SET'),
+     ('padding_top', 1, 'length', 'CSS_PADDING_SET'),
++    ('border_radius', 1, 'length', 'CSS_PADDING_SET'),
+     ('padding_right', 1, 'length', 'CSS_PADDING_SET'),
+     ('padding_left', 1, 'length', 'CSS_PADDING_SET'),
+     ('padding_bottom', 1, 'length', 'CSS_PADDING_SET'),
+--- a/libcss/src/select/strings.c
++++ b/libcss/src/select/strings.c
+@@ -53,6 +53,12 @@
+ 	error = lwc_intern_string(
+ 			"focus", SLEN("focus"),
+ 			&str->focus);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string(
++			"has", SLEN("has"),
++			&str->has);
+ 	if (error != lwc_error_ok)
+ 		return css_error_from_lwc_error(error);
+ 
+@@ -214,6 +220,8 @@
+ 		lwc_string_unref(str->active);
+ 	if (str->focus != NULL)
+ 		lwc_string_unref(str->focus);
++	if (str->has != NULL)
++		lwc_string_unref(str->has);
+ 	if (str->nth_child != NULL)
+ 		lwc_string_unref(str->nth_child);
+ 	if (str->nth_last_child != NULL)
+--- a/libcss/src/select/strings.h
++++ b/libcss/src/select/strings.h
+@@ -19,6 +19,7 @@
+ 	lwc_string *hover;
+ 	lwc_string *active;
+ 	lwc_string *focus;
++	lwc_string *has;
+ 	lwc_string *nth_child;
+ 	lwc_string *nth_last_child;
+ 	lwc_string *nth_of_type;
+--- a/libcss/src/stylesheet.c
++++ b/libcss/src/stylesheet.c
+@@ -977,6 +977,9 @@
+ 		d->value.string = lwc_string_ref(detail->value.string);
+ 
+ 	(*parent) = temp;
++
++	/* :where() does not contribute selector specificity. */
++	if (detail->zero_specificity) return CSS_OK;
+ 
+ 	/* Update parent's specificity */
+ 	switch (detail->type) {
+--- a/libcss/src/stylesheet.h
++++ b/libcss/src/stylesheet.h
+@@ -78,7 +78,7 @@
+ 		     next       : 1,		/**< Another selector detail
+ 						 * follows */
+ 		     value_type : 1,		/**< Type of value field */
+-		     negate     : 1;		/**< Detail match is inverted */
++		     zero_specificity : 1, negate : 1;		/**< Detail match is inverted */
+ } css_selector_detail;
+ 
+ struct css_selector {

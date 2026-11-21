@@ -12,7 +12,7 @@ fn source_manifest(dir: &Path, root: &Path, entries: &mut String) {
         if path.is_dir() {
             writeln!(entries, "({guest:?}, None),").unwrap();
             source_manifest(&path, root, entries);
-        } else if matches!(guest.as_str(), "/src/agent/chat.md" | "/src/agent/native.py") || guest == "/src/games/snake.py" || guest == "/src/links/COPYING" || guest == "/src/links/prepare.py" || guest == "/src/links/webdeps.py" || guest == "/src/links/events.js" || matches!(
+        } else if matches!(guest.as_str(), "/src/agent/chat.md" | "/src/agent/native.py" | "/src/agent/desktop.py" | "/src/agent/desktop.md") || guest == "/src/games/snake.py" || guest == "/src/links/COPYING" || guest == "/src/ssh/prepare-sunset.py" || guest == "/src/links/prepare.py" || guest == "/src/links/webdeps.py" || guest == "/src/links/events.js" || matches!(
             path.extension().and_then(|s| s.to_str()),
             Some("c" | "h" | "ld" | "def" | "rs" | "swift")
         ) || matches!(
@@ -93,11 +93,14 @@ fn main() {
         "target/user-build/foreground.bin",
         "target/user-build/sh.elf",
         "target/user-build/ssh.elf",
+        "target/user-build/sftp.elf",
         "target/user-build/lust.elf",
         "target/user-build/agent-run.elf",
         "target/user-build/ls.elf",
         "target/user-build/links.elf",
         "target/user-build/desktop.elf",
+        "target/user-build/nxeyes.elf",
+        "target/user-build/stopwatch.elf",
         "target/user-build/echo.bin",
         "target/user-build/python.bin",
         "target/user-build/tcc.bin",

@@ -78,7 +78,7 @@ impl Terminal {
             } else {
                 (y + shift * CH, y)
             };
-            fb.copy_within(src * W..src * W + width, dst * W);
+            fb.copy_within(src * self.stride..src * self.stride + width, dst * self.stride);
         }
         let first = if up { 0 } else { self.rows - shift };
         for row in first..first + shift {
@@ -86,13 +86,13 @@ impl Terminal {
             for col in 0..self.cols {
                 let byte = cells.get(col).copied().unwrap_or(b' ');
                 let (fg, bg) = styles.get(col).copied().unwrap_or(DEFAULT_STYLE);
-                let start = row * CH * W + col * CW;
+                let start = row * CH * self.stride + col * CW;
                 if byte == b' ' {
                     for dy in 0..CH {
-                        fb[start + dy * W..start + dy * W + CW].fill(bg);
+                        fb[start + dy * self.stride..start + dy * self.stride + CW].fill(bg);
                     }
                 } else {
-                    glyph(fb, start, CW, byte, fg, bg);
+                    glyph_at(fb, self.stride, start, CW, byte, fg, bg);
                 }
             }
         }

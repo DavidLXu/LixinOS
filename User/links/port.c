@@ -19,6 +19,12 @@ typedef struct {
     const char *message;
 } Browser;
 
+#ifdef LX_DESKTOP_BROWSER
+// Remember the source offset because resizing can replace the formatted document.
+static int editing_url, form_position = -1;
+static char edit_url[ADDRESS_LIMIT];
+#endif
+
 static void out(const char *s) {
     while (*s) console_call(1, 256 + (unsigned char)*s++);
 }
@@ -254,6 +260,14 @@ too_long:
 static void activate_control(Browser *b,struct form_control *fc) {
     int prevented=page_click(&b->media,fc->position);
     if (!prevented && (fc->type==FC_TEXT || fc->type==FC_TEXTAREA)) {
+#ifdef LX_DESKTOP_BROWSER
+        if (b->window.hosted) {
+            form_position = fc->position;
+            editing_url = 1;
+            edit_url[0] = 0;
+            return;
+        }
+#endif
         char value[ADDRESS_LIMIT];
         if (read_input(b,value,fc->name?(char *)fc->name:"Value")) {
             mem_free(fc->default_value);
@@ -324,6 +338,41 @@ static int key(Browser *b) {
         default: return 0;
     }
 }
+static int browser_action(Browser *b,int k) {
+    b->message=NULL;
+    if (k=='q'||k=='Q'||k==3||k==4) return 0;
+    if (k=='\t'||k==NEXT) select_link(b,1);
+    else if (k==PREV) select_link(b,-1);
+    else if (k==' '||k==PAGE_DOWN) {
+        int last=b->doc->y-b->rows;
+        if (last>b->current.top) {
+            b->current.top+=b->rows;
+            if (b->current.top>last) b->current.top=last;
+        }
+    } else if (k==PAGE_UP) {
+        b->current.top=b->current.top>b->rows?b->current.top-b->rows:0;
+    } else if (k=='b'||k=='B'||k==127||k==8) {
+        if (b->depth && visit(b,b->back[b->depth-1],0)) --b->depth;
+    } else if (k=='g'||k=='G') {
+        char input[ADDRESS_LIMIT];
+        if (read_input(b,input,"Open")) {
+            Location next={.selected=-1};
+            if (address(b,input,next.url)) visit(b,next,1);
+            else b->message="Address too long";
+        }
+    } else if ((k==13||k==10) && b->current.selected>=0) {
+        struct link *link=&b->doc->links[b->current.selected];
+        if (link->form) { activate_control(b,link->form); return 1; }
+        char *url=(char *)link->where;
+        if (!url) return 1;
+        Location next={.selected=-1};
+        if ((!strncmp(b->current.url,"http://",7) || !strncmp(b->current.url,"https://",8)) && !strncmp(url,"file:",5))
+            b->message="Remote documents cannot open guest files";
+        else if (strlen(url)>=sizeof(next.url)) b->message="Address too long";
+        else {strcpy(next.url,url); visit(b,next,1);}
+    }
+    return 1;
+}
 static int browse(Browser *b,const char *arg) {
     Location loc={.selected=-1};
     if (!address(b,arg,loc.url)) {lx_error("links: address too long\n");return 1;}
@@ -333,43 +382,101 @@ static int browse(Browser *b,const char *arg) {
         draw(b);
         int k=key(b);
         if (!k) continue;
-        b->message=NULL;
-        if (k=='q'||k=='Q'||k==3||k==4) break;
-        if (k=='\t'||k==NEXT) select_link(b,1);
-        else if (k==PREV) select_link(b,-1);
-        else if (k==' '||k==PAGE_DOWN) {
-            int last=b->doc->y-b->rows;
-            if (last>b->current.top) {
-                b->current.top+=b->rows;
-                if (b->current.top>last) b->current.top=last;
-            }
-        } else if (k==PAGE_UP) {
-            b->current.top=b->current.top>b->rows?b->current.top-b->rows:0;
-        } else if (k=='b'||k=='B'||k==127||k==8) {
-            if (b->depth && visit(b,b->back[b->depth-1],0)) --b->depth;
-        } else if (k=='g'||k=='G') {
-            char input[ADDRESS_LIMIT];
-            if (read_input(b,input,"Open")) {
-                Location next={.selected=-1};
-                if (address(b,input,next.url)) visit(b,next,1);
-                else b->message="Address too long";
-            }
-        } else if ((k==13||k==10) && b->current.selected>=0) {
-            struct link *link=&b->doc->links[b->current.selected];
-            if (link->form) { activate_control(b,link->form); continue; }
-            char *url=(char *)link->where;
-            if (!url) continue;
-            Location next={.selected=-1};
-            if ((!strncmp(b->current.url,"http://",7) || !strncmp(b->current.url,"https://",8)) && !strncmp(url,"file:",5))
-                b->message="Remote documents cannot open guest files";
-            else if (strlen(url)>=sizeof(next.url)) b->message="Address too long";
-            else {strcpy(next.url,url); visit(b,next,1);}
-        }
+        if (!browser_action(b,k)) break;
     }
     release_page(&b->media); destroy_formatted(b->doc);
     if (!b->window.canvas.pixels) out("\033[0m\033[2J\033[H");
     return 0;
 }
+#ifdef LX_DESKTOP_BROWSER
+#include "../desktop/browser.h"
+static Browser *session;
+
+
+static void geometry(Browser *b, int x, int y, int width, int height) {
+    struct browser_window *w=&b->window;
+    w->x=x; w->y=y; w->w=width; w->h=height;
+    b->cols=(width-2*WEB_MARGIN)/WEB_CHAR;
+    if (b->cols>256) b->cols=256;
+    b->rows=(height-WEB_TOP-30)/WEB_LINE;
+}
+
+int desk_web_open(unsigned *pixels,int stride,int height,const char *cwd,int width,int rows) {
+    if (session) return 1;
+    Browser *b=calloc(1,sizeof(*b));
+    if (!b) return 0;
+    b->window.canvas=(struct lx_canvas){.pixels=pixels,.width=stride,.height=height};
+    b->window.hosted=1;
+    strcpy(b->cwd,cwd);
+    geometry(b,0,0,width,rows);
+    static int initialized;
+    if (!initialized) { init_charset(); initialized=1; }
+    Location home_loc={.selected=-1};
+    strcpy(home_loc.url,"about:links");
+    if (!visit(b,home_loc,0)) { free(b); return 0; }
+    session=b;
+    return 1;
+}
+void desk_web_close(void) {
+    if (!session) return;
+    release_page(&session->media);
+    destroy_formatted(session->doc);
+    free(session); session=NULL; editing_url=0; form_position=-1;
+}
+const char *desk_web_title(void) { return session ? (char *)session->doc->title : "Links"; }
+void desk_web_draw(int x,int y,int w,int h) {
+    Browser *b=session;
+    int resized=b->window.w!=w || b->window.h!=h;
+    geometry(b,x,y,w,h);
+    if (resized && b->media.html) {
+        struct f_data *doc=layout(b,b->current.url,b->media.headers,b->media.html,strlen(b->media.html),b->media.title);
+        destroy_formatted(b->doc); b->doc=doc;
+        if (b->current.selected>=doc->nlinks) b->current.selected=-1;
+        int last=doc->y>b->rows?doc->y-b->rows:0;
+        if (b->current.top>last) b->current.top=last;
+    }
+    draw_window(b,editing_url?edit_url:b->current.url);
+}
+int desk_web_tick(void) { return session && !editing_url && tick(session); }
+int desk_web_key(int key) {
+    Browser *b=session;
+    if (editing_url) {
+        size_t n=strlen(edit_url);
+        if (key==27 || key==3) { editing_url=0; form_position=-1; }
+        else if (key==13 || key==10) {
+            Location loc={.selected=-1};
+            editing_url=0;
+            if (form_position >= 0 && n) {
+                for (int i=0;i<b->doc->nlinks;i++) {
+                    struct form_control *fc=b->doc->links[i].form;
+                    if (fc && fc->position==form_position) {
+                        mem_free(fc->default_value);
+                        fc->default_value=stracpy((unsigned char *)edit_url);
+                        submit_form(b,fc);
+                        break;
+                    }
+                }
+            } else if (n && address(b,edit_url,loc.url)) visit(b,loc,1);
+            form_position=-1;
+        } else if ((key==8 || key==127) && n) edit_url[n-1]=0;
+        else if (key>=32 && key<127 && n+1<sizeof(edit_url)) { edit_url[n]=key; edit_url[n+1]=0; }
+    } else if (key=='g' || key=='G') { editing_url=1; edit_url[0]=0; }
+    else return browser_action(b,key);
+    return 1;
+}
+void desk_web_cancel_pointer(void) {
+    if (!session) return;
+    session->armed_link=-1;
+    session->window.down=session->window.dragging=0;
+}
+int desk_web_pointer(int x,int y,int down,int wheel) {
+    if (editing_url) return 0;
+    struct lx_pointer p={.x=x,.y=y,.down=down,.wheel=wheel,.inside=1};
+    int k=pointer_key(session,p);
+    if (k) desk_web_key(k);
+    return k || down;
+}
+#else
 extern char __data_image[], __data_begin[], __data_end[];
 /* The browser heap is mapped separately. Use the private RW bank below
    the mailboxes for the C/JS stack; preserve the kernel-supplied arguments. */
@@ -404,3 +511,5 @@ void browser_start(const char *cwd,const char *args,size_t len) {
     init_charset();
     finish(browse(browser,initial));
 }
+
+#endif

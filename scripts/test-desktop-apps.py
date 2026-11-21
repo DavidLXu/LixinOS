@@ -107,32 +107,42 @@ def exercise(guest, control, directory, install, screenshots):
         raise AssertionError((color, text, pixel(color_x, color_y).hex()))
 
     def display(label, screenshot=None):
+        if install:
+            wait(cx+20,cy+55,"293c3b",(cx+25,cy+59,label,True,150),screenshot)
+            return
         wait(CX+20, CY+55, "223b43", (CX+27, CY+61, label, True, 150), screenshot)
 
+    cx,cy=76+(CW-76-376)//2,(CH-378)//2
     guest.send(b"desktop\r")
-    wait(480, 28, "f9f9f4")
+    wait(1, 1, "281e2b")
     if install:
-        click(488, 49)
+        click(38,192)
     else:
-        click(58, 45)
-        left, top = (CW - 600)//2, (CH - 391)//2
+        click(38,35)
+        left, top = 76+(CW-76-600)//2, (CH - 391)//2
         wait(left + 6, top + 52, "f9f9f4")
         click(left + 72, top + 95)
     display("0")
     for i in (16, 17, 9, 15, 13, 18):
-        click(CX+40+i%4*87, CY+132+i//4*49)
+        if install:
+            click(cx+40+i%4*87,cy+120+i//4*54)
+        else:
+            click(CX+40+i%4*87, CY+132+i//4*49)
         time.sleep(0.07)
     display("2.5", "calculator.png" if install else None)
     guest.send(b"c1/0=")
     display("Cannot divide by zero")
     guest.send(b"c")
     display("0")
-    click(CX+40+3*87, CY+132+4*49)
-    wait(480, 28, "f9f9f4")
+    if install:
+        click(cx+355,cy+22)
+    else:
+        click(CX+40+3*87, CY+132+4*49)
+    wait(1, 1, "281e2b")
 
     if not install:
         click(left + 580, top + 20)
-    click(586, 48)
+    click(38,438)
     wait(4, 5, "233b43")
     if install:
         guest.send(b"Hello LXE1\rSecond line\x1b[D!")
@@ -143,7 +153,7 @@ def exercise(guest, control, directory, install, screenshots):
     wait(20, 84, "fcfcf7", (46, 91, "llo LXE1", False, 130),
          None if install else "editor-reboot.png")
     click(CW-60, 31)
-    wait(480, 28, "f9f9f4")
+    wait(1, 1, "281e2b")
     guest.expect(b"\x1b", prompt)
     guest.expect(b"cat /notes.txt\r", prompt, b"Hello LXE1\nSecond lin!e")
     guest.send(b"shutdown\r")

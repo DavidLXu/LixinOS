@@ -1,0 +1,50 @@
+--- a/mousepad/main.c
++++ b/mousepad/main.c
+@@ -23,6 +23,7 @@
+ 
+ #ifdef HAVE_LOCALE_H
+ #include <locale.h>
++#include <gtksourceview/gtksource.h>
+ #endif
+ 
+ 
+@@ -34,6 +35,15 @@
+   MousepadApplication *application;
+   gint status;
+ 
++  /* LixinOS window backend */
++  g_setenv ("GDK_BACKEND", "broadway", TRUE);
++  g_setenv ("GSETTINGS_BACKEND", "memory", TRUE);
++  g_setenv ("NO_AT_BRIDGE", "1", TRUE);
++  g_setenv ("FONTCONFIG_FILE", "/lib/gtk3/fonts.conf", TRUE);
++  gchar *languages[] = { "/lib/gtk3/mousepad/language-specs", NULL };
++  gchar *styles[] = { "/lib/gtk3/mousepad/styles", NULL };
++  gtk_source_language_manager_set_search_path (gtk_source_language_manager_get_default (), languages);
++  gtk_source_style_scheme_manager_set_search_path (gtk_source_style_scheme_manager_get_default (), styles);
+   /* bind the text domain to the locale directory */
+   setlocale (LC_ALL, "");
+   bindtextdomain (GETTEXT_PACKAGE, PACKAGE_LOCALE_DIR);
+@@ -47,7 +57,7 @@
+   /* create the application */
+   application = g_object_new (MOUSEPAD_TYPE_APPLICATION,
+                               "application-id", MOUSEPAD_ID,
+-                              "flags", G_APPLICATION_HANDLES_COMMAND_LINE | G_APPLICATION_HANDLES_OPEN,
++                              "flags", G_APPLICATION_HANDLES_COMMAND_LINE | G_APPLICATION_HANDLES_OPEN | G_APPLICATION_NON_UNIQUE,
+                               NULL);
+ 
+   /* run the application */
+--- a/mousepad/mousepad-window.c
++++ b/mousepad/mousepad-window.c
+@@ -685,7 +685,11 @@
+ GtkWidget *
+ mousepad_window_new (MousepadApplication *application)
+ {
+-  return g_object_new (MOUSEPAD_TYPE_WINDOW, "application", GTK_APPLICATION (application), NULL);
++  return g_object_new (MOUSEPAD_TYPE_WINDOW,
++                       "application", GTK_APPLICATION (application),
++                       "decorated", FALSE,
++                       "default-width", 720, "default-height", 436,
++                       NULL);
+ }
+ 
+ 

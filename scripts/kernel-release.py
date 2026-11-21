@@ -170,6 +170,44 @@ def publish(temp, guest_disk):
     print(f"Published {tag} at {commit}", flush=True)
 
 
+def latest_tag():
+    if not (ROOT / ".git").exists():
+        return ""
+    tags = git("tag", "-l", "--sort=-version:refname", "kernel-*").splitlines()
+    return next((tag for tag in tags if re.fullmatch(TAG_PATTERN, tag)), "")
+
+
+def boot_files(tag, variant):
+    """Cache only the selected boot binaries from a local paired release."""
+    tag = latest_tag() if tag == "latest" else tag
+    if not re.fullmatch(TAG_PATTERN, tag):
+        raise ValueError("no matching local kernel release")
+    ref = "refs/tags/" + tag
+    manifest = json.loads(git("show", f"{ref}:{ART}/manifest.json"))
+    if manifest["tag"] != tag:
+        raise ValueError("kernel release manifest tag mismatch")
+    files = ("tcc-kernel.elf",) if variant == "tcc" else (f"rust-{variant}.elf", "cpython.pkg")
+    directory = ROOT / "data/kernel-cache" / tag
+    directory.mkdir(parents=True, exist_ok=True)
+    for name in files:
+        expected = manifest["sha256"][name]
+        path = directory / name
+        if path.is_file() and digest(path) == expected:
+            continue
+        with tempfile.NamedTemporaryFile(dir=directory, prefix="boot-", delete=False) as stream:
+            staging = Path(stream.name)
+            try:
+                subprocess.run(["git", "show", f"{ref}:{ART}/{name}"], cwd=ROOT,
+                               stdout=stream, check=True)
+                stream.flush()
+                if digest(staging) != expected:
+                    raise ValueError(f"kernel release checksum mismatch: {name}")
+                os.replace(staging, path)
+            finally:
+                staging.unlink(missing_ok=True)
+    print(directory)
+
+
 def restore(tag, dest):
     if not re.fullmatch(TAG_PATTERN, tag):
         raise ValueError("expected kernel-YYYY-MM-DD.N")
@@ -207,12 +245,20 @@ def main():
     publish_cmd = commands.add_parser("publish", help="build, boot-test and tag both kernels")
     publish_cmd.add_argument("--tcc-source-disk", type=Path, help="use /src/kernel from a saved guest disk")
     commands.add_parser("list", help="list paired releases")
+    commands.add_parser("latest", help="print the newest local paired release")
+    boot = commands.add_parser("boot-files", help="verify and cache boot files from a local release")
+    boot.add_argument("tag")
+    boot.add_argument("variant", choices=(*PROFILES, "tcc"))
     get = commands.add_parser("restore", help="restore and verify a new runnable worktree")
     get.add_argument("tag")
     get.add_argument("directory", type=Path)
     args = parser.parse_args()
     if args.action == "list":
         print(git("tag", "-l", "--sort=-version:refname", "kernel-*"))
+    elif args.action == "latest":
+        print(latest_tag())
+    elif args.action == "boot-files":
+        boot_files(args.tag, args.variant)
     elif args.action == "restore":
         restore(args.tag, args.directory.absolute())
     else:

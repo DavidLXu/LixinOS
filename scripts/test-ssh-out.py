@@ -80,7 +80,9 @@ async def serve(keyfile, port):
                 return
 
     async with await asyncssh.listen("127.0.0.1", port, server_factory=Login,
-                                     server_host_keys=[keyfile], process_factory=shell) as listener:
+                                     server_host_keys=[keyfile], process_factory=shell,
+                                     sftp_factory=lambda chan: asyncssh.SFTPServer(
+                                         chan, chroot=os.fsencode(Path(keyfile).parent / "remote"))) as listener:
         print(listener.get_port(), flush=True)
         await listener.wait_closed()
 

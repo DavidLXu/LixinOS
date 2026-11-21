@@ -1,4 +1,5 @@
 #include "native.h"
+#include "../gui/mouse-cursor.h"
 
 /* QEMU ramfb XRGB, 2 physical pixels per logical canvas pixel. */
 enum {
@@ -19,13 +20,20 @@ static unsigned width = 2354, height = 1408, pane_width = 2354, columns = 107, r
 static int split, online, ssh;
 static int clock_offset;
 static void paint_status(void);
+static int hide_edit_menu(void);
+static void show_edit_menu(void);
+static int hide_text_pointer(void);
+static int edit_menu_active(void);
 int ssh_mode(void) { return ssh; }
 static unsigned focus;
 int split_mode(void) { return split; }
 unsigned focused_pane(void) { return focus; }
 void cycle_focus(void) {
-    if (split)
+    if (split) {
+        hide_text_pointer();
+        close_edit_menu();
         focus ^= 1;
+    }
 }
 static u8 font[95 * CW * CH];
 struct cell {
@@ -51,14 +59,104 @@ static struct terminal panes[2], *term = panes;
 struct popup {
     struct terminal *grid;
     u32 *backdrop, *title;
-    unsigned x, y, w, h, cols, rows, screen_w, screen_h;
-    int editor, drag, dx, dy, down, closing;
+    unsigned x, y, w, h, cols, rows, screen_w, screen_h, id;
+    int editor, drag, dx, dy, down, closing, tab, paste;
 };
 static struct popup windows[NATIVE_TASKS], *shown[2], *win;
+static unsigned next_window_id = 1;
+static struct {
+    unsigned count;
+    int action;
+} tab_bar[2];
+enum { TAB_LEFT = 164, TAB_WIDTH = 30 };
+static int hidden_tab(void) { return win && win->tab && !win->backdrop; }
+static void move_window(unsigned x, unsigned y);
+
+static int tabs_visible(void) {
+    return shown[process_pane()] && shown[process_pane()]->tab;
+}
+
+int popup_tab_input(void) {
+    unsigned owner = task_terminal(), visible = popup_terminal();
+    if (owner && owner != visible) return 0;
+    return !tabs_visible() || owner == visible;
+}
+
+int display_output_visible(void) {
+    return popup_tab_input();
+}
 static unsigned top = BAR, pane_origin;
+
+/* Lift the overlay before changing or saving the pixels underneath it. */
+static unsigned cursor_x, cursor_y;
+static int cursor_drawn, text_cursor;
+static u32 cursor_underlay[CUR_H][CUR_W][4];
+static void toggle_text_pointer(void) {
+    unsigned stride = pane_width + CW;
+    unsigned right = cursor_x / stride * stride + pane_width;
+    for (unsigned y = 0; y < CUR_H && cursor_y + 2 * y + 1 < height; y++)
+        for (unsigned x = 0; x < CUR_W && cursor_x + 2 * x + 1 < right; x++) {
+            char ink = text_cursor ? lixin_text_cursor[y][x] : lixin_cursor[y][x];
+            if (ink == '.')
+                continue;
+            u32 *p = frame[cursor_y + 2 * y] + cursor_x + 2 * x;
+            for (unsigned i = 0; i < 4; ++i) {
+                u32 *pixel = p + (i / 2) * width + i % 2;
+                if (cursor_drawn) {
+                    *pixel = cursor_underlay[y][x][i];
+                } else {
+                    cursor_underlay[y][x][i] = *pixel;
+                    *pixel = lixin_cursor_pixel(ink, *pixel);
+                }
+            }
+        }
+    cursor_drawn = !cursor_drawn;
+}
+static int hide_text_pointer(void) {
+    if (!cursor_drawn)
+        return 0;
+    toggle_text_pointer();
+    return 1;
+}
+static void refresh_text_pointer(void) {
+    if (process_pane() != focus || hidden_tab() || (!uses_terminal_pointer() && !tabs_visible() && !edit_menu_active()))
+        return;
+    long position = tablet_position(width, height, BAR);
+    if (position < 0 || !(position & (1UL << 25))) {
+        hide_text_pointer();
+        return;
+    }
+    unsigned x = (position & 4095) * 2, y = BAR + ((position >> 12) & 4095) * 2;
+    if (x < pane_origin || x >= pane_origin + pane_width || y + 1 >= height) {
+        hide_text_pointer();
+        return;
+    }
+    int text = !edit_menu_active() && x >= origin && x < origin + columns * CW &&
+               y >= top && y < top + rows * CH;
+    if (text) {
+        x -= x - pane_origin < 8 ? x - pane_origin : 8;
+        y -= y - BAR < 14 ? y - BAR : 14;
+    }
+    if (cursor_drawn && x == cursor_x && y == cursor_y && text == text_cursor)
+        return;
+    hide_text_pointer();
+    cursor_x = x;
+    cursor_y = y;
+    text_cursor = text;
+    toggle_text_pointer();
+}
+
 static void choose_view(unsigned id) {
     pane_origin = id * (pane_width + CW);
+    unsigned owner = task_terminal();
     win = shown[id];
+    if (id == process_pane() && owner && (!win || win->id != owner)) {
+        for (unsigned i = 1; i < NATIVE_TASKS; i++)
+            if (windows[i].grid && windows[i].tab && windows[i].id == owner) {
+                win = &windows[i];
+                break;
+            }
+    }
     origin = pane_origin + (win ? 2 * (win->x + 6) : 0);
     top = BAR + (win ? 2 * (win->y + 44) : 0);
     columns = win ? win->cols : pane_width / CW;
@@ -86,6 +184,8 @@ static int show_window(struct popup *w) {
     w->backdrop = (u32 *)file_buffer(16 * w->screen_w * w->screen_h);
     if (!w->backdrop)
         return 0;
+    hide_text_pointer();
+    close_edit_menu();
     for (unsigned j = 0; j < 2 * w->screen_h; j++)
         memcpy(w->backdrop + j * 2 * w->screen_w, frame[BAR + j] + pane_origin, 8 * w->screen_w);
     shown[process_pane()] = w;
@@ -105,7 +205,8 @@ int popup_open(int slot, unsigned title_w, const u32 *title, int editor) {
     if (!nrows || title_w != cols * 11 + 12 || shown[process_pane()])
         return 0;
     *w = (struct popup){
-        .w = title_w, .h = nrows * 22 + 50, .cols = cols, .rows = nrows, .editor = editor};
+        .w = title_w, .h = nrows * 22 + 50, .cols = cols, .rows = nrows,
+        .id = next_window_id++, .editor = editor};
     w->x = (pane_width / 2 - w->w) / 2;
     w->y = (h - w->h) / 2;
     w->grid = (struct terminal *)file_buffer(sizeof(*w->grid));
@@ -124,20 +225,39 @@ int popup_open(int slot, unsigned title_w, const u32 *title, int editor) {
     w->grid = 0;
     return 0;
 }
-int popup_show(int slot) { return show_window(&windows[slot]); }
+int popup_show(int slot) {
+    struct popup *w = &windows[slot];
+    if (show_window(w)) {
+        reset_tablet(width, height, BAR);
+        return 1;
+    }
+    return 0;
+}
+void popup_mark_tab(unsigned slot) { windows[slot].tab = 1; }
+void popup_position(unsigned slot, unsigned from) {
+    struct popup *w = &windows[slot];
+    if (w->backdrop) {
+        move_window(windows[from].x, windows[from].y);
+    } else {
+        w->x = windows[from].x;
+        w->y = windows[from].y;
+    }
+}
 void popup_hide(int slot, int keep) {
     struct popup *w = &windows[slot];
     if (!w->grid)
         return;
     if (w->backdrop) {
+        hide_text_pointer();
+        close_edit_menu();
         for (unsigned j = 2*w->y; j < 2*(w->y + w->h); j++)
             memcpy(frame[BAR+j] + pane_origin + 2*w->x,
                    w->backdrop + j*2*w->screen_w + 2*w->x, 8*w->w);
         release_buffer((const u8 *)w->backdrop, 16 * w->screen_w * w->screen_h);
         w->backdrop = 0;
+        w->drag = w->down = 0;
+        shown[process_pane()] = 0;
     }
-    shown[process_pane()] = 0;
-    choose_view(process_pane());
     if (!keep) {
         if (w->grid->previous)
             release_buffer((const u8 *)w->grid->previous, sizeof(*w->grid));
@@ -145,6 +265,7 @@ void popup_hide(int slot, int keep) {
         release_buffer((const u8 *)w->title, 4 * w->w * 44);
         w->grid = 0;
     }
+    choose_view(process_pane());
 }
 static int clamp(int x, int max) { return x < 0 ? 0 : x > max ? max : x; }
 static void move_window(unsigned x, unsigned y) {
@@ -170,10 +291,18 @@ static void move_window(unsigned x, unsigned y) {
     win->y = y;
     choose_view(process_pane());
 }
+unsigned popup_terminal(void) {
+    struct popup *visible = shown[process_pane()];
+    return visible ? visible->id : 0;
+}
 int popup_closed(void) { return win && win->closing && !win->editor; }
 int popup_key(int key) {
     if (!win)
         return key;
+    if (key == 29 && win->tab && !hidden_tab()) {
+        tab_bar[process_pane()].action = TAB_HIDE;
+        return -1;
+    }
     if (key == 29 && !win->editor && win == &windows[task_active()]) {
         task_pause();
         return -1;
@@ -202,16 +331,29 @@ static long popup_pointer(long e) {
     int press = down && !win->down;
     win->down = down;
     if (press && inside && dx >= 0 && dx < (int)win->w && dy >= 0 && dy < 44) {
-        if (dy >= 8 && dy < 36 && dx >= (int)win->w - 35 && dx < (int)win->w - 7)
-            win->closing = 1;
-        else if (!win->editor && dy >= 8 && dy < 36 && dx >= (int)win->w - 68 &&
-                 dx < (int)win->w - 40 && win == &windows[task_active()]) {
-            task_pause();
-        } else {
-            win->drag = 1;
-            win->dx = dx;
-            win->dy = dy;
+        if (dy >= 8 && dy < 36) {
+            unsigned pane = process_pane();
+            if (dx >= (int)win->w - 35 && dx < (int)win->w - 7) {
+                if (win->tab) tab_bar[pane].action = TAB_CLOSE;
+                else win->closing = 1;
+                return -1;
+            }
+            if (!win->editor && dx >= (int)win->w - 68 && dx < (int)win->w - 40) {
+                if (win->tab) tab_bar[pane].action = TAB_HIDE;
+                else if (win == &windows[task_active()]) task_pause();
+                return -1;
+            }
+            if (win->tab && dx >= TAB_LEFT) {
+                unsigned index = (dx - TAB_LEFT) / TAB_WIDTH, count = tab_bar[pane].count;
+                if (index < count || (index == count && count < TERMINAL_TABS)) {
+                    tab_bar[pane].action = index < count ? (int)index + 1 : TAB_NEW;
+                    return -1;
+                }
+            }
         }
+        win->drag = 1;
+        win->dx = dx;
+        win->dy = dy;
         return -1;
     }
     inside = inside && dx >= 6 && dx < (int)win->w - 6 && dy >= 44 && dy < (int)win->h - 6;
@@ -250,7 +392,123 @@ static void glyph(unsigned x, unsigned y, u8 c, u32 ink, u32 paper) {
         }
     }
 }
+void popup_tab_bar(unsigned active, unsigned count) {
+    unsigned pane = process_pane();
+    tab_bar[pane].count = count;
+    tab_bar[pane].action = 0;
+    if (!count || !tabs_visible()) return;
+    int redraw_pointer = hide_text_pointer();
+    int redraw_menu = hide_edit_menu();
+    for (unsigned index = 0; index <= TERMINAL_TABS; index++) {
+        unsigned x = win->x + TAB_LEFT + index * TAB_WIDTH, y = win->y + 8;
+        int exists = index < count || (index == count && count < TERMINAL_TABS);
+        u32 color = index == active ? 0x395772 : 0x202e38;
+        for (unsigned row = 0; row < 28; row++)
+            for (unsigned col = 0; col < TAB_WIDTH - 4; col++)
+                pixel(x + col, y + row, exists ? color :
+                      win->title[(8 + row) * win->w + TAB_LEFT + index * TAB_WIDTH + col]);
+        if (exists)
+            glyph(pane_origin + 2 * (x + 8), BAR + 2 * (y + 3),
+                  index < count ? '1' + index : '+', 0xf0f5fc, color);
+    }
+    if (redraw_menu) show_edit_menu();
+    if (redraw_pointer) toggle_text_pointer();
+}
+
+int popup_tab_action(void) {
+    unsigned pane = process_pane();
+    int action = tab_bar[pane].action;
+    tab_bar[pane].action = 0;
+    return action;
+}
+
+
+enum {
+    MENU_W = 9 * CW, MENU_H = 2 * CH + 4,
+    RIGHT_PRESS = 1UL << 29, COPY_EVENT = 1UL << 30
+};
+static struct {
+    unsigned x, y;
+    int open, drawn, hovered, copy;
+    u32 underlay[MENU_H][MENU_W];
+} menu;
+
+static int edit_menu_active(void) { return menu.open; }
+
+static int hide_edit_menu(void) {
+    if (!menu.drawn) return 0;
+    for (unsigned row = 0; row < MENU_H; row++)
+        memcpy(frame[menu.y + row] + menu.x, menu.underlay[row], MENU_W * 4);
+    menu.drawn = 0;
+    return 1;
+}
+
+static void show_edit_menu(void) {
+    if (menu.drawn || !menu.open) return;
+    for (unsigned row = 0; row < MENU_H; row++) {
+        u32 *pixels = frame[menu.y + row] + menu.x;
+        memcpy(menu.underlay[row], pixels, MENU_W * 4);
+        for (unsigned col = 0; col < MENU_W; col++) {
+            int border = row < 2 || row >= MENU_H - 2 || !col || col == MENU_W - 1;
+            pixels[col] = border ? 0x71879b : (int)(row - 2) / CH == menu.hovered ? 0x395772 : 0x25313e;
+        }
+    }
+    for (int item = 0; item < 2; item++) {
+        const char *label = item ? "Paste" : "Copy";
+        u32 ink = item || menu.copy ? 0xf0f5fc : 0x8494a4;
+        u32 paper = item == menu.hovered ? 0x395772 : 0x25313e;
+        for (unsigned i = 0; label[i]; i++)
+            glyph(menu.x + (i + 1) * CW, menu.y + 2 + item * CH, label[i], ink, paper);
+    }
+    menu.drawn = 1;
+}
+
+void close_edit_menu(void) {
+    if (!menu.open) return;
+    hide_text_pointer();
+    hide_edit_menu();
+    menu.open = 0;
+}
+
+int dismiss_edit_menu(int key) {
+    if (key != 27 || !menu.open || process_pane() != focus) return 0;
+    close_edit_menu();
+    return 1;
+}
+
+int display_editor_active(void) { return win && win->editor; }
+
+static long edit_menu_input(long e, int copy, int *action) {
+    if (e < 0) return e;
+    int inside = (e >> 25) & 1;
+    unsigned x = pane_origin + (e & 4095) * 2, y = BAR + ((e >> 12) & 4095) * 2;
+    if (inside && (e & RIGHT_PRESS)) {
+        close_edit_menu();
+        menu.x = clamp(x, pane_origin + pane_width - MENU_W);
+        menu.y = clamp(y, height - MENU_H);
+        menu.open = 1;
+        menu.copy = copy;
+        menu.hovered = -1;
+    }
+    if (!menu.open) return e & ~RIGHT_PRESS;
+    int hit = inside && x >= menu.x && x < menu.x + MENU_W &&
+        y >= menu.y + 2 && y < menu.y + MENU_H - 2 ? (int)((y - menu.y - 2) / CH) : -1;
+    if (e & (1UL << 24)) {
+        *action = hit == 1 ? 2 : hit == 0 && menu.copy ? 1 : 0;
+        close_edit_menu();
+        suppress_tablet_left();
+    } else {
+        if (menu.hovered != hit) {
+            hide_edit_menu();
+            menu.hovered = hit;
+        }
+        show_edit_menu();
+    }
+    return e & ~((15UL << 24) | RIGHT_PRESS);
+}
+
 static void draw_cell(unsigned r, unsigned c) {
+    if (hidden_tab()) return;
     const struct cell *cell =
         r < term->scroll
             ? &term->history[(term->history_head + HISTORY - term->scroll + r) % HISTORY][c]
@@ -259,9 +517,16 @@ static void draw_cell(unsigned r, unsigned c) {
     unsigned pos = r * columns + c;
     unsigned lo = term->anchor < term->extent ? term->anchor : term->extent;
     unsigned hi = term->anchor + term->extent - lo;
-    int inverse = cell->reverse ^ (term->selected && pos >= lo && pos <= hi);
-    glyph(origin + c * CW, top + r * CH, cell->byte ? cell->byte : ' ', inverse ? paper : ink,
-          inverse ? ink : paper);
+    if (cell->reverse) {
+        unsigned swap = ink;
+        ink = paper;
+        paper = swap;
+    }
+    if (term->selected && pos >= lo && pos <= hi) {
+        ink = 0xf0f5fc;
+        paper = 0x395772;
+    }
+    glyph(origin + c * CW, top + r * CH, cell->byte ? cell->byte : ' ', ink, paper);
 }
 static void agent_header(void) {
     if (!term->agent_bar || (win ? win->rows : height / CH - 1) < 4) return;
@@ -280,13 +545,25 @@ static void agent_header(void) {
         glyph(origin+c*CW,y+CH,c && c-1<strlen(root) ? root[c-1] : ' ',FG,0x20272e);
     }
 }
+static void draw_caret(void) {
+    if (!term->cursor || term->scroll || term->col >= columns || term->escape) return;
+    for (unsigned j = CH - 4; j < CH - 2; j++)
+        for (unsigned i = 0; i < CW - 2; i++)
+            frame[top + term->row * CH + j][origin + term->col * CW + i] = FG;
+}
 void display_restore(void) {
-    if (!online)
+    if (!online || hidden_tab())
         return;
+    int redraw_pointer = hide_text_pointer();
+    int redraw_menu = hide_edit_menu();
     agent_header();
     for (unsigned r = 0; r < rows; r++)
         for (unsigned c = 0; c < columns; c++)
             draw_cell(r, c);
+    draw_caret();
+    if (redraw_menu) show_edit_menu();
+    if (redraw_pointer)
+        toggle_text_pointer();
 }
 static int configure(void) {
     volatile u8 *fw = (volatile u8 *)0x09020000UL;
@@ -447,7 +724,8 @@ void display_agent_bar(unsigned mode, const char *root) {
     if (rows!=old_rows) reflow(term,columns,old_rows);
     display_restore();
 }
-static unsigned requested_w, requested_h;
+static unsigned requested_w, requested_h, canvas_version = 1;
+u32 canvas_generation(void) { return canvas_version; }
 void resize_display(unsigned w, unsigned h) {
     requested_w = w;
     requested_h = h;
@@ -467,9 +745,13 @@ static void apply_resize(void) {
         h = MAX_HEIGHT;
     if (w == width && h == height)
         return;
+    hide_text_pointer();
+    close_edit_menu();
     unsigned oldcols = pane_width / CW, previous_rows = height / CH - 1;
     width = w;
     height = h;
+    if (++canvas_version == 0) canvas_version = 1;
+    reset_tablet(width, height, BAR);
     columns = (width / CW - split) / (split + 1);
     pane_width = columns * CW;
     rows = height / CH - 1;
@@ -524,6 +806,8 @@ void display_status(void) {
     if (!online)
         return;
     apply_resize();
+    if (!win || !win->editor)
+        display_idle_pointer();
     u64 now = clock_ticks();
     if (now - last < clock_hz() / 2)
         return;
@@ -534,15 +818,19 @@ static void terminal_pointer(long e) {
     if (!(e & (3UL << 26))) {
         unsigned x = (e & 4095) * 2 / CW, y = ((e >> 12) & 4095) * 2 / CH;
         int down = (e >> 24) & 1;
-        if ((e & (1UL << 25)) && x < columns && y < rows && (down || term->selecting)) {
+        unsigned header = (top - BAR) / CH;
+        if (win) header = (top - BAR - 2 * (win->y + 44)) / CH;
+        if ((e & (1UL << 25)) && x < columns && y >= header && y - header < rows &&
+            (down || term->selecting)) {
+            y -= header;
             if (down && !term->selecting) {
                 term->anchor = y * columns + x;
-                term->selected = 1;
+                term->selected = term->selecting = 1;
             }
             term->extent = y * columns + x;
             display_restore();
         }
-        term->selecting = down;
+        if (!down) term->selecting = 0;
         return;
     }
     unsigned old = term->scroll;
@@ -551,43 +839,79 @@ static void terminal_pointer(long e) {
             term->scroll + 3 < term->history_count ? term->scroll + 3 : term->history_count;
     if (e & (1UL << 27))
         term->scroll = term->scroll < 3 ? 0 : term->scroll - 3;
-    if (old != term->scroll)
+    if (old != term->scroll) {
+        term->selected = term->selecting = 0;
         display_restore();
+    }
 }
+static long read_pointer(void);
+static void copy_selection(void);
+
 void display_idle_pointer(void) {
-    if (!online || process_pane() != focus || handles_pointer())
+    if (!online || process_pane() != focus || hidden_tab() ||
+        (!uses_terminal_pointer() && !tabs_visible()) || display_editor_active())
         return;
     long e;
-    while ((e = canvas_pointer()) >= 0) {
+    while ((e = read_pointer()) >= 0) {
+        hide_text_pointer();
+        int action = 0;
+        e = edit_menu_input(e, term->selected, &action);
         e = popup_pointer(e);
         if (e >= 0)
             terminal_pointer(e);
+        if (action == 1) copy_selection();
+        if (action == 2) {
+            if (win && win->tab) win->paste = 1;
+            else clipboard_request(editing_file());
+        }
+    }
+    refresh_text_pointer();
+}
+
+void popup_tab_paste(void) {
+    if (win && win->tab && win->paste) {
+        win->paste = 0;
+        clipboard_request(editing_file());
     }
 }
+
 void selection_copy(void) {
     display_idle_pointer();
+    copy_selection();
+}
+
+static void copy_selection(void) {
     if (!online || !term->selected)
         return;
     unsigned lo = term->anchor < term->extent ? term->anchor : term->extent,
              hi = term->anchor + term->extent - lo;
     u8 bytes[4096];
     unsigned n = 0;
-    for (unsigned pos = lo; pos <= hi && n < sizeof(bytes); pos++) {
-        unsigned r = pos / columns, c = pos % columns;
-        if (c == 0 && pos != lo && n < sizeof(bytes) - 1)
-            bytes[n++] = '\n';
-        const struct cell *cell =
-            r < term->scroll
-                ? &term->history[(term->history_head + HISTORY - term->scroll + r) % HISTORY][c]
-                : &term->cells[r - term->scroll][c];
-        bytes[n++] = cell->byte ? cell->byte : ' ';
+    for (unsigned r = lo / columns; r <= hi / columns && n < sizeof(bytes); r++) {
+        const struct cell *cells = r < term->scroll
+            ? term->history[(term->history_head + HISTORY - term->scroll + r) % HISTORY]
+            : term->cells[r - term->scroll];
+        unsigned first = r == lo / columns ? lo % columns : 0;
+        unsigned end = r == hi / columns ? hi % columns + 1 : columns;
+        while (end > first && (!cells[end - 1].byte || cells[end - 1].byte == ' ')) end--;
+        if (r != lo / columns) bytes[n++] = '\n';
+        for (unsigned c = first; c < end && n < sizeof(bytes); c++)
+            bytes[n++] = cells[c].byte ? cells[c].byte : ' ';
     }
     clipboard_copy(bytes, n);
 }
 int editor_input(void) {
     static int pressed;
     for (;;) {
-        long e = popup_pointer(canvas_pointer());
+        long e = read_pointer();
+        int action = 0;
+        if (e >= 0) {
+            hide_text_pointer();
+            e = edit_menu_input(e, 1, &action);
+            e = popup_pointer(e);
+        }
+        if (online)
+            refresh_text_pointer();
         if (e >= 0) {
             int down = (e >> 24) & 1, inside = (e >> 25) & 1;
             if ((down && inside) || pressed) {
@@ -596,6 +920,8 @@ int editor_input(void) {
                 return phase << 20 | (((e >> 12) & 4095) * 2 / CH) << 8 | (e & 4095) * 2 / CW;
             }
         }
+        if (action == 1) return 3;
+        if (action == 2) clipboard_request(1);
         int key = popup_key(console_key());
         if (key >= 0)
             return key;
@@ -618,8 +944,10 @@ static void next_row(int soft) {
     term->wrapped[rows - 1] = 0;
     memmove(term->cells, term->cells[1], (rows - 1) * sizeof(term->cells[0]));
     memset(term->cells[rows - 1], 0, sizeof(term->cells[0]));
-    for (unsigned y = top; y < top + (rows - 1) * CH; y++)
-        memcpy(frame[y] + origin, frame[y + CH] + origin, columns * CW * 4);
+    if (!hidden_tab()) {
+        for (unsigned y = top; y < top + (rows - 1) * CH; y++)
+            memcpy(frame[y] + origin, frame[y + CH] + origin, columns * CW * 4);
+    }
     for (unsigned c = 0; c < columns; c++)
         draw_cell(rows - 1, c);
 }
@@ -818,8 +1146,15 @@ static void process_byte(u8 c) {
     if (!term->nowrap || term->col+1<columns)term->col++;
 }
 void display_byte(u8 c) {
-    if (!online)
+    if (!online) return;
+    if (hidden_tab()) {
+        term->selected = term->selecting = term->scroll = 0;
+        process_byte(c);
         return;
+    }
+    if (!display_output_visible()) return;
+    int redraw_pointer = hide_text_pointer();
+    int redraw_menu = hide_edit_menu();
     if (term->selected) {
         term->selected = term->selecting = 0;
         display_restore();
@@ -831,15 +1166,14 @@ void display_byte(u8 c) {
     if (term->cursor && term->col < columns)
         draw_cell(term->row, term->col);
     process_byte(c);
-    if (term->cursor && term->col < columns && !term->escape) {
-        for (unsigned j = CH - 4; j < CH - 2; j++)
-            for (unsigned i = 0; i < CW - 2; i++)
-                frame[top + term->row * CH + j][origin + term->col * CW + i] = FG;
-    }
+    draw_caret();
+    if (redraw_menu) show_edit_menu();
+    if (redraw_pointer)
+        toggle_text_pointer();
 }
 u64 geometry(void) { return online ? (1UL << 32) | (rows << 16) | columns : (24UL << 16) | 80; }
 u64 canvas_size(void) { return online ? (((height - BAR) / 2) << 16) | (pane_width / 2) : 0; }
-long canvas_pointer(void) {
+static long read_pointer(void) {
     if (!online || process_pane() != focus)
         return -1;
     long e = tablet_poll(width, height, BAR);
@@ -850,19 +1184,38 @@ long canvas_pointer(void) {
         return e & ~(1UL << 25);
     return (e & ~4095UL) | ((x - pane_origin) / 2);
 }
-int present(const u64 *args, u64 arena, u64 bytes) {
+long canvas_pointer(u64 options) {
+    long e = options & 16 ? (long)((options >> 32) & 0xffffff) | (1L << 25) | RIGHT_PRESS : read_pointer();
+    if (e < 0) return e;
+    hide_text_pointer();
+    int action = 0;
+    if ((options & 8) && (e & RIGHT_PRESS)) { close_edit_menu(); return e; }
+    e = edit_menu_input(e, options & 2, &action);
+    if (menu.open) refresh_text_pointer();
+    if (action == 1) return e | COPY_EVENT;
+    if (action == 2) clipboard_request(options & 5);
+    return e;
+}
+int present(const u64 *args, u64 arena, u64 bytes, u64 generation) {
     u64 p = args[0], x = args[1], y = args[2], w = args[3], h = args[4];
+    if (generation && generation != canvas_generation()) return -2;
+    u64 stride = generation ? args[5] : w;
     if (!online || !w || !h || w > pane_width / 2 || h > (height - BAR) / 2 ||
         x > pane_width / 2 - w || y > (height - BAR) / 2 - h || p % 4 || p < arena ||
-        p - arena > bytes || w * h * 4 > bytes - (p - arena))
+        p - arena > bytes || stride < w || stride > bytes / 4 ||
+        ((h - 1) * stride + w) * 4 > bytes - (p - arena))
         return -1;
-    const u32 *src = (const u32 *)p;
+    int redraw_pointer = hide_text_pointer();
+    int redraw_menu = hide_edit_menu();
     for (unsigned j = 0; j < h; j++) {
+        const u32 *src = (const u32 *)p + j * stride;
         u32 *dst = &frame[BAR + 2 * (y + j)][origin + 2 * x];
         for (unsigned i = 0; i < w; i++) {
             dst[2 * i] = dst[2 * i + 1] = *src++;
         }
         memcpy(dst + width, dst, w * 8);
     }
+    if (redraw_menu) show_edit_menu();
+    if (redraw_pointer && menu.open) toggle_text_pointer();
     return 0;
 }

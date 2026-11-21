@@ -49,7 +49,7 @@ static const char *local_page(const char *url, struct page_source *s) {
 
 static const char *wait_io(int *idle) {
     if (++*idle > 1500) return "HTTP server timed out";
-    if (lx_timed_byte(8)==3) return "Cancelled";
+    if (lx_transport_wait()) return "Cancelled";
     return NULL;
 }
 /* Check message framing as records arrive. An authenticated final chunk or
@@ -164,7 +164,7 @@ static const char *exchange(int fd, struct tls_connection *tls, const char *requ
     s->bytes[s->length]=0;
     return NULL;
 }
-static const char *http_page(char *address, struct page_source *s, char *redirect,int credentials) {
+const char *lx_http_get(const char *address, struct page_source *s, char *redirect,int credentials) {
     int secure = !strncmp(address,"https://",8);
     const char *host=address+(secure?8:7);
     size_t hn=strcspn(host,":/?#");
@@ -189,8 +189,13 @@ static const char *http_page(char *address, struct page_source *s, char *redirec
     if (credentials) cookie_list(address,cookies,sizeof(cookies),1);
     int path_len=strcspn(path,"#");
     for (int i=0;i<path_len;i++) if ((unsigned char)path[i]<=32 || path[i]==127) return "Invalid HTTP path";
-    snprintf(request,sizeof(request),"GET %s%.*s HTTP/1.1\r\nHost: %s:%ld\r\nConnection: close\r\nAccept-Encoding: identity\r\nUser-Agent: Mozilla/5.0 (compatible; Links/2.30; LixinOS aarch64)\r\n%s%s%s\r\n",
-             *path=='/'?"":"/",path_len,path,name,port,*cookies?"Cookie: ":"",cookies,*cookies?"\r\n":"");
+#ifdef LX_NETSURF
+    const char *agent = "NetSurf/3.11 (LixinOS aarch64)";
+#else
+    const char *agent = "Mozilla/5.0 (compatible; Links/2.30; LixinOS aarch64)";
+#endif
+    snprintf(request,sizeof(request),"GET %s%.*s HTTP/1.1\r\nHost: %s:%ld\r\nConnection: close\r\nAccept-Encoding: identity\r\nUser-Agent: %s\r\n%s%s%s\r\n",
+             *path=='/'?"":"/",path_len,path,name,port,agent,*cookies?"Cookie: ":"",cookies,*cookies?"\r\n":"");
     int fd=lx_tcp_connect(name,port);
     if (fd<0) return "DNS lookup or TCP connection failed";
     struct tls_connection *tls=secure ? tls_open(fd,name) : NULL;
@@ -259,7 +264,7 @@ static const char *load(char address[ADDRESS_LIMIT],struct page_source *out,cons
         char redirect[ADDRESS_LIMIT]={0};
         const char *error;
         if (!strncmp(address,"file://",7)) error=local_page(address+7,&s);
-        else if (!strncmp(address,"http://",7) || !strncmp(address,"https://",8)) error=http_page(address,&s,redirect,credentials);
+        else if (!strncmp(address,"http://",7) || !strncmp(address,"https://",8)) error=lx_http_get(address,&s,redirect,credentials);
         else return "Supported addresses: local files, HTTP and HTTPS";
         if (!error && !strict && !redirect[0] && s.status && (s.status<200 || s.status>=300))
             error="HTTP server returned an unsuccessful status";
