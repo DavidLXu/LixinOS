@@ -1,4 +1,5 @@
 """Build a guest window client and exercise independent instances through QMP."""
+from launcher_grid import installed_apps, select_icon
 import json
 from pathlib import Path
 import runpy
@@ -65,16 +66,15 @@ def exercise(guest, control, directory):
         raise AssertionError(f"Desktop did not show {description}: {guest.buffer[-1000:]!r}")
 
     guest.send(b"ls -1 /bin\r")
-    apps = [name.decode() for name in guest.until(prompt).splitlines()
-            if name == b"nxeyes" or name.endswith((b".win", b".win2"))]
+    apps = installed_apps(guest.until(prompt))
 
     def open_menu():
         click(36, 8+7*min(82, (WORK_HEIGHT-48)//8)+19)
-        wait(lambda p: p(82, 6) == "233c3d", "Applications menu")
+        wait(lambda p: p(82, 6) == "203f51", "Applications menu")
 
     def new_app(name="counter.win"):
         open_menu()
-        click(128, 60+32*apps.index(name))
+        select_icon(click,qmp,WORK_WIDTH,WORK_HEIGHT,apps.index(name.encode())+6,len(apps)+6)
 
     left = 76 + (WORK_WIDTH-76-360)//2
     top = (WORK_HEIGHT-246)//2
@@ -111,7 +111,7 @@ def exercise(guest, control, directory):
     click(left+28+360-85, top+28+22)
     counter(0, 3)
     open_menu()
-    click(320, 23)
+    click(WORK_WIDTH-118, 30)
     wait(lambda p: p(410, 8) == "233c3d", "Windows tab")
     click(150, 92)
     counter(1, 1)
@@ -176,7 +176,7 @@ def exercise(guest, control, directory):
     wait(lambda p: p(left+20, body+12) != back, "minimized stopwatch")
     time.sleep(1.2)
     open_menu()
-    click(320, 23)
+    click(WORK_WIDTH-118, 30)
     click(150, 60)
     face(left, body, 480, True)
     zero = tuple(color(0x2249 if mark == "0" else 0xe77a) for mark in "111101101101111")

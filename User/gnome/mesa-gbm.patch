@@ -1,0 +1,107 @@
+--- a/src/gbm/meson.build
++++ b/src/gbm/meson.build
+@@ -25,16 +25,15 @@
+   libgbm_name = 'gbm_mesa'
+ endif
+ 
+-libgbm = shared_library(
++libgbm = static_library(
+   libgbm_name,
+   files_gbm,
+   include_directories : incs_gbm,
+   c_args : [args_gbm],
+   link_args : [ld_args_gc_sections],
+-  link_with : [libloader],
++  link_with : [libloader, libgbm_dri],
+   dependencies : [dep_libdrm, idep_xmlconfig],
+   gnu_symbol_visibility : 'hidden',
+-  version : '1.0.0',
+   install : true,
+ )
+ 
+--- a/src/gbm/backends/dri/meson.build
++++ b/src/gbm/backends/dri/meson.build
+@@ -8,7 +8,7 @@
+   incs_gbm_dri += inc_wayland_drm
+ endif
+ 
+-libgbm_dri = shared_library(
++libgbm_dri = static_library(
+   'dri_gbm',
+   files('gbm_dri.c', 'gbm_driint.h'),
+   include_directories : [incs_gbm, incs_gbm_dri, inc_st_dri, inc_gallium_aux],
+@@ -16,9 +16,7 @@
+   link_with : [libloader, libgallium_dri],
+   dependencies : [deps_gbm_dri, dep_dl, dep_libdrm, idep_mesautil, idep_xmlconfig],
+   gnu_symbol_visibility : 'hidden',
+-  install : true,
+-  install_dir: join_paths(get_option('libdir'), 'gbm'),
+-  name_prefix : '',
++  install : false,
+ )
+ 
+ devenv.set('GBM_BACKENDS_PATH', meson.current_build_dir())
+--- a/src/gbm/main/backend.c
++++ b/src/gbm/main/backend.c
+@@ -48,6 +48,7 @@
+    void *lib;
+ };
+ 
++#ifndef __lixinos__
+ #define BACKEND_LIB_SUFFIX "_gbm"
+ static const char *backend_search_path_vars[] = {
+    "GBM_BACKENDS_PATH",
+@@ -87,6 +88,8 @@
+    return new_desc;
+ }
+ 
++#endif
++
+ static struct gbm_device *
+ backend_create_device(const struct gbm_backend_desc *bd, int fd)
+ {
+@@ -105,6 +108,7 @@
+    return dev;
+ }
+ 
++#ifndef __lixinos__
+ static struct gbm_device *
+ load_backend_by_name(const char *name, int fd, bool warn_on_fail)
+ {
+@@ -144,9 +148,17 @@
+    return NULL;
+ }
+ 
++#endif
++
+ struct gbm_device *
+ _gbm_create_device(int fd)
+ {
++#ifdef __lixinos__
++   extern struct gbm_backend *gbmint_get_backend(const struct gbm_core *);
++   static struct gbm_backend_desc dri = { .name = "dri" };
++   dri.backend = gbmint_get_backend(&gbm_core);
++   return backend_create_device(&dri, fd);
++#else
+    struct gbm_device *dev = NULL;
+ 
+    const char *b = getenv("GBM_BACKEND");
+@@ -163,6 +175,7 @@
+    }
+ 
+    return load_backend_by_name("dri", fd, true);
++#endif
+ }
+ 
+ void
+@@ -171,6 +184,10 @@
+    const struct gbm_backend_desc *backend_desc = gbm->v0.backend_desc;
+    gbm->v0.destroy(gbm);
+ 
++#ifndef __lixinos__
+    if (backend_desc && backend_desc->lib)
+       free_backend_desc(backend_desc);
++#else
++   (void)backend_desc;
++#endif
+ }

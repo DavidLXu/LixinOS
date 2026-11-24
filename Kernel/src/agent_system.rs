@@ -5,7 +5,7 @@ use core::fmt::Write;
 use serde::{Deserialize, Serialize};
 
 type Result<T> = core::result::Result<T, &'static str>;
-type Entry = Option<Option<Vec<u8>>>;
+type Entry = Option<Option<disk::FileData>>;
 type Edits = BTreeMap<String, Entry>;
 const ARCHIVE: &str = "/.agent-system-undo";
 const MANIFEST: &str = "/.agent-system-undo/manifest";
@@ -19,14 +19,14 @@ enum State {
 }
 
 impl State {
-    fn of(entry: Option<&Option<Vec<u8>>>) -> Self {
+    fn of(entry: Option<&Option<disk::FileData>>) -> Self {
         match entry {
             None => Self::Missing,
             Some(None) => Self::Directory,
-            Some(Some(bytes)) => Self::File {
-                bytes: bytes.len(),
-                checksum: disk::checksum(bytes),
-            },
+            Some(Some(file)) => {
+                let (bytes, checksum) = file.sig();
+                Self::File { bytes, checksum }
+            }
         }
     }
 
@@ -94,7 +94,7 @@ fn effective<'a>(
     files: &'a disk::Files,
     edits: &'a Edits,
     path: &str,
-) -> Option<&'a Option<Vec<u8>>> {
+) -> Option<&'a Option<disk::FileData>> {
     match edits.get(path) {
         Some(change) => change.as_ref(),
         None => files.get(path),
@@ -224,7 +224,7 @@ impl Plan {
                 } else {
                     bytes.extend_from_slice(contents.as_bytes());
                 }
-                self.stage(volume, path.clone(), Some(Some(bytes)))?;
+                self.stage(volume, path.clone(), Some(Some(disk::FileData::from_vec(bytes))))?;
             }
             ("replace", [old, new]) => {
                 let bytes = self.bytes(volume, &path)?;
@@ -234,7 +234,7 @@ impl Plan {
                     return Err("old text must occur exactly once");
                 }
                 let bytes = text.replacen(old, new, 1).into_bytes();
-                self.stage(volume, path.clone(), Some(Some(bytes)))?;
+                self.stage(volume, path.clone(), Some(Some(disk::FileData::from_vec(bytes))))?;
             }
             ("copy" | "compile", [source]) => {
                 let source = resolve(source)?;
@@ -251,7 +251,7 @@ impl Plan {
                 } else {
                     bytes.into_owned()
                 };
-                self.stage(volume, path.clone(), Some(Some(candidate)))?;
+                self.stage(volume, path.clone(), Some(Some(disk::FileData::from_vec(candidate))))?;
                 return Ok(format!("staged {path:?} from {source:?} using {tool}"));
             }
             _ => return Err("unsupported system tool or invalid arguments"),
@@ -303,7 +303,7 @@ impl Plan {
     }
 
     pub(crate) fn preview(&self, volume: &Volume, visible: impl Fn(&str, usize) -> String) {
-        fn text(entry: Option<&Option<Vec<u8>>>) -> &str {
+        fn text(entry: Option<&Option<disk::FileData>>) -> &str {
             entry
                 .and_then(Option::as_deref)
                 .and_then(|bytes| core::str::from_utf8(bytes).ok())
@@ -364,7 +364,7 @@ impl Plan {
         }
         let serialized = serde_json_wasm::to_vec(&manifest)
             .map_err(|_| "could not encode system rollback data")?;
-        changes.insert(MANIFEST.into(), Some(Some(serialized)));
+        changes.insert(MANIFEST.into(), Some(Some(disk::FileData::from_vec(serialized))));
         commit(volume, changes, BTreeMap::new())
     }
 }

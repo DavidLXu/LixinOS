@@ -1,0 +1,15 @@
+--- a/deps/openssl/openssl/crypto/armcap.c
++++ b/deps/openssl/openssl/crypto/armcap.c
+@@ -77,6 +77,12 @@
+ #include <sys/auxv.h>
+ #define OSSL_IMPLEMENT_GETAUXVAL
+ #endif
++#endif
++/* The guest musl supplies getauxval. Probe only capabilities advertised
++ * by the ELF loader: LixinOS does not deliver recoverable SIGILL signals. */
++#ifdef __lixinos__
++#include <sys/auxv.h>
++#define OSSL_IMPLEMENT_GETAUXVAL
+ #endif
+ #if defined(__FreeBSD__) || defined(__OpenBSD__)
+ #include <sys/param.h>

@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<repository version="1.2"
+            xmlns="http://www.gtk.org/introspection/core/1.0"
+            xmlns:c="http://www.gtk.org/introspection/c/1.0">
+  <namespace name="LixinProbe" version="1.0" shared-library="liblixin-probe.so.0"
+             c:identifier-prefixes="LixinProbe" c:symbol-prefixes="lixin_probe">
+    <function name="twice" c:identifier="lixin_probe_twice">
+      <return-value transfer-ownership="none">
+        <type name="gint" c:type="int"/>
+      </return-value>
+      <parameters>
+        <parameter name="value" transfer-ownership="none">
+          <type name="gint" c:type="int"/>
+        </parameter>
+      </parameters>
+    </function>
+  </namespace>
+</repository>

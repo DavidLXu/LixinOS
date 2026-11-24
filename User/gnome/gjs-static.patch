@@ -1,0 +1,202 @@
+--- a/meson.build
++++ b/meson.build
+@@ -43,6 +43,7 @@
+ 
+ cxx = meson.get_compiler('cpp')
+ cc = meson.get_compiler('c')
++lixinos = cc.get_define('__lixinos__') != ''
+ 
+ if cc.get_id() == 'msvc'
+     add_project_arguments(cxx.get_supported_arguments([
+@@ -287,32 +288,25 @@
+ # Check if a minimal SpiderMonkey program compiles, links, and runs. If not,
+ # it's most likely the case that SpiderMonkey was configured incorrectly, for
+ # example by building mozglue as a shared library.
+-minimal_program = cxx.run('''
++spidermonkey_test = '''
+ #include <js/Initialization.h>
+ int main(void) {
+     if (!JS_Init()) return 1;
+     JS_ShutDown();
+     return 0;
+ }
+-''',
+-    args: debug_arg, dependencies: spidermonkey,
+-    name: 'SpiderMonkey sanity check')
+-
+-recommended_configuration = ''' Check the recommended configuration:
+-https://github.com/spidermonkey-embedders/spidermonkey-embedding-examples/blob/esr91/docs/Building%20SpiderMonkey.md'''
+-if not minimal_program.compiled()
+-    error('''A minimal SpiderMonkey program
+-could not be compiled or linked. Most likely you should build it with a
+-different configuration.''' + recommended_configuration)
+-elif meson.is_cross_build()
+-    warning('''This is a cross build. A check that a minimal
+-SpiderMonkey program executes will not be performed. Before shipping GJS, you
+-should check that it does not crash on startup, since building SpiderMonkey with
+-the wrong configuration may cause that.''' + recommended_configuration)
+-elif minimal_program.returncode() != 0
+-    error('''A minimal SpiderMonkey program
+-failed to execute. Most likely you should build it with a different
+-configuration.''' + recommended_configuration)
++'''
++spidermonkey_description = 'SpiderMonkey sanity check'
++if meson.can_run_host_binaries()
++    minimal_program = cxx.run(spidermonkey_test,
++        args: debug_arg, dependencies: spidermonkey, name: spidermonkey_description)
++    spidermonkey_works = minimal_program.compiled() and minimal_program.returncode() == 0
++else
++    spidermonkey_works = cxx.links(spidermonkey_test,
++        args: debug_arg, dependencies: spidermonkey, name: spidermonkey_description)
++endif
++if not spidermonkey_works
++    error('A minimal SpiderMonkey program failed the sanity check.')
+ endif
+ 
+ ### Check for external programs ################################################
+@@ -494,7 +488,8 @@
+ 
+ module_resource_srcs = gnome.compile_resources('js-resources',
+     'js.gresource.xml',
+-    c_name: 'js_resources')
++    c_name: 'js_resources',
++    extra_args: lixinos ? ['--manual-register'] : [])
+ module_resource_lib = static_library('js-resources', module_resource_srcs,
+     dependencies: gio, override_options: ['unity=off'])
+ 
+@@ -561,14 +556,23 @@
+     '-Wl,-exported_symbols_list,@0@'.format(symbol_list[0].full_path()),
+ ])
+ 
+-libgjs = shared_library(meson.project_name(),
+-    sources: libgjs_private_sources,
+-    link_args: link_args, link_depends: [symbol_map, symbol_list],
+-    link_whole: [libgjs_internal, module_resource_lib],
+-    dependencies: base_build_dep,
+-    version: '0.0.0', soversion: '0',
+-    gnu_symbol_visibility: 'hidden',
+-    install: true)
++if lixinos
++    libgjs = static_library(meson.project_name(),
++        sources: libgjs_private_sources,
++        link_whole: [libgjs_internal, libgjs_jsapi, module_resource_lib],
++        dependencies: base_build_dep,
++        gnu_symbol_visibility: 'hidden',
++        install: true)
++else
++    libgjs = shared_library(meson.project_name(),
++        sources: libgjs_private_sources,
++        link_args: link_args, link_depends: [symbol_map, symbol_list],
++        link_whole: [libgjs_internal, module_resource_lib],
++        dependencies: base_build_dep,
++        version: '0.0.0', soversion: '0',
++        gnu_symbol_visibility: 'hidden',
++        install: true)
++endif
+ 
+ install_headers(gjs_public_headers, subdir: api_name / 'gjs')
+ 
+@@ -578,12 +582,15 @@
+ 
+ ### Build GjsPrivate introspection library #####################################
+ 
+-gjs_private_gir = gnome.generate_gir(libgjs,
+-    includes: ['GObject-2.0', 'Gio-2.0'], sources: libgjs_private_sources,
+-    namespace: 'GjsPrivate', nsversion: '1.0', identifier_prefix: 'Gjs',
+-    symbol_prefix: 'gjs_', fatal_warnings: get_option('werror'), install: true,
+-    install_gir: false, install_dir_typelib: pkglibdir / 'girepository-1.0')
+-gjs_private_typelib = gjs_private_gir[1]
++# LixinOS generates the typelib on the host from the same private sources.
++if not lixinos
++    gjs_private_gir = gnome.generate_gir(libgjs,
++        includes: ['GObject-2.0', 'Gio-2.0'], sources: libgjs_private_sources,
++        namespace: 'GjsPrivate', nsversion: '1.0', identifier_prefix: 'Gjs',
++        symbol_prefix: 'gjs_', fatal_warnings: get_option('werror'), install: true,
++        install_gir: false, install_dir_typelib: pkglibdir / 'girepository-1.0')
++    gjs_private_typelib = gjs_private_gir[1]
++endif
+ 
+ ### Build gjs-console interpreter ##############################################
+ 
+@@ -691,17 +698,19 @@
+ 
+ ### Tests and test setups ######################################################
+ 
+-# External code should not error out even when building with -Werror
+-gi_tests = subproject('gobject-introspection-tests',
+-    default_options: ['werror=false', 'cairo=true',
+-        'install_dir=@0@'.format(installed_tests_execdir)])
+-
+-subdir('installed-tests')
+-
+-# Note: The test program in test/ needs to be ported
+-#       to Windows before we can build it on Windows.
+-if host_machine.system() != 'windows'
+-    subdir('test')
++if not lixinos
++    # External code should not error out even when building with -Werror
++    gi_tests = subproject('gobject-introspection-tests',
++        default_options: ['werror=false', 'cairo=true',
++            'install_dir=@0@'.format(installed_tests_execdir)])
++
++    subdir('installed-tests')
++
++    # Note: The test program in test/ needs to be ported
++    #       to Windows before we can build it on Windows.
++    if host_machine.system() != 'windows'
++        subdir('test')
++    endif
+ endif
+ 
+ valgrind_environment = environment()
+--- a/gjs/context.cpp
++++ b/gjs/context.cpp
+@@ -355,6 +355,8 @@
+             g_win32_get_package_installation_directory_of_module(gjs_dll)};
+         Gjs::AutoChar priv_typelib_dir{g_build_filename(
+             basedir, "lib", "gjs", "girepository-1.0", nullptr)};
++#elif defined(__lixinos__)
++        Gjs::AutoChar priv_typelib_dir{g_strdup("/lib/gnome/girepository-1.0")};
+ #else
+         Gjs::AutoChar priv_typelib_dir{
+             g_build_filename(PKGLIBDIR, "girepository-1.0", nullptr)};
+--- a/gjs/engine.cpp
++++ b/gjs/engine.cpp
+@@ -124,9 +124,16 @@
+ }
+ 
+ #else
++#ifdef __lixinos__
++extern "C" void js_resources_register_resource(void);
++#endif
++
+ class GjsInit {
+ public:
+     GjsInit() {
++#ifdef __lixinos__
++        js_resources_register_resource();
++#endif
+         const char* reason = JS_InitWithFailureDiagnostic();
+         if (reason)
+             g_error("Could not initialize JavaScript: %s", reason);
+@@ -139,7 +146,9 @@
+     explicit operator bool() const { return true; }
+ };
+ 
++#ifndef __lixinos__
+ static GjsInit gjs_is_inited;
++#endif
+ #endif
+ 
+ // JSPrincipals (basically a weird name for security callbacks) which are in
+@@ -196,6 +205,10 @@
+ };
+ 
+ JSContext* gjs_create_js_context(GjsContextPrivate* uninitialized_gjs) {
++#ifdef __lixinos__
++    // A static build must finish constructing SpiderMonkey's globals first.
++    static GjsInit gjs_is_inited;
++#endif
+     g_assert(gjs_is_inited);
+     JSContext *cx = JS_NewContext(32 * 1024 * 1024 /* max bytes */);
+     if (!cx)

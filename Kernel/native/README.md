@@ -1,6 +1,6 @@
 # 在 LixinOS 内用 TCC 重建内核
 
-此版本在 Apple Silicon Mac 上的 QEMU AArch64 `virt` 中运行，使用一个 vCPU，内存配置取决于磁盘布局。内核、板级驱动和磁盘引导程序均来自 C 或 AArch64 汇编源码。网络使用 lwIP 的 C 源码。两个编译清单随磁盘安装在 `/src/kernel`。
+此版本在 Apple Silicon Mac 上的 QEMU AArch64 `virt` 中运行，默认使用两个 vCPU，内存配置取决于磁盘布局。内核、板级驱动和磁盘引导程序均来自 C 或 AArch64 汇编源码。网络使用 lwIP 的 C 源码。两个编译清单随磁盘安装在 `/src/kernel`。
 
 ## 启动和更新
 

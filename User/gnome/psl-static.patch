@@ -1,0 +1,15 @@
+--- a/meson.build
++++ b/meson.build
+@@ -73,7 +73,11 @@
+ 
+ if libidn2_dep.found() or libidn_dep.found()
+   # Check for libunistring, we need it for psl_str_to_utf8lower()
+-  libunistring = cc.find_library('unistring')
++  unistring_dirs = []
++  if cc.get_define('__lixinos__') != ''
++    unistring_dirs += get_option('prefix') / get_option('libdir')
++  endif
++  libunistring = cc.find_library('unistring', dirs: unistring_dirs)
+   libiconv_dep = dependency('iconv')
+ endif
+ 

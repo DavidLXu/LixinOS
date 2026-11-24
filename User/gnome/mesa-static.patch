@@ -1,0 +1,144 @@
+--- a/src/mapi/shared-glapi/meson.build
++++ b/src/mapi/shared-glapi/meson.build
+@@ -26,7 +26,7 @@
+   _glapi_c_args += ['-D_GLAPI_DLL_EXPORTS']
+ endif
+ 
+-libglapi = shared_library(
++libglapi = static_library(
+   'glapi',
+   [files_shared_glapi, shared_glapi_mapi_tmp_h],
+   c_args : [
+@@ -37,12 +37,8 @@
+     gcc_lto_quirk,
+   ],
+   gnu_symbol_visibility : 'hidden',
+-  link_args : [ld_args_gc_sections],
+   include_directories : [inc_src, inc_include, inc_mapi],
+   dependencies : [dep_thread, idep_mesautil],
+-  soversion : host_machine.system() == 'windows' ? '' : '0',
+-  version : '0.0.0',
+-  name_prefix : host_machine.system() == 'windows' ? 'lib' : [],  # always use lib, but avoid warnings on !windows
+   install : true,
+ )
+ libglapi_build_dir = meson.current_build_dir()
+--- a/src/mapi/es2api/meson.build
++++ b/src/mapi/es2api/meson.build
+@@ -22,10 +22,9 @@
+   command : gen_vs_module_defs_normal_command,
+ )
+ 
+-libgles2 = shared_library(
++libgles2 = static_library(
+   'GLESv2' + get_option('gles-lib-suffix'),
+   ['../entry.c', es2_glapi_mapi_tmp_h],
+-  vs_module_defs : gles2_def,
+   c_args : [
+     c_msvc_compat_args,
+     _es2_c_args,
+@@ -34,14 +33,9 @@
+     gcc_lto_quirk,
+   ],
+   gnu_symbol_visibility : 'hidden',
+-  link_args : [ld_args_gc_sections],
+   include_directories : [inc_src, inc_include, inc_mapi],
+   link_with : libglapi,
+   dependencies : [dep_thread, dep_libdrm, dep_m, dep_dl, idep_mesautilc11],
+-  soversion : host_machine.system() == 'windows' ? '' : '2',
+-  version : '2.0.0',
+-  darwin_versions : '3.0.0',
+-  name_prefix : host_machine.system() == 'windows' ? 'lib' : [],  # always use lib, but avoid warnings on !windows
+   install : true,
+ )
+ 
+--- a/src/gallium/targets/dri/meson.build
++++ b/src/gallium/targets/dri/meson.build
+@@ -42,7 +42,7 @@
+   libgallium_name = 'gallium-@0@'.format(meson.project_version())
+ endif
+ 
+-libgallium_dri = shared_library(
++libgallium_dri = static_library(
+   libgallium_name,
+   files('dri_target.c'),
+   include_directories : [
+@@ -50,8 +50,6 @@
+     inc_gallium_winsys, include_directories('../../frontends/dri'),
+   ],
+   gnu_symbol_visibility : 'hidden',
+-  link_args : [ld_args_build_id, ld_args_gc_sections, gallium_dri_ld_args],
+-  link_depends : gallium_dri_link_depends,
+   link_with : [
+     libmesa, libgalliumvl,
+     libgallium, libglapi, libpipe_loader_static, libws_null, libwsw, libswdri,
+@@ -67,7 +65,6 @@
+     driver_asahi, driver_crocus
+   ],
+   install : true,
+-  name_suffix : libname_suffix,
+ )
+ 
+ if with_gallium_va or with_gallium_vdpau
+--- a/src/egl/meson.build
++++ b/src/egl/meson.build
+@@ -6,7 +6,7 @@
+ 
+ c_args_for_egl = [asan_c_args]
+ cpp_args_for_egl = []
+-link_for_egl = [libpipe_loader_dynamic]
++link_for_egl = [libpipe_loader_static]
+ if with_dri
+   link_for_egl += libgallium_dri
+ endif
+@@ -180,7 +180,7 @@
+   command : gen_vs_module_defs_normal_command,
+ )
+ 
+-libegl = shared_library(
++libegl = static_library(
+   egl_lib_name,
+   files_egl,
+   c_args : [
+@@ -191,13 +191,8 @@
+   gnu_symbol_visibility : 'hidden',
+   include_directories : incs_for_egl,
+   link_with : [link_for_egl, libglapi],
+-  link_args : [ld_args_bsymbolic, ld_args_gc_sections],
+   dependencies : [deps_for_egl, dep_dl, dep_libdrm, dep_clock, dep_thread, idep_mesautil],
+   install : true,
+-  version : egl_lib_version,
+-  soversion : egl_lib_soversion,
+-  name_prefix : host_machine.system() == 'windows' ? 'lib' : [],  # always use lib, but avoid warnings on !windows
+-  vs_module_defs : egl_def
+ )
+ 
+ if not with_glvnd
+@@ -233,3 +228,12 @@
+     suite : ['egl'],
+   )
+ endif
++
++executable(
++  'lixin-egl-check',
++  'lixin-egl-check.c',
++  include_directories: inc_include,
++  link_with: [libegl, libgles2],
++  dependencies: [dep_m, dep_thread],
++  link_language: 'cpp',
++)
+--- a/src/gallium/drivers/softpipe/sp_tex_tile_cache.h
++++ b/src/gallium/drivers/softpipe/sp_tex_tile_cache.h
+@@ -40,7 +40,13 @@
+ /**
+  * Cache tile size (width and height). This needs to be a power of two.
+  */
++#ifdef __lixinos__
++/* Cache one smaller tile per entry within the guest's process heap.
++ * The tile coordinates and texture limits are derived independently. */
++#define TEX_TILE_SIZE_LOG2 3
++#else
+ #define TEX_TILE_SIZE_LOG2 5
++#endif
+ #define TEX_TILE_SIZE (1 << TEX_TILE_SIZE_LOG2)
+ 
+ #define TEX_ADDR_BITS (SP_MAX_TEXTURE_2D_LEVELS - 1)

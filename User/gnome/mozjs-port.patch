@@ -1,0 +1,127 @@
+--- a/build/moz.configure/toolchain.configure
++++ b/build/moz.configure/toolchain.configure
+@@ -2026,6 +2026,13 @@
+             # ensure consistent output.
+             env["LC_ALL"] = "C"
+             retcode, stdout, stderr = get_cmd_output(*cmd, env=env)
++            if retcode and target.kernel == "Darwin" and linker in (None, "ld64"):
++                # Recent Xcode rejects --version without the old logging banner.
++                _, version_out, version_err = get_cmd_output(
++                    *(cmd_base + linker_flag + ["-Wl,-v"]), env=env
++                )
++                if "PROJECT:ld-" in version_out + version_err:
++                    return namespace(KIND="ld64", LINKER_FLAG=linker_flag)
+             if retcode == 1 and "Logging ld64 options" in stderr:
+                 kind = "ld64"
+ 
+--- a/build/moz.configure/flags.configure
++++ b/build/moz.configure/flags.configure
+@@ -76,7 +76,14 @@
+             )
+ 
+ 
+-@depends(when=link_libstdcxx_statically)
++is_lixinos = try_compile(
++    body="#ifndef __lixinos__\n#error not LixinOS\n#endif",
++    check_msg="for a LixinOS target",
++    when=building_with_gnu_compatible_cc,
++)
++
++
++@depends(when=link_libstdcxx_statically & ~is_lixinos)
+ def check_libstdcxx_linkage():
+     die("Firefox does not support linking statically with libstdc++")
+ 
+--- a/python/mozbuild/mozbuild/action/check_binary.py
++++ b/python/mozbuild/mozbuild/action/check_binary.py
+@@ -152,6 +152,10 @@
+                     "We do not want text relocations in libraries and programs"
+                 )
+     except Empty:
++        # A fully static ELF has LOAD segments but no dynamic relocation table.
++        segments = {line.split()[0] for line in get_output(READELF, "-l", binary) if line.split()}
++        if "LOAD" in segments and "DYNAMIC" not in segments:
++            raise Skip()
+         raise RuntimeError("Could not parse readelf output?")
+ 
+ 
+--- a/mozglue/interposers/env_interposer.cpp
++++ b/mozglue/interposers/env_interposer.cpp
+@@ -6,7 +6,16 @@
+ #include <string.h>
+ #include <unistd.h>
+ 
+-#include "InterposerHelper.h"
++#include "mozilla/Types.h"
++
++#ifdef __lixinos__
++#  define ENV_INTERPOSER(name) __wrap_##name
++#  define ENV_ORIGINAL(name) __real_##name
++#else
++#  include "InterposerHelper.h"
++#  define ENV_INTERPOSER(name) name
++#  define ENV_ORIGINAL(name) GET_REAL_SYMBOL(name)
++#endif
+ 
+ // The interposers in this file cover all the functions used to access the
+ // environment (getenv(), putenv(), setenv(), unsetenv() and clearenv()). They
+@@ -32,7 +41,14 @@
+ 
+ extern "C" {
+ 
+-MFBT_API char* getenv(const char* name) {
++#ifdef __lixinos__
++int __real_putenv(char* string);
++int __real_setenv(const char* name, const char* value, int replace);
++int __real_unsetenv(const char* name);
++int __real_clearenv(void);
++#endif
++
++MFBT_API char* ENV_INTERPOSER(getenv)(const char* name) {
+   pthread_mutex_lock(&gEnvLock);
+   char* result = internal_getenv(name);
+   pthread_mutex_unlock(&gEnvLock);
+@@ -40,8 +56,8 @@
+   return result;
+ }
+ 
+-MFBT_API int putenv(char* string) {
+-  static const auto real_putenv = GET_REAL_SYMBOL(putenv);
++MFBT_API int ENV_INTERPOSER(putenv)(char* string) {
++  static const auto real_putenv = ENV_ORIGINAL(putenv);
+ 
+   pthread_mutex_lock(&gEnvLock);
+   int result = real_putenv(string);
+@@ -49,8 +65,8 @@
+   return result;
+ }
+ 
+-MFBT_API int setenv(const char* name, const char* value, int replace) {
+-  static const auto real_setenv = GET_REAL_SYMBOL(setenv);
++MFBT_API int ENV_INTERPOSER(setenv)(const char* name, const char* value, int replace) {
++  static const auto real_setenv = ENV_ORIGINAL(setenv);
+ 
+   pthread_mutex_lock(&gEnvLock);
+   int result = real_setenv(name, value, replace);
+@@ -58,8 +74,8 @@
+   return result;
+ }
+ 
+-MFBT_API int unsetenv(const char* name) {
+-  static const auto real_unsetenv = GET_REAL_SYMBOL(unsetenv);
++MFBT_API int ENV_INTERPOSER(unsetenv)(const char* name) {
++  static const auto real_unsetenv = ENV_ORIGINAL(unsetenv);
+ 
+   pthread_mutex_lock(&gEnvLock);
+   int result = real_unsetenv(name);
+@@ -67,8 +83,8 @@
+   return result;
+ }
+ 
+-MFBT_API int clearenv(void) {
+-  static const auto real_clearenv = GET_REAL_SYMBOL(clearenv);
++MFBT_API int ENV_INTERPOSER(clearenv)(void) {
++  static const auto real_clearenv = ENV_ORIGINAL(clearenv);
+ 
+   pthread_mutex_lock(&gEnvLock);
+   int result = real_clearenv();

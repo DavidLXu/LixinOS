@@ -1,0 +1,28 @@
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -1777,7 +1777,10 @@
+ 	}
+ };
+ function internalModules() {
+-	const addon = createRequire(import.meta.url)("node-addon-require-builtin");
++	const require = createRequire(import.meta.url);
++	const addon = process.execArgv.includes("--expose-internals")
++		? { requireBuiltin: require }
++		: require("node-addon-require-builtin");
+ 	const esmModule = addon.requireBuiltin("internal/modules/esm/loader");
+ 	const cjsModule = addon.requireBuiltin("internal/modules/cjs/loader");
+ 	const cjsHelpers = addon.requireBuiltin("internal/modules/helpers");
+--- a/lib/worker/profile-resolution-bootstrap.js
++++ b/lib/worker/profile-resolution-bootstrap.js
+@@ -561,7 +561,10 @@
+ 	}
+ };
+ function internalModules() {
+-	const addon = createRequire(import.meta.url)("node-addon-require-builtin");
++	const require = createRequire(import.meta.url);
++	const addon = process.execArgv.includes("--expose-internals")
++		? { requireBuiltin: require }
++		: require("node-addon-require-builtin");
+ 	const esmModule = addon.requireBuiltin("internal/modules/esm/loader");
+ 	const cjsModule = addon.requireBuiltin("internal/modules/cjs/loader");
+ 	const cjsHelpers = addon.requireBuiltin("internal/modules/helpers");

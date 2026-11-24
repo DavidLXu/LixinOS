@@ -1,0 +1,11 @@
+--- a/geocode-glib/meson.build
++++ b/geocode-glib/meson.build
+@@ -70,7 +70,7 @@
+ if not get_option('soup2')
+   library_name += '-2'
+ endif
+-libgcglib = shared_library(library_name,
++libgcglib = library(library_name,
+                            sources,
+                            dependencies: deps,
+                            include_directories: include,

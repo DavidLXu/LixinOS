@@ -1,0 +1,55 @@
+--- a/dbus/CMakeLists.txt
++++ b/dbus/CMakeLists.txt
+@@ -263,7 +263,7 @@
+ find_library(LIBSOCKET socket)
+ 
+ ### Client library
+-add_library(dbus-1 SHARED
++add_library(dbus-1 STATIC
+     ${libdbus_SOURCES}
+     ${libdbus_HEADERS}
+ )
+--- a/bus/main.c
++++ b/bus/main.c
+@@ -412,6 +412,11 @@
+   void *ready_event_handle;
+ 
+ #ifdef DBUS_UNIX
++#ifdef __lixinos__
++  /* The guest reserves 0 through 2 even when closed. The foreground daemon
++   * has no need to read stdin. Only the launcher attaches standard streams. */
++  close (STDIN_FILENO);
++#else
+   const char *error_str;
+ 
+   /* Redirect stdin from /dev/null since we will never need it, and
+@@ -436,6 +441,7 @@
+   /* Set all fds >= 3 close-on-execute. We don't want activated services
+    * to inherit fds we might have inherited from our caller. */
+   _dbus_fd_set_all_close_on_exec ();
++#endif
+ #endif
+   ready_event_handle = NULL;
+ 
+--- a/dbus/dbus-sysdeps-unix.c
++++ b/dbus/dbus-sysdeps-unix.c
+@@ -2724,6 +2724,19 @@
+             break;
+           }
+       }
++#ifdef __lixinos__
++    /* The native guest has one identity and may have no passwd file. */
++    if (p == NULL && (result == 0 || result == ENOENT) &&
++        (uid == 0 || (username_c != NULL && strcmp (username_c, "root") == 0)))
++      {
++        p_str = (struct passwd) {
++          .pw_name = (char *) "root", .pw_uid = 0, .pw_gid = 0,
++          .pw_dir = (char *) "/",
++        };
++        p = &p_str;
++        result = 0;
++      }
++#endif
+     if (result == 0 && p == &p_str)
+       {
+         if (!fill_user_info_from_passwd (p, info, error))

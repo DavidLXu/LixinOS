@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Mousepad
+Exec=/bin/mousepad.win3
+TryExec=/bin/mousepad.win3

@@ -1,6 +1,8 @@
 #include "native.h"
+#include "smp.h"
+extern unsigned long remote_table(void);
 
-enum { FREE, READY, WAITING, EXITED, PAUSED };
+enum { FREE, READY, WAITING, EXITED, PAUSED, REMOTE };
 struct task {
     u64 stack, pid, parent, waiting, cpu;
     int state, detached, job, watching, stop;
@@ -23,7 +25,7 @@ long task_list(char *out) {
         p = add_number(p, t->parent);
         p = add_text(p, t->state == WAITING  ? " waiting "
                         : t->state == EXITED ? " exited "
-                        : i == current       ? " running "
+                        : i == current || t->state == REMOTE ? " running "
                                              : " ready ");
         p = add_text(p, t->detached ? "background\n" : "foreground\n");
     }
@@ -57,16 +59,20 @@ void tasks_init(void) {
         MMIO32(0x08010004) = 255;
         MMIO32(0x08010000) = 1;
     }
+    smp_init(gic3);
     arm_timer(clock_hz() / 50);
 }
-static u64 idle, sample_at, sample_idle;
+static u64 idle, sample_at, sample_idle, sample_remote;
 static unsigned busy;
 u64 idle_ticks(void) { return idle; }
 unsigned cpu_percent(void) {
     u64 now = clock_ticks(), delta = now - sample_at;
     if (delta >= clock_hz() / 2) {
         u64 waited = idle - sample_idle;
-        busy = waited >= delta ? 0 : 100 - waited * 100 / delta;
+        u64 remote = smp_busy_ticks(), work = remote - sample_remote;
+        if (work > delta) work = delta;
+        busy = ((waited < delta ? delta - waited : 0) + work) * 100 / (delta * smp_cpus());
+        sample_remote = remote;
         sample_at = now;
         sample_idle = idle;
     }
@@ -75,7 +81,7 @@ unsigned cpu_percent(void) {
 void idle_slice(void) {
     display_status();
     for (unsigned i = 0; i < NATIVE_TASKS; i++)
-        if (i != current && tasks[i].state == READY) {
+        if (i != current && (tasks[i].state == READY || (tasks[i].state == REMOTE && smp_finished()))) {
             schedule();
             return;
         }
@@ -104,7 +110,10 @@ u64 task_pid(void) { return tasks[current].pid; }
 unsigned task_terminal(void) { return tasks[current].terminal; }
 long task_resources(u64 *out) {
     u64 now=clock_ticks(), busy=now-idle_ticks();
-    out[0]=now; out[1]=idle_ticks(); out[2]=native_ram_bytes();
+    u64 remote = smp_busy_ticks();
+    out[0]=now;
+    out[1]=smp_cpus() == 1 ? idle_ticks() : (idle_ticks() + now - remote) / 2;
+    out[2]=native_ram_bytes();
     unsigned n=3;
     for(unsigned i=0;i<NATIVE_TASKS;i++) {
         struct task *t=&tasks[i];
@@ -112,7 +121,7 @@ long task_resources(u64 *out) {
         out[n]=t->pid; out[n+1]=t->parent;
         out[n+2]=t->cpu+(i==current ? busy-busy_start : 0);
         out[n+3]=process_private_bytes(i);
-        out[n+4]=t->state==EXITED?5:t->state==WAITING||t->state==PAUSED?4:i==current?1:2;
+        out[n+4]=t->state==EXITED?5:t->state==WAITING||t->state==PAUSED?4:(i==current || t->state==REMOTE)?1:2;
         out[n+5]=t->detached;
         const char *path=process_task_name(i), *name=path;
         for(;*path;path++) if(*path=='/') name=path+1;
@@ -127,7 +136,7 @@ void schedule(void) {
     unsigned old = current;
     for (unsigned k = 1; k < NATIVE_TASKS; k++) {
         unsigned id = (old + k) % NATIVE_TASKS;
-        if (tasks[id].state != READY)
+        if (tasks[id].state != READY && !(tasks[id].state == REMOTE && smp_finished()))
             continue;
         u64 busy=clock_ticks()-idle_ticks();
         tasks[old].cpu+=busy-busy_start;
@@ -160,6 +169,7 @@ int task_stopped(void) { return tasks[current].stop; }
 static void stop_tree(unsigned slot, int status) {
     struct task *t = &tasks[slot];
     if (t->state == FREE || t->state == EXITED) return;
+    if (t->state == REMOTE) smp_revoke_clock();
     t->stop = status;
     if (t->state == PAUSED) t->state = READY;
     for (unsigned i = 1; i < NATIVE_TASKS; i++)
@@ -213,10 +223,11 @@ long task_wait_mode(u64 pid, int nohang) {
                 }
                 tasks[current].watching = 0;
             }
-            if (child->state != EXITED && child->state != PAUSED) {
+            while (child->state != EXITED && child->state != PAUSED) {
                 tasks[current].state = WAITING;
                 tasks[current].waiting = pid;
-                schedule();
+                /* A child running on CPU 1 may not yet have a local continuation. */
+                idle_slice();
                 tasks[current].state = READY;
             }
         }
@@ -249,7 +260,7 @@ void task_start(void) {
     for (;;) {
     } /* No runnable continuation. */
 }
-void timer_interrupt(void) {
+void smp_primary_tick(void *frame) {
     u64 id = gic3 ? gic3_ack() : MMIO32(0x0801000c);
     if (id >= 1020)
         return;
@@ -264,6 +275,22 @@ void timer_interrupt(void) {
         console_pump();
         display_status();
         net_poll();
+        if (smp_cpus() == 2) {
+            for (unsigned i = 0; i < NATIVE_TASKS; i++) {
+                if (i == current || tasks[i].state != READY) continue;
+                if (smp_available() && smp_submit(frame, remote_table())) {
+                    unsigned owner = current;
+                    tasks[owner].state = REMOTE;
+                    while (!smp_finished()) {
+                        schedule();
+                        if (!smp_finished()) idle_slice();
+                    }
+                    tasks[owner].state = READY;
+                    tasks[owner].cpu += smp_collect();
+                }
+                break;
+            }
+        }
         schedule();
     }
 }

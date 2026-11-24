@@ -27,8 +27,6 @@ def fetch(name, url, digest):
 
 archive = fetch("duktape.tar.xz", "https://sources.buildroot.net/duktape/duktape-2.7.0.tar.xz",
                 "90f8d2fa8b5567c6899830ddef2c03f3c27960b11aca222fa17aa7ac613c2890")
-fetch("stb_image.h", "https://raw.githubusercontent.com/nothings/stb/f58f558c120e9b32c217290b80bad1a0729fbb2c/stb_image.h",
-      "594c2fe35d49488b4382dbfaec8f98366defca819d916ac95becf3e75f4200b3")
 font = fetch("unifont.hex.gz", "https://unifoundry.com/pub/unifont/unifont-16.0.04/font-builds/unifont-16.0.04.hex.gz",
              "f9c8c7802453f47be02677176aeac2342ee96d354fad7a26cedcce48e68e1d9f")
 with tarfile.open(archive) as src:

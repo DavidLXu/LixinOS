@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -e
+build=$(cd "$(dirname "$0")" && pwd)
+cache=$(dirname "$build")
+llvm=${LIXINOS_LLVM_BIN:-/opt/homebrew/opt/llvm@22/bin}
+cross=("$cache"/arm-gnu-toolchain-*-aarch64-none-elf)
+musl="$cache/cpython-port/sysroot"
+sdk="$build/alpine-sdk/usr"
+gccdir=$(dirname "$("${cross[0]}/bin/aarch64-none-elf-gcc" -print-libgcc-file-name)")
+ld="${cross[0]}/bin/aarch64-none-elf-ld"
+cc="$llvm/clang"
+args=(--target=aarch64-unknown-linux-musl --sysroot="$musl" --ld-path="$ld" -D__lixinos__
+      -isystem "$sdk/include")
+static_libraries=()
+if [[ ${0##*/} == moz-cxx ]]; then
+    cc="$llvm/clang++"
+    args+=(-nostdinc++ -isystem "$sdk/include/c++/14.2.0"
+           -isystem "$sdk/include/c++/14.2.0/aarch64-alpine-linux-musl")
+    static_libraries+=("$sdk/lib/libstdc++.a" -lm)
+fi
+env_interposition=()
+for arg do
+    case "$arg" in
+        -Wl,@*/js.list)
+            env_interposition+=(-Wl,--wrap=getenv,--wrap=putenv,--wrap=setenv,--wrap=unsetenv,--wrap=clearenv) ;;
+        -c|-E|-S|-fsyntax-only|-M|-MM|--version|-dump*)
+            exec "$cc" "${args[@]}" "$@" ;;
+    esac
+done
+root=$(cd "$cache/../../.." && pwd)
+exec "$cc" "${args[@]}" -static -nostdlib -L"$gccdir" "$musl/lib/crt1.o" "$gccdir/crtbegin.o" "$@" \
+    -Wl,--gc-sections,--build-id=none,-z,max-page-size=4096 -Wl,-T,"$root/User/cpython/program.ld" \
+    "${env_interposition[@]}" -Wl,--start-group "${static_libraries[@]}" "$build/runtime/rt/liblx.a" "$musl/lib/libc.a" -lgcc \
+    -Wl,--end-group "$gccdir/crtend.o"

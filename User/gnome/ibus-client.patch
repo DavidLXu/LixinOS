@@ -1,0 +1,65 @@
+--- a/meson.build
++++ b/meson.build
+@@ -447,8 +447,10 @@
+ if get_option('ui')
+   subdir('ui')
+ endif
+-subdir('tools')
+-subdir('bus')
++if cc.get_define('__lixinos__') == ''
++  subdir('tools')
++  subdir('bus')
++endif
+ if get_option('setup')
+   subdir('setup')
+ endif
+--- a/meson.build
++++ b/meson.build
+@@ -237,6 +237,7 @@
+ pygobject_dep = dependency('pygobject-3.0', version: '>= 3.0.0',
+                            required: false)
+ enable_pygobject = pygobject_dep.found()
++pyoverridesdir = ''
+ if enable_pygobject
+   pyoverridesdir = get_option('python-overrides-dir')
+   if pyoverridesdir == ''
+--- a/meson.build
++++ b/meson.build
+@@ -220,6 +220,7 @@
+ introspection_dep = dependency('gobject-introspection-1.0', version: '>= 0.6.8',
+                                required: get_option('introspection'))
+ enable_introspection = introspection_dep.found()
++introspection_args = []
+ if enable_introspection
+   introspection_args = [ '--warn-all', ]
+   if introspection_dep.version().version_compare('>=1.83.2')
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -144,14 +144,19 @@
+   '-Wl,--version-script,@0@'.format(ibus_symbolmap),
+ )
+ 
+-gen_internal_compose_table = executable('gen-internal-compose-table',
+-  sources: gen_internal_compose_table_sources,
+-  c_args: ibus_lib_cflags,
+-  include_directories: config_h_inc,
+-  dependencies: ibus_deps,
+-)
+-
+-subdir('compose')
++if cc.get_define('__lixinos__') != ''
++  # The release archive includes both generated endianness variants.
++  ibus_gresources_data_gen = files('compose/sequences-' + endian + '-endian')
++else
++  gen_internal_compose_table = executable('gen-internal-compose-table',
++    sources: gen_internal_compose_table_sources,
++    c_args: ibus_lib_cflags,
++    include_directories: config_h_inc,
++    dependencies: ibus_deps,
++  )
++
++  subdir('compose')
++endif
+ 
+ ibusresources = gnome.compile_resources('ibusresources',
+   ibus_gresources_xml,

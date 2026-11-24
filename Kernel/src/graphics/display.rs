@@ -21,6 +21,22 @@ static mut GEOMETRY_GENERATION: u32 = 1;
 // Keep the terminal image separate while a resizable canvas owns its pixels.
 static mut CANVAS_SCREENS: [Option<Screen>; PANES] = [const { None }; PANES];
 static mut REQUEST: Option<Size> = None;
+unsafe extern "C" {
+    fn gpu_init() -> i32;
+    fn gpu_set_mode(fb: *mut u32, stride: u32, width: u32, height: u32) -> i32;
+    fn gpu_damage(x: u32, y: u32, w: u32, h: u32);
+    fn gpu_refresh();
+}
+static mut VIRTIO_GPU: bool = false;
+pub(super) fn damage(x: usize, y: usize, w: usize, h: usize) {
+    unsafe { if VIRTIO_GPU { gpu_damage(x as u32, y as u32, w as u32, h as u32); } }
+}
+pub(super) fn refresh() {
+    unsafe { if VIRTIO_GPU { gpu_refresh(); } }
+}
+fn set_gpu_mode(size: Size) -> bool {
+    unsafe { gpu_set_mode(FB.cast(), W as u32, size.width as u32, size.height as u32) != 0 }
+}
 static mut SELECTOR: u16 = 0;
 static mut CLOCK_OFFSET: i32 = 0;
 
@@ -34,7 +50,12 @@ pub(super) fn init() {
         SELECTOR = selector;
         CLOCK_OFFSET = clock_offset;
     }
-    configure_ramfb(selector, DEFAULT.width, DEFAULT.height);
+    if selector != 0 {
+        configure_ramfb(selector, DEFAULT.width, DEFAULT.height);
+    } else {
+        assert!(unsafe { gpu_init() != 0 } && set_gpu_mode(DEFAULT), "cannot configure virtio-gpu");
+        unsafe { VIRTIO_GPU = true; }
+    }
 }
 
 pub(super) fn clock_offset() -> i32 {
@@ -112,6 +133,10 @@ pub(crate) fn apply_resize() {
     {
         return;
     }
+    if unsafe { VIRTIO_GPU } && !set_gpu_mode(next) {
+        unsafe { REQUEST = None; }
+        return;
+    }
     hide_text_pointer();
     edit_menu::close();
     unsafe {
@@ -158,7 +183,7 @@ pub(crate) fn apply_resize() {
         }
         reset_pointer();
         draw_status(USAGE.busy_percent);
-        configure_ramfb(SELECTOR, next.width, next.height);
+        if !VIRTIO_GPU { configure_ramfb(SELECTOR, next.width, next.height); }
     }
 }
 

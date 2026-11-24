@@ -19,6 +19,7 @@ struct Tables {
     ram: Table,
     extended: Table,
     program: Table,
+    shared: Table,
     wide: [Table; 4],
 }
 static mut SPACES: [*mut Tables; BANKS] = [core::ptr::null_mut(); BANKS];
@@ -58,7 +59,7 @@ struct TestIo {
     interrupt: fn() -> Option<&'static str>,
 }
 
-// The foreground EL0 slot is single-core and uses synchronous syscalls.
+// Test I/O is only accessed by synchronous syscalls on the primary CPU.
 struct TestSlot(UnsafeCell<[Option<TestIo>; BANKS]>);
 unsafe impl Sync for TestSlot {}
 static TEST_IO: TestSlot = TestSlot(UnsafeCell::new([const { None }; BANKS]));
@@ -72,6 +73,9 @@ pub(crate) fn git_mailbox() -> *mut u8 {
 }
 pub(crate) fn bank() -> usize {
     crate::scheduler::active()
+}
+pub(crate) fn test_io_active() -> bool {
+    unsafe { (&*TEST_IO.0.get())[bank()].is_some() }
 }
 fn test_clock() -> u64 {
     crate::scheduler::ticks()
@@ -157,6 +161,7 @@ pub fn setup_bank(bank: usize) -> Result<(), &'static str> {
         (*tables(bank)).root.0[1] = addr_of_mut!((*tables(bank)).ram) as u64 | 3;
         (*tables(bank)).root.0[2] = addr_of_mut!((*tables(bank)).program) as u64 | 3;
         (*tables(bank)).root.0[3] = addr_of_mut!((*tables(bank)).extended) as u64 | 3;
+        (*tables(bank)).root.0[SHARED_BASE / crate::GIB] = addr_of_mut!((*tables(bank)).shared) as u64 | 3;
         for i in 0..crate::MAPPED_RAM / BLOCK {
             let pa = 0x40000000 + i * BLOCK;
             (*tables(bank)).ram.0[i] = pa as u64 | AF | SH | UXN | 1;
@@ -249,9 +254,9 @@ pub fn init() {
     unsafe {
         asm!("msr vbar_el1, {vectors}", "msr mair_el1, {attr}", "msr tcr_el1, {tcr}",
             "msr ttbr0_el1, {table}", "dsb sy","isb","tlbi vmalle1","dsb sy","isb",
-            "mrs x9, sctlr_el1","orr x9,x9,#1","orr x9,x9,#4","msr sctlr_el1,x9","isb",
+            "mrs x9, sctlr_el1","orr x9,x9,#1","orr x9,x9,#4","orr x9,x9,#0x1000","msr sctlr_el1,x9","isb",
             "mrs x9,cpacr_el1","orr x9,x9,#(3<<20)","msr cpacr_el1,x9","isb",
-            vectors=in(reg)user_vectors as *const () as usize,attr=in(reg)0xbbu64,
+            vectors=in(reg)user_vectors as *const () as usize,attr=in(reg)0xffu64,
             tcr=in(reg)(25u64|(1<<23)|(3<<12)|((crate::high_heap_end().is_some() as u64)<<32)),table=in(reg)addr_of_mut!((*tables(0)).root),out("x9") _);
     }
 }
@@ -456,6 +461,7 @@ pub(crate) const WEB_HEAP_BASE: usize = 0x7800_0000;
 const PROGRAM_BASE: usize = 0xa000_0000;
 pub(crate) const EXTENDED_BASE: usize = 0xc000_0000;
 pub(crate) const WIDE_BASE: usize = 64 * crate::GIB;
+pub(crate) const SHARED_BASE: usize = 48 * crate::GIB;
 const PROGRAM_LIMIT: usize = EXTENDED_BASE - PROGRAM_BASE;
 const ARENA_LIMIT: usize = 128 * 1024 * 1024;
 const _: () = assert!(ARENA_BASE + ARENA_LIMIT <= ALIAS && ALIAS + USER_REGION_BYTES <= WEB_HEAP_BASE
@@ -570,6 +576,100 @@ impl Drop for UserArena {
                 alloc::alloc::dealloc(block.as_ptr(), layout);
             }
         }
+    }
+}
+
+use crate::shared_memory::{LIMIT as SHARED_LIMIT, MAPS as SHARED_MAPS, PAGE, Shared};
+
+struct SharedMapping {
+    file: Shared,
+    bytes: usize,
+    tables: Vec<alloc::boxed::Box<Table>>,
+}
+
+impl Drop for SharedMapping {
+    fn drop(&mut self) {
+        self.file.borrow_mut().mappings -= 1;
+    }
+}
+
+pub(crate) struct SharedMappings {
+    bank: usize,
+    slots: [Option<SharedMapping>; SHARED_MAPS],
+}
+
+impl SharedMappings {
+    pub fn new() -> Self {
+        Self { bank: bank(), slots: core::array::from_fn(|_| None) }
+    }
+
+    fn publish(&self, slot: usize, mapped: bool) {
+        let Some(mapping) = &self.slots[slot] else { return; };
+        let first = slot * (SHARED_LIMIT / BLOCK);
+        for (i, table) in mapping.tables.iter().enumerate() {
+            unsafe {
+                (*tables(self.bank)).shared.0[first + i] =
+                    if mapped { (&**table as *const Table as u64) | 3 } else { 0 };
+            }
+        }
+    }
+
+    fn flush() {
+        unsafe { asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb"); }
+    }
+
+    pub fn set_mapped(&self, mapped: bool) {
+        if self.slots.iter().all(Option::is_none) { return; }
+        for i in 0..self.slots.len() { self.publish(i, mapped); }
+        Self::flush();
+    }
+
+    pub fn map(&mut self, file: Shared, bytes: usize, offset: usize, prot: u64) -> i64 {
+        if bytes == 0 || bytes > SHARED_LIMIT || offset % PAGE != 0 || !matches!(prot, 1 | 3) {
+            return -22;
+        }
+        let bytes = bytes.next_multiple_of(PAGE);
+        let base = {
+            let f = file.borrow();
+            if offset.checked_add(bytes).is_none_or(|end| end > f.len.next_multiple_of(PAGE)) {
+                return -22;
+            }
+            f.physical() + offset
+        };
+        let Some(slot) = self.slots.iter().position(Option::is_none) else { return -12; };
+        let count = bytes.div_ceil(BLOCK);
+        let mut entries = Vec::new();
+        if entries.try_reserve_exact(count).is_err() { return -12; }
+        for i in 0..count {
+            let table = unsafe { alloc::alloc::alloc_zeroed(core::alloc::Layout::new::<Table>()).cast::<Table>() };
+            if table.is_null() { return -12; }
+            let mut table = unsafe { alloc::boxed::Box::from_raw(table) };
+            for page in 0..(bytes - i * BLOCK).min(BLOCK) / PAGE {
+                table.0[page] = (base + i * BLOCK + page * PAGE) as u64
+                    | 3 | AF | SH | USER_ACCESS | PXN | UXN | if prot == 1 { READ_ONLY } else { 0 };
+            }
+            entries.push(table);
+        }
+        file.borrow_mut().mappings += 1;
+        self.slots[slot] = Some(SharedMapping { file, bytes, tables: entries });
+        self.publish(slot, true);
+        Self::flush();
+        (SHARED_BASE + slot * SHARED_LIMIT) as i64
+    }
+
+    pub fn unmap(&mut self, address: usize, bytes: usize) -> i64 {
+        let Some(offset) = address.checked_sub(SHARED_BASE) else { return -22; };
+        if offset % SHARED_LIMIT != 0 || bytes == 0 || bytes > SHARED_LIMIT { return -22; }
+        let slot = offset / SHARED_LIMIT;
+        if self.slots.get(slot).and_then(Option::as_ref)
+            .is_none_or(|map| map.bytes != bytes.next_multiple_of(PAGE))
+        {
+            return -22;
+        }
+        self.publish(slot, false);
+        Self::flush();
+        self.slots[slot] = None;
+        0
     }
 }
 

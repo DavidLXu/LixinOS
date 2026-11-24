@@ -147,6 +147,7 @@ fn offset((x, y): Point) -> usize {
     BAR_PIXELS + unsafe { ACTIVE } * (pane_width() + CW) + 2 * (y * W + x)
 }
 fn framebuffer() -> &'static mut [u32] {
+    display::damage(0, CH, W, H);
     unsafe { &mut (*FB).0 }
 }
 
@@ -394,7 +395,7 @@ pub(super) fn write_popup(byte: u8) -> bool {
         return false;
     };
     let start = win.text_origin() + win.term.bar_rows() * BAR_PIXELS;
-    win.term.byte(&mut framebuffer()[start..], byte);
+    win.term.visible_byte(start, byte);
     true
 }
 pub fn poll_window() {

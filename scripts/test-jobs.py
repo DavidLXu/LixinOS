@@ -1,5 +1,6 @@
 """Exercise background tasks, socket wait, pipe backpressure and PID/FD reuse."""
 from pathlib import Path
+import os
 import re
 import runpy
 import socket
@@ -51,7 +52,7 @@ int main(void){volatile unsigned i;puts("cpu-start");for(i=0;i<2000000000u;i++){
             output = guest.until(prompt)
             busy = re.search(rb"^guest_busy_percent=(\d+)$", output, re.M)
             sample = re.search(rb"^sample_ms=(\d+)$", output, re.M)
-            assert busy and sample and b"vcpus=1" in output, output
+            assert busy and sample and f"vcpus={os.getenv('LIXINOS_CPUS', '2')}".encode() in output, output
             assert 250 <= int(sample[1]) and 0 <= int(busy[1]) <= 100, output
             return int(busy[1])
 

@@ -1,0 +1,12 @@
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -8,7 +8,8 @@
+ import { randomUUID } from "node:crypto";
+ import { createReadStream, realpath } from "node:fs";
+ import { chmod, link, lstat, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
+-import { TextDecoder, promisify } from "node:util";
++import { TextDecoder } from "text-encoding-utf-8";
++import { promisify } from "node:util";
+ //#region lib/types/win32.js
+ /**
+ * Windows security-descriptor helpers for atomic local-file replacement. Koffi loads lazily so

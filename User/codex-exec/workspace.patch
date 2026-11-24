@@ -1,0 +1,55 @@
+--- a/codex-rs/core/src/unified_exec/process.rs
++++ b/codex-rs/core/src/unified_exec/process.rs
+@@ -128,10 +128,10 @@
+ 
+ impl UnifiedExecProcess {
+     #[cfg(lixinos)]
+-    pub(crate) async fn guest_builtin(result: std::io::Result<Vec<u8>>) -> Self {
++    pub(crate) async fn guest_builtin(result: std::io::Result<(i32, Vec<u8>)>) -> Self {
+         let process = Self::new(ProcessHandle::GuestBuiltin, None, OutputDrainPolicy::BoundedAfterExit);
+         let (status, stream, bytes) = match result {
+-            Ok(bytes) => (0, ExecOutputStream::Stdout, bytes),
++            Ok((code, bytes)) => (code, ExecOutputStream::Stdout, bytes),
+             Err(error) => (1, ExecOutputStream::Stderr, format!("{error}\n").into_bytes()),
+         };
+         process.output.output_buffer.lock().await.push_chunk(stream, &bytes);
+--- a/codex-rs/core/src/tools/runtimes/unified_exec.rs
++++ b/codex-rs/core/src/tools/runtimes/unified_exec.rs
+@@ -63,6 +63,8 @@
+ 
+ #[cfg(lixinos)]
+ mod lixinos_readonly;
++#[cfg(lixinos)]
++mod lixinos_workspace;
+ mod launch;
+ mod snapshot_metrics;
+ 
+@@ -608,7 +610,16 @@
+ 
+         #[cfg(lixinos)]
+         if !environment_is_remote {
+-            let output = lixinos_readonly::execute(req, attempt);
++            let command = req.prepared.hook_command.as_str();
++            let words: Vec<_> = command.split_ascii_whitespace().collect();
++            let literal = command.chars().all(|c| c.is_alphanumeric() || " ./_-".contains(c));
++            let builtin = literal && matches!(words.as_slice(), ["pwd"] | ["ls"] | ["ls", _] | ["cat", _])
++                && !words.get(1).is_some_and(|p| p.starts_with('-'));
++            let output = if builtin {
++                lixinos_readonly::execute(req, attempt).map(|bytes| (0, bytes))
++            } else {
++                lixinos_workspace::execute(req, attempt, &ctx.cancellation_token).await
++            };
+             return Ok(UnifiedExecAttempt {
+                 process: UnifiedExecProcess::guest_builtin(output).await,
+                 metrics_sidecar,
+--- a/codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs
++++ b/codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs
+@@ -104,7 +104,7 @@
+         };
+         #[cfg(lixinos)]
+         if let ToolSpec::Function(spec) = &mut spec {
+-            spec.description.push_str(" On the local LixinOS guest use literal pwd, ls [directory], or cat file within the current workspace. Pipes, options, shell syntax, and PTYs are unavailable.");
++            spec.description.push_str(" On LixinOS use non-interactive guest shell commands. The offline worker maps the project to /workspace and supports pipes, redirection, &&, ||, native tcc builds, and running project tests. Use relative paths. Workspace writes follow the selected Codex sandbox mode.");
+         }
+         if !self.options.allow_tty
+             && let ToolSpec::Function(spec) = &mut spec

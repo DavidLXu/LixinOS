@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <time.h>
 
 struct context {
@@ -16,6 +17,7 @@ struct thread {
     uint64_t deadline, signal_mask;
     int (*entry)(void *);
     void *arg;
+    char name[16];
 };
 static struct thread threads[64] = {{.id = 1}};
 static int current, next_id = 2;
@@ -27,6 +29,18 @@ static uint64_t micros(void) { return console_call(38, 1); }
 int lx_thread_id(void) { return threads[current].id; }
 int lx_thread_main(void) { return current == 0; }
 int lx_threads_active(void) { return active > 1; }
+long lx_prctl(int option, uintptr_t address) {
+    struct thread *thread = &threads[current];
+    if (option != PR_SET_NAME && option != PR_GET_NAME)
+        return -ENOSYS;
+    if (!address)
+        return -EFAULT;
+    if (option == PR_GET_NAME)
+        memcpy((void *)address, thread->name, sizeof(thread->name));
+    else
+        strncpy(thread->name, (const char *)address, sizeof(thread->name) - 1);
+    return 0;
+}
 long lx_clear_tid(int *word) {
     threads[current].clear_tid = word;
     return lx_thread_id();
@@ -101,6 +115,7 @@ long lx_clone(int (*fn)(void *), void *sp, int flags, void *arg, int *ptid, void
             t->arg = arg;
             t->clear_tid = ctid;
             t->signal_mask = threads[current].signal_mask;
+            memcpy(t->name, threads[current].name, sizeof(t->name));
             *ptid = t->id = next_id++;
             ++active;
             return t->id;

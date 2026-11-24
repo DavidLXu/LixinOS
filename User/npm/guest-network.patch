@@ -1,0 +1,26 @@
+--- a/node_modules/@npmcli/agent/lib/options.js
++++ b/node_modules/@npmcli/agent/lib/options.js
+@@ -4,7 +4,7 @@
+ 
+ const normalizeOptions = (opts) => {
+   const family = parseInt(opts.family ?? '0', 10)
+-  const keepAlive = opts.keepAlive ?? true
++  const keepAlive = process.platform === 'lixinos' ? false : (opts.keepAlive ?? true)
+ 
+   const normalized = {
+     // nodejs http agent options. these are all the defaults
+--- a/node_modules/@npmcli/agent/lib/agents.js
++++ b/node_modules/@npmcli/agent/lib/agents.js
+@@ -131,8 +131,10 @@
+       socket = (isSecureEndpoint ? tls : net).connect(options)
+     }
+ 
+-    socket.setKeepAlive(this.keepAlive, this.keepAliveMsecs)
+-    socket.setNoDelay(this.keepAlive)
++    if (process.platform !== 'lixinos') {
++      socket.setKeepAlive(this.keepAlive, this.keepAliveMsecs)
++      socket.setNoDelay(this.keepAlive)
++    }
+ 
+     const abortController = new AbortController()
+     const { signal } = abortController

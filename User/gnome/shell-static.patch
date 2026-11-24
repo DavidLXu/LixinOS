@@ -1,0 +1,488 @@
+--- a/meson.build
++++ b/meson.build
+@@ -38,6 +38,11 @@
+ fs = import('fs')
+ gnome = import('gnome')
+ i18n  = import('i18n')
++cc = meson.get_compiler('c')
++lixinos = cc.get_define('__lixinos__') != ''
++if lixinos
++  add_languages('cpp', native: false)
++endif
+ 
+ prefix = get_option('prefix')
+ 
+@@ -68,8 +73,11 @@
+ endif
+ 
+ atk_bridge_dep = dependency('atk-bridge-2.0')
+-ecal_dep = dependency('libecal-2.0', version: ecal_req)
+-eds_dep = dependency('libedataserver-1.2', version: eds_req)
++have_calendar_server = not lixinos
++if have_calendar_server
++  ecal_dep = dependency('libecal-2.0', version: ecal_req)
++  eds_dep = dependency('libedataserver-1.2', version: eds_req)
++endif
+ gcr_dep = dependency('gcr-4', version: gcr_req)
+ gdk_pixbuf_dep = dependency('gdk-pixbuf-2.0')
+ gi_dep = dependency('girepository-2.0', version: gio_req)
+@@ -140,12 +148,10 @@
+   subdir('man')
+ endif
+ 
+-mutter_typelibdir = mutter_dep.get_variable('typelibdir')
++mutter_typelibdir = lixinos ? '/lib/gnome/girepository-1.0' : mutter_dep.get_variable('typelibdir')
+ python = find_program('python3')
+-gjs = find_program('gjs')
++gjs_path = lixinos ? '/bin/gjs' : find_program('gjs').full_path()
+ generate_app_list = find_program('build-aux/generate-app-list.py')
+-
+-cc = meson.get_compiler('c')
+ 
+ m_dep = cc.find_library('m', required: false)
+ 
+@@ -258,12 +264,16 @@
+     'package_version=' + meson.project_version(),
+     'pkgdatadir=' + pkgdatadir,
+     'pkglibdir=' + pkglibdir,
+-    'static=false',
+-    'introspection=true',
++    'static=' + lixinos.to_string(),
++    'introspection=' + (not lixinos).to_string(),
+     'alsa=false'
+   ]
+ )
+-libgvc_gir = libgvc.get_variable('libgvc_gir')
++if lixinos
++  libgvc_dep = libgvc.get_variable('libgvc_dep')
++else
++  libgvc_gir = libgvc.get_variable('libgvc_gir')
++endif
+ 
+ libshew = dependency('libshew',
+   default_options: [
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -10,7 +10,9 @@
+   'fatal_warnings': get_option('werror'),
+ }
+ 
+-subdir('calendar-server')
++if have_calendar_server
++  subdir('calendar-server')
++endif
+ subdir('hotplug-sniffer')
+ subdir('st')
+ if have_x11_client
+@@ -45,7 +47,7 @@
+ 
+ typelib_cflags = [
+   '-DMUTTER_TYPELIB_DIR="@0@"'.format(mutter_typelibdir),
+-  '-DSHELL_TYPELIB_DIR="@0@"'.format(pkglibdir),
++  '-DSHELL_TYPELIB_DIR="@0@"'.format(lixinos ? mutter_typelibdir : pkglibdir),
+ ]
+ 
+ gnome_shell_cflags = [
+@@ -215,10 +217,12 @@
+ ]
+ 
+ libshell_no_gir_sources = [
+-  js_resources,
+   libshell_private_headers,
+   libshell_private_sources
+ ]
++if not lixinos
++  libshell_no_gir_sources += js_resources
++endif
+ 
+ dbus_generated = gnome.gdbus_codegen('org-gtk-application',
+   'org.gtk.Application.xml',
+@@ -255,34 +259,42 @@
+   include_directories: [include_directories('tray')],
+ )
+ 
+-libshell_gir_includes = [
+-  'Clutter-@0@'.format(mutter_api_version),
+-  'Meta-@0@'.format(mutter_api_version),
+-  'Gcr-4',
+-  'GioUnix-2.0',
+-  'PolkitAgent-1.0',
+-  'GdkPixbuf-2.0'
+-]
+-
+-if have_networkmanager
+-  libshell_gir_includes += ['NM-1.0']
+-endif
+-
+-libshell_gir_includes += [
+-  libgvc_gir[0],
+-  libst_gir[0]
+-]
+-
+-libshell_gir = gnome.generate_gir(libshell,
+-  sources: libshell_gir_sources,
+-  nsversion: mutter_api_version,
+-  namespace: 'Shell',
+-  includes: libshell_gir_includes,
+-  extra_args: ['--quiet'],
+-  kwargs: introspection_common,
+-)
+-
+-gnome_shell_binary = executable('gnome-shell', 'main.c',
++if not lixinos
++  libshell_gir_includes = [
++    'Clutter-@0@'.format(mutter_api_version),
++    'Meta-@0@'.format(mutter_api_version),
++    'Gcr-4',
++    'GioUnix-2.0',
++    'PolkitAgent-1.0',
++    'GdkPixbuf-2.0'
++  ]
++
++  if have_networkmanager
++    libshell_gir_includes += ['NM-1.0']
++  endif
++
++  libshell_gir_includes += [
++    libgvc_gir[0],
++    libst_gir[0]
++  ]
++
++  libshell_gir = gnome.generate_gir(libshell,
++    sources: libshell_gir_sources,
++    nsversion: mutter_api_version,
++    namespace: 'Shell',
++    includes: libshell_gir_includes,
++    extra_args: ['--quiet'],
++    kwargs: introspection_common,
++  )
++endif
++
++gnome_shell_sources = files('main.c')
++if lixinos
++  gnome_shell_sources += js_resources
++  gnome_shell_deps += [libgvc_dep, libshew]
++endif
++gnome_shell_binary = executable('gnome-shell', gnome_shell_sources,
++  link_language: lixinos ? 'cpp' : 'c',
+   c_args: gnome_shell_cflags + typelib_cflags,
+   dependencies: gnome_shell_deps + [libshell_dep, libst_dep, mutter_dep],
+   include_directories: [conf_inc],
+--- a/src/st/meson.build
++++ b/src/st/meson.build
+@@ -230,16 +230,18 @@
+   )
+ endif
+ 
+-libst_gir = gnome.generate_gir(libst,
+-  sources: st_gir_sources,
+-  nsversion: mutter_api_version,
+-  namespace: 'St',
+-  includes: [
+-    'Clutter-' + mutter_api_version,
+-    'GdkPixbuf-2.0',
+-    'Meta-' + mutter_api_version],
+-  dependencies: [mutter_dep, gdk_pixbuf_dep],
+-  include_directories: include_directories('..'),
+-  extra_args: ['-DST_COMPILATION', '--quiet'],
+-  kwargs: introspection_common,
+-)
++if not lixinos
++  libst_gir = gnome.generate_gir(libst,
++    sources: st_gir_sources,
++    nsversion: mutter_api_version,
++    namespace: 'St',
++    includes: [
++      'Clutter-' + mutter_api_version,
++      'GdkPixbuf-2.0',
++      'Meta-' + mutter_api_version],
++    dependencies: [mutter_dep, gdk_pixbuf_dep],
++    include_directories: include_directories('..'),
++    extra_args: ['-DST_COMPILATION', '--quiet'],
++    kwargs: introspection_common,
++  )
++endif
+--- a/js/dbusServices/meson.build
++++ b/js/dbusServices/meson.build
+@@ -22,7 +22,7 @@
+ 
+   serviceconf = configuration_data()
+   serviceconf.set('service', service)
+-  serviceconf.set('gjs', gjs.full_path())
++  serviceconf.set('gjs', gjs_path)
+   serviceconf.set('pkgdatadir', pkgdatadir)
+ 
+   configure_file(
+--- a/subprojects/libshew/src/meson.build
++++ b/subprojects/libshew/src/meson.build
+@@ -28,14 +28,16 @@
+ 
+ meson.override_dependency('libshew', libshew_dep)
+ 
+-libshew_gir = gnome.generate_gir(libshew,
+-  sources: shew_sources + shew_public_headers,
+-  nsversion: api_version,
+-  namespace: 'Shew',
+-  includes: ['Gdk-4.0', 'Gtk-4.0'],
+-  extra_args: ['--quiet'],
+-  fatal_warnings: get_option('werror'),
+-  install_gir: false,
+-  install_typelib: true,
+-  install_dir_typelib: typelibdir,
+-)
++if meson.get_compiler('c').get_define('__lixinos__') == ''
++  libshew_gir = gnome.generate_gir(libshew,
++    sources: shew_sources + shew_public_headers,
++    nsversion: api_version,
++    namespace: 'Shew',
++    includes: ['Gdk-4.0', 'Gtk-4.0'],
++    extra_args: ['--quiet'],
++    fatal_warnings: get_option('werror'),
++    install_gir: false,
++    install_typelib: true,
++    install_dir_typelib: typelibdir,
++  )
++endif
+--- a/meson.build
++++ b/meson.build
+@@ -338,7 +338,7 @@
+ 
+ gnome.post_install(
+   glib_compile_schemas: true,
+-  gtk_update_icon_cache: true
++  gtk_update_icon_cache: not lixinos
+ )
+ 
+ meson.add_dist_script('build-aux/generate-stylesheets.py')
+--- a/src/shell-app-usage.c
++++ b/src/shell-app-usage.c
+@@ -5,8 +5,6 @@
+ #include <string.h>
+ #include <stdlib.h>
+ 
+-#include <X11/Xlib.h>
+-#include <X11/Xatom.h>
+ #include <glib.h>
+ #include <gio/gio.h>
+ #include <meta/display.h>
+--- a/src/shell-util.c
++++ b/src/shell-util.c
+@@ -13,7 +13,6 @@
+ #include <sys/resource.h>
+ #endif
+ 
+-#include <GL/gl.h>
+ #include <cogl/cogl.h>
+ 
+ #include "shell-app-cache-private.h"
+--- a/src/st/meson.build
++++ b/src/st/meson.build
+@@ -191,8 +191,10 @@
+   pango_dep,
+ ]
+ 
+-# Currently meson requires a shared library for building girs
+-libst = shared_library('st-' + mutter_api_version,
++# The GIR scanner needs a shared library on platforms that generate it.
++st_library = lixinos ? 'static' : 'shared'
++libst = build_target('st-' + mutter_api_version,
++  target_type: st_library + '_library',
+   sources: st_gir_sources + st_nogir_sources + croco_sources,
+   c_args: st_cflags,
+   dependencies: st_deps + [
+--- a/src/shell-util.c
++++ b/src/shell-util.c
+@@ -353,8 +353,6 @@
+                                    bits_per_sample, width, height, rowstride,
+                                    (GdkPixbufDestroyNotify) g_free, NULL);
+ }
+-
+-typedef const gchar *(*ShellGLGetString) (GLenum);
+ 
+ #ifndef HAVE_FDWALK
+ static int
+--- a/src/gtkactionobservable.h
++++ b/src/gtkactionobservable.h
+@@ -22,6 +22,13 @@
+ #include "gtkactionobserver.h"
+ 
+ G_BEGIN_DECLS
++
++#ifdef __lixinos__
++#define gtk_action_observable_get_type lx_shell_action_observable_get_type
++#define gtk_action_observable_register_observer lx_shell_action_observable_register_observer
++#define gtk_action_observable_unregister_observer lx_shell_action_observable_unregister_observer
++#endif
++
+ 
+ #define GTK_TYPE_ACTION_OBSERVABLE                          (gtk_action_observable_get_type ())
+ #define GTK_ACTION_OBSERVABLE(inst)                         (G_TYPE_CHECK_INSTANCE_CAST ((inst),                     \
+--- a/src/gtkactionobserver.h
++++ b/src/gtkactionobserver.h
+@@ -22,6 +22,24 @@
+ #include <gio/gio.h>
+ 
+ G_BEGIN_DECLS
++
++#ifdef __lixinos__
++#define GtkActionObservable LxShellActionObservable
++#define _GtkActionObservable _LxShellActionObservable
++#define GtkActionObservableInterface LxShellActionObservableInterface
++#define _GtkActionObservableInterface _LxShellActionObservableInterface
++#define GtkActionObserver LxShellActionObserver
++#define _GtkActionObserver _LxShellActionObserver
++#define GtkActionObserverInterface LxShellActionObserverInterface
++#define _GtkActionObserverInterface _LxShellActionObserverInterface
++#define gtk_action_observer_action_added lx_shell_action_observer_action_added
++#define gtk_action_observer_action_enabled_changed lx_shell_action_observer_action_enabled_changed
++#define gtk_action_observer_action_removed lx_shell_action_observer_action_removed
++#define gtk_action_observer_action_state_changed lx_shell_action_observer_action_state_changed
++#define gtk_action_observer_get_type lx_shell_action_observer_get_type
++#define gtk_action_observer_primary_accel_changed lx_shell_action_observer_primary_accel_changed
++#endif
++
+ 
+ #define GTK_TYPE_ACTION_OBSERVER                            (gtk_action_observer_get_type ())
+ #define GTK_ACTION_OBSERVER(inst)                           (G_TYPE_CHECK_INSTANCE_CAST ((inst),                     \
+--- a/src/gtkactionmuxer.h
++++ b/src/gtkactionmuxer.h
+@@ -22,6 +22,22 @@
+ #include <gio/gio.h>
+ 
+ G_BEGIN_DECLS
++
++#ifdef __lixinos__
++#define GtkActionMuxer LxShellActionMuxer
++#define _GtkActionMuxer _LxShellActionMuxer
++#define GtkActionMuxerClass LxShellActionMuxerClass
++#define gtk_action_muxer_get_parent lx_shell_action_muxer_get_parent
++#define gtk_action_muxer_get_primary_accel lx_shell_action_muxer_get_primary_accel
++#define gtk_action_muxer_get_type lx_shell_action_muxer_get_type
++#define gtk_action_muxer_insert lx_shell_action_muxer_insert
++#define gtk_action_muxer_new lx_shell_action_muxer_new
++#define gtk_action_muxer_remove lx_shell_action_muxer_remove
++#define gtk_action_muxer_set_parent lx_shell_action_muxer_set_parent
++#define gtk_action_muxer_set_primary_accel lx_shell_action_muxer_set_primary_accel
++#define gtk_print_action_and_target lx_shell_print_action_and_target
++#endif
++
+ 
+ #define GTK_TYPE_ACTION_MUXER                               (gtk_action_muxer_get_type ())
+ #define GTK_ACTION_MUXER(inst)                              (G_TYPE_CHECK_INSTANCE_CAST ((inst),                     \
+--- a/src/main.c
++++ b/src/main.c
+@@ -592,6 +592,10 @@
+     g_warning ("Could not change to home directory %s", home_dir);
+ }
+ 
++#ifdef __lixinos__
++void lx_allow_extended_heap (void);
++#endif
++
+ int
+ main (int argc, char **argv)
+ {
+@@ -600,6 +604,10 @@
+   g_autofree char *cwd = NULL;
+   GError *error = NULL;
+   int ecode = EXIT_SUCCESS;
++
++#ifdef __lixinos__
++  lx_allow_extended_heap ();
++#endif
+ 
+   bindtextdomain (GETTEXT_PACKAGE, LOCALEDIR);
+   bind_textdomain_codeset (GETTEXT_PACKAGE, "UTF-8");
+--- a/js/ui/main.js
++++ b/js/ui/main.js
+@@ -247,6 +247,7 @@
+     screenshotUI = new Screenshot.ScreenshotUI();
+ 
+     messageTray = new MessageTray.MessageTray();
++    brightnessManager = new BrightnessManager.BrightnessManager();
+     panel = new Panel.Panel();
+     keyboard = new Keyboard.KeyboardManager();
+     notificationDaemon = new NotificationDaemon.NotificationDaemon();
+@@ -262,7 +263,6 @@
+     breakManagerDispatcher = new BreakManager.BreakDispatcher(breakManager);
+     timeLimitsDispatcher = new TimeLimitsManager.TimeLimitsDispatcher(timeLimitsManager);
+ 
+-    brightnessManager = new BrightnessManager.BrightnessManager();
+     brightnessDBus = new ShellDBus.BrightnessDBus(brightnessManager);
+ 
+     global.connect('shutdown', () => {
+--- a/js/misc/meson.build
++++ b/js/misc/meson.build
+@@ -4,6 +4,7 @@
+ jsconf.set('GETTEXT_PACKAGE', meson.project_name())
+ jsconf.set('LIBMUTTER_API_VERSION', mutter_api_version)
+ jsconf.set10('HAVE_NETWORKMANAGER', have_networkmanager)
++jsconf.set10('LIXINOS', lixinos)
+ jsconf.set10('HAVE_PORTAL_HELPER', have_portal_helper)
+ jsconf.set('UTILS_FOLDER_APPS', run_command(
+   generate_app_list, '../../data/default-apps/utilities-folder.txt',
+--- a/js/misc/config.js.in
++++ b/js/misc/config.js.in
+@@ -5,6 +5,7 @@
+ /* The version of this package */
+ export const PACKAGE_VERSION = '@PACKAGE_VERSION@';
+ /* 1 if networkmanager is available, 0 otherwise */
++export const LIXINOS = @LIXINOS@;
+ export const HAVE_NETWORKMANAGER = @HAVE_NETWORKMANAGER@;
+ /* 1 if portal helper is enabled, 0 otherwise */
+ export const HAVE_PORTAL_HELPER = @HAVE_PORTAL_HELPER@;
+--- a/js/misc/systemActions.js
++++ b/js/misc/systemActions.js
+@@ -8,6 +8,7 @@
+ import * as GnomeSession from './gnomeSession.js';
+ import * as LoginManager from './loginManager.js';
+ import * as Main from '../ui/main.js';
++import * as Config from './config.js';
+ import * as Screenshot from '../ui/screenshot.js';
+ 
+ const LOCKDOWN_SCHEMA = 'org.gnome.desktop.lockdown';
+@@ -397,18 +398,22 @@
+         return visible;
+     }
+ 
++    _managesLocalSession() {
++        return Config.LIXINOS && this._session.get_name_owner() === null;
++    }
++
+     _updateLogout() {
+-        let user = this._userManager.get_user(GLib.get_user_name());
+-
+-        let allowLogout = !this._lockdownSettings.get_boolean(DISABLE_LOG_OUT_KEY);
+-        let alwaysShow = global.settings.get_boolean(ALWAYS_SHOW_LOG_OUT_KEY);
+-        let systemAccount = user.system_account;
+-        let localAccount = user.local_account;
+-        let multiUser = this._userManager.has_multiple_users;
+-        let multiSession = Gdm.get_session_ids().length > 1;
+-        let shouldShowInMode = !Main.sessionMode.isLocked && !Main.sessionMode.isGreeter;
+-
+-        let visible = allowLogout && (alwaysShow || multiUser || multiSession || systemAccount || !localAccount) && shouldShowInMode;
++        const allowLogout = !this._lockdownSettings.get_boolean(DISABLE_LOG_OUT_KEY);
++        const shouldShowInMode = !Main.sessionMode.isLocked && !Main.sessionMode.isGreeter;
++        let showLogout = this._managesLocalSession();
++        if (!showLogout) {
++            const user = this._userManager.get_user(GLib.get_user_name());
++            showLogout = global.settings.get_boolean(ALWAYS_SHOW_LOG_OUT_KEY) ||
++                this._userManager.has_multiple_users || Gdm.get_session_ids().length > 1 ||
++                user.system_account || !user.local_account;
++        }
++
++        const visible = allowLogout && showLogout && shouldShowInMode;
+         this._actions.get(LOGOUT_ACTION_ID).available = visible;
+         this.notify('can-logout');
+ 
+@@ -448,6 +453,10 @@
+             throw new Error('The logout action is not available!');
+ 
+         Main.overview.hide();
++        if (this._managesLocalSession()) {
++            global.context.terminate();
++            return;
++        }
+         this._session.LogoutAsync(0).catch(logError);
+     }
+ 

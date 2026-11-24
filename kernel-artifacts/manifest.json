@@ -1,0 +1,17 @@
+{
+  "tag": "kernel-2026-11-24.1",
+  "date": "2026-11-24T15:10:12+08:00",
+  "source_tree": "56e1639e685f758eac86c6ad88d2da3196a5181d",
+  "tcc_disk_sha256": "a6833d25bf3fee62c97cd5fe67ea264ae08a4e04420c20231f9ddb2433261ffd",
+  "sha256": {
+    "cpython.pkg": "b86e0d8c0e787ded402d108df0dc5ce6a34f84419d93c9784e874bfb822e20a4",
+    "rust-release.elf": "3b82878ca7575f78795bad7c42496cf02fe904a214f708b92c4e9043a014af67",
+    "rust-retina.elf": "a9a8ca5bf2551ec0369f2338793ccec1af86bb576c46776b1bd1b5a67d806267",
+    "rust-split.elf": "aebb43eba096044eb06dfef29cd9a630e8fa467dbec48cd002fd0c1410074af4",
+    "rust-ssh.elf": "731974ed27f8e89dbbdf9e0e71394795807806ac98839f2cc1fe3b8d54cbb310",
+    "rust-window.elf": "e5e713506aeae5ab224bdfe6e55fbd9d1aa1857bab81582a224a77898849af93",
+    "tcc-kernel.elf": "aab63b0b928d0566427f02f7bad36b565443bf978ad52a1c31c8874b967401db",
+    "tcc-loader.elf": "f6ac9f3beed0977d19b46ba5ac7a4e57348f1ee1b0007205dd3b995e5f3eaf23",
+    "tcc-system.img.gz": "0c3cd6c58aa3524b7015d768a121533556d58be98303f4bad5a655b5700e1b08"
+  }
+}

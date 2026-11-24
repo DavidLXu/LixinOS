@@ -1,0 +1,44 @@
+--- a/subprojects/gvdb/gvdb/gvdb-builder.h
++++ b/subprojects/gvdb/gvdb/gvdb-builder.h
+@@ -23,6 +23,19 @@
+ #define __gvdb_builder_h__
+ 
+ #include <gio/gio.h>
++
++#ifdef __lixinos__
++#define gvdb_hash_table_new mutter_gvdb_hash_table_new
++#define gvdb_hash_table_insert mutter_gvdb_hash_table_insert
++#define gvdb_hash_table_insert_string mutter_gvdb_hash_table_insert_string
++#define gvdb_item_set_value mutter_gvdb_item_set_value
++#define gvdb_item_set_hash_table mutter_gvdb_item_set_hash_table
++#define gvdb_item_set_parent mutter_gvdb_item_set_parent
++#define gvdb_table_write_contents mutter_gvdb_table_write_contents
++#define gvdb_table_write_contents_async mutter_gvdb_table_write_contents_async
++#define gvdb_table_write_contents_finish mutter_gvdb_table_write_contents_finish
++#define gvdb_table_get_contents mutter_gvdb_table_get_contents
++#endif
+ 
+ typedef struct _GvdbItem GvdbItem;
+ 
+--- a/subprojects/gvdb/gvdb/gvdb-reader.h
++++ b/subprojects/gvdb/gvdb/gvdb-reader.h
+@@ -23,6 +23,19 @@
+ #define __gvdb_reader_h__
+ 
+ #include <glib.h>
++
++#ifdef __lixinos__
++#define gvdb_table_new_from_bytes mutter_gvdb_table_new_from_bytes
++#define gvdb_table_new mutter_gvdb_table_new
++#define gvdb_table_free mutter_gvdb_table_free
++#define gvdb_table_get_names mutter_gvdb_table_get_names
++#define gvdb_table_list mutter_gvdb_table_list
++#define gvdb_table_get_table mutter_gvdb_table_get_table
++#define gvdb_table_get_raw_value mutter_gvdb_table_get_raw_value
++#define gvdb_table_get_value mutter_gvdb_table_get_value
++#define gvdb_table_has_value mutter_gvdb_table_has_value
++#define gvdb_table_is_valid mutter_gvdb_table_is_valid
++#endif
+ 
+ /* We cannot enable the weak attribute unconditionally here because both
+  * gvdb/gvdb-reader.c and tests/dconf-mock-gvdb.c include this file. The

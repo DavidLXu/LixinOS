@@ -1,0 +1,33 @@
+--- a/meson.build
++++ b/meson.build
+@@ -403,15 +403,23 @@
+ 
+ mapfile = dir_src / 'libinput.sym'
+ version_flag = '-Wl,--version-script,@0@'.format(mapfile)
+-lib_libinput = shared_library('input',
+-		src_libinput,
++if cc.get_define('__lixinos__') != ''
++	lib_libinput = static_library('input', src_libinput,
+ 		include_directories : [include_directories('.'), includes_include],
+ 		dependencies : deps_libinput,
+-		version : libinput_so_version,
+-		link_args : version_flag,
+-		link_depends : mapfile,
+-		install : true
+-		)
++		link_whole : [libinput_util, libquirks],
++		install : true)
++else
++	lib_libinput = shared_library('input',
++			src_libinput,
++			include_directories : [include_directories('.'), includes_include],
++			dependencies : deps_libinput,
++			version : libinput_so_version,
++			link_args : version_flag,
++			link_depends : mapfile,
++			install : true
++			)
++endif
+ 
+ dep_libinput = declare_dependency(
+ 		link_with : lib_libinput,

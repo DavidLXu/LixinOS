@@ -101,7 +101,8 @@ struct snapshot {
 static struct snapshot live = {(u8 *)0x80000000UL}, staged = {(u8 *)0x8c000000UL};
 struct build_ref {
     u8 *p;
-    u32 capacity;
+    u32 capacity, disk_off, disk_crc;
+    u8 lazy;
 };
 struct build_view {
     struct build_ref *items;
@@ -142,16 +143,83 @@ u64 disk_generation(void) { return generation; }
 static u32 word(const u8 *p) {
     return (u32)p[0] | (u32)p[1] << 8 | (u32)p[2] << 16 | (u32)p[3] << 24;
 }
-static u32 hash(const u8 *p, u32 n) {
-    u32 h = 2166136261u;
+static void store_word(u8 *p, u32 value) {
+    p[0] = value;
+    p[1] = value >> 8;
+    p[2] = value >> 16;
+    p[3] = value >> 24;
+}
+static u32 hash_cont(u32 h, const u8 *p, u32 n) {
+    while (n >= 4) {
+        h = (h ^ p[0]) * 16777619u;
+        h = (h ^ p[1]) * 16777619u;
+        h = (h ^ p[2]) * 16777619u;
+        h = (h ^ p[3]) * 16777619u;
+        p += 4;
+        n -= 4;
+    }
     while (n--)
         h = (h ^ *p++) * 16777619u;
     return h;
+}
+static u32 hash(const u8 *p, u32 n) { return hash_cont(2166136261u, p, n); }
+static int read_slot_range(unsigned slot, u64 payload_off, u8 *dst, u32 len) {
+    if (!len)
+        return 1;
+    u64 base = 2 + (u64)slot * (SLOT_BYTES / 512);
+    u64 sec = payload_off / 512;
+    u32 head = payload_off % 512;
+    u8 tmp[512];
+    if (head) {
+        if (!transfer(0, base + sec, tmp, 512))
+            return 0;
+        u32 take = 512 - head;
+        if (take > len)
+            take = len;
+        memcpy(dst, tmp + head, take);
+        dst += take;
+        len -= take;
+        sec++;
+    }
+    u32 aligned_len = len & ~511u;
+    for (u32 pos = 0; pos < aligned_len;) {
+        u32 n = aligned_len - pos > (1u << 20) ? (1u << 20) : aligned_len - pos;
+        if (!transfer(0, base + sec + pos / 512, dst + pos, n))
+            return 0;
+        pos += n;
+    }
+    dst += aligned_len;
+    len -= aligned_len;
+    sec += aligned_len / 512;
+    if (len) {
+        if (!transfer(0, base + sec, tmp, 512))
+            return 0;
+        memcpy(dst, tmp, len);
+    }
+    return 1;
 }
 static int matches(const u8 *p, const char *name, unsigned n) {
     for (unsigned i = 0; i < n; i++)
         if (p[i] != (u8)name[i])
             return 0;
+    return 1;
+}
+static int parse_idx_header(const u8 *h, u32 size, u32 *sec_off, u32 *idx_bytes, u32 *idx_crc,
+                            u32 *voff, u32 *vlen) {
+    if (!matches(h + 28, "LXIDX001", 8) || word(h + 56) != hash(h, 56))
+        return 0;
+    u32 so = word(h + 36), ib = word(h + 40), ic = word(h + 44), vo = word(h + 48),
+        vl = word(h + 52);
+    u64 payload_secs = ((u64)size + 511) / 512;
+    u64 idx_secs = ((u64)ib + 511) / 512;
+    if (so < payload_secs || ib < 8 || 1UL + so + idx_secs > SLOT_BYTES / 512 || vo > size ||
+        vl > size - vo || vl > (1u << 20))
+        return 0;
+    *sec_off = so;
+    *idx_bytes = ib;
+    *idx_crc = ic;
+    *voff = vo;
+    *vlen = vl;
     return 1;
 }
 
@@ -312,11 +380,6 @@ static void base_file_stats(u64 *stats) {
     }
 }
 
-static void store_word(u8 *p, u32 value) {
-    for (int i = 0; i < 4; i++)
-        p[i] = value >> (i * 8);
-}
-
 #include "build-fs.h"
 u32 disk_usage(void) { return build_volume ? build_live.bytes : live.size; }
 void file_stats(u64 *stats) {
@@ -352,10 +415,81 @@ static int load_snapshot(const u8 *head, unsigned slot) {
     u32 size = word(head + 16);
     if (size < 4 || size > SLOT_BYTES - 512)
         return 0;
+    u32 sec_off, idx_bytes, idx_crc, voff, vlen;
+    if (matches(head, "LIXINFS3", 8) &&
+        parse_idx_header(head, size, &sec_off, &idx_bytes, &idx_crc, &voff, &vlen)) {
+#ifdef LIXINOS_BOOT_DISK
+        u64 idx_rounded = ((u64)idx_bytes + 511) & ~511UL;
+        if (idx_rounded <= SLOT_BYTES) {
+            int ok = 1;
+            for (u64 pos = 0; pos < idx_rounded;) {
+                u32 n = idx_rounded - pos > (1u << 20) ? (1u << 20) : idx_rounded - pos;
+                if (!transfer(0, 2 + (u64)slot * (SLOT_BYTES / 512) + sec_off + pos / 512,
+                              staged.data + pos, n)) {
+                    ok = 0;
+                    break;
+                }
+                pos += n;
+            }
+            if (ok && hash(staged.data, idx_bytes) == idx_crc) {
+                u32 count = word(staged.data), pos = 8;
+                const char *want = "/boot/kernel.elf";
+                u32 want_len = 16;
+                for (u32 i = 0; i < count && pos + 32 <= idx_bytes; i++) {
+                    u32 plen = staged.data[pos] | ((u32)staged.data[pos + 1] << 8);
+                    u32 sz = word(staged.data + pos + 4);
+                    u32 birth = word(staged.data + pos + 8);
+                    u32 mod = word(staged.data + pos + 12);
+                    u32 boff = word(staged.data + pos + 16);
+                    u32 bcrc = word(staged.data + pos + 20);
+                    pos += 32;
+                    if (!plen || plen > 512 || plen > idx_bytes - pos)
+                        break;
+                    if (plen == want_len && sz != DIR_SIZE && sz <= NATIVE_FILE_LIMIT &&
+                        boff <= size && sz <= size - boff &&
+                        matches(staged.data + pos, want, want_len)) {
+                        u8 *out = live.data;
+                        store_word(out, 2);
+                        u32 o = 4;
+                        store_word(out + o, 1);
+                        store_word(out + o + 4, DIR_SIZE);
+                        store_word(out + o + 8, 0);
+                        store_word(out + o + 12, 0);
+                        out[o + 16] = '/';
+                        o += 17;
+                        store_word(out + o, want_len);
+                        store_word(out + o + 4, sz);
+                        store_word(out + o + 8, birth);
+                        store_word(out + o + 12, mod);
+                        memcpy(out + o + 16, want, want_len);
+                        if (read_slot_range(slot, boff, out + o + 16 + want_len, sz) &&
+                            hash(out + o + 16 + want_len, sz) == bcrc) {
+                            live.size = o + 16 + want_len + sz;
+                            live.count = 2;
+                            live.timed = 1;
+                            live.buckets = 0;
+                            ordered = 0;
+                            live.end = live.size;
+                            active_slot = slot;
+                            generation = word(head + 8) | (u64)word(head + 12) << 32;
+                            return 1;
+                        }
+                        break;
+                    }
+                    pos += plen;
+                }
+            }
+        }
+#else
+        if (build_volume &&
+            load_build_indexed(head, slot, size, sec_off, idx_bytes, idx_crc, voff, vlen))
+            return 1;
+#endif
+    }
     u64 total = ((u64)size + 511) & ~511UL;
     for (u64 pos = 0; pos < total;) {
-        u32 n = total - pos > 65536 ? 65536 : total - pos;
-        if (!transfer(0, 2 + slot * (SLOT_BYTES / 512) + pos / 512, live.data + pos, n))
+        u32 n = total - pos > (1u << 20) ? (1u << 20) : total - pos;
+        if (!transfer(0, 2 + (u64)slot * (SLOT_BYTES / 512) + pos / 512, live.data + pos, n))
             return 0;
         pos += n;
     }
@@ -391,7 +525,7 @@ static int load_snapshot(const u8 *head, unsigned slot) {
 static unsigned fdt_word(const unsigned char *p) {
     return (unsigned)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3];
 }
-static int build_memory_present(void) {
+int build_memory_present(void) {
     const unsigned char *dt = (const unsigned char *)0x40000000UL;
     unsigned size = fdt_word(dt + 4), strings = fdt_word(dt + 12), start = fdt_word(dt + 8);
     if (fdt_word(dt) != 0xd00dfeed || size < 40 || size > (2u << 20) || strings >= size ||
@@ -461,7 +595,7 @@ int mount_disk(void) {
     if (!load_snapshot(heads[b > a], b > a) && !load_snapshot(heads[b <= a], b <= a))
         return 0;
 #ifndef LIXINOS_BOOT_DISK
-    if (build_volume)
+    if (build_volume && !build_indexed)
         return build_index();
 #endif
     return 1;
@@ -688,7 +822,7 @@ int batch_commit(int id) {
     store_word(head + 24, hash(head, 24));
     u32 sector = 1 + (1 - active_slot) * (SLOT_BYTES / 512);
     for (u32 pos = 0; pos < rounded;) {
-        u32 bytes = rounded - pos > 65536 ? 65536 : rounded - pos;
+        u32 bytes = rounded - pos > (1u << 20) ? (1u << 20) : rounded - pos;
         if (!transfer(1, sector + 1 + pos / 512, scratch + pos, bytes))
             return 0;
         pos += bytes;
@@ -798,6 +932,8 @@ int batch_move(int id, const char *source, const char *dest) {
          i < (build_volume ? build_live.count : live.count); i++) {
         struct entry e;
         if (build_volume) {
+            if (!build_ensure(&build_live.items[i]))
+                return 0;
             u8 *p = build_live.items[i].p;
             struct file f = build_file(p);
             e = (struct entry){p + 16, f.data, word(p), f.size, f.birth, f.modified};

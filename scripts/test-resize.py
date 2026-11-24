@@ -40,16 +40,21 @@ def exercise(guest, control, directory, split):
             )
         return (width, height), cell
 
-    def resize(width, height):
-        source = Path(os.environ["LIXINOS_TEST_WINDOW_SIZE"])
-        source.write_text(f"{width}\t{height}\n")
+    def wait_frame(ready):
         end = time.monotonic() + 8
         while time.monotonic() < end:
             size, cell = frame()
-            if size == (width, height):
-                return cell
+            if ready(size, cell):
+                return size, cell
             time.sleep(0.04)
-        raise AssertionError((size, (width, height)))
+        raise AssertionError(f"Expected terminal pixels did not reach scanout; last size {size}")
+
+    def resize(width, height):
+        source = Path(os.environ["LIXINOS_TEST_WINDOW_SIZE"])
+        source.write_text(f"{width}\t{height}\n")
+        # A VirtIO mode change and the first transfer to that scanout are separate commands.
+        return wait_frame(lambda size, cell: size == (width, height) and
+                          bytes.fromhex("d4e3ff") in cell(-1, width // 22 - 2))[1]
 
     def clock(width, cell):
         last = width // 22 - 1
@@ -83,7 +88,9 @@ def exercise(guest, control, directory, split):
     guest.expect(b"tcc layout.c -o layout\r", shell)
     guest.send(b"./layout\r")
     guest.until(line.encode())
-    (initial_width, _), initial = frame()
+    (initial_width, _), initial = wait_frame(
+        lambda _, cell: cell(0, 63) == cell(0, 64) and cell(0, 64) != cell(0, 65)
+        and cell(0, 65) != cell(0, 66))
     glyph = initial(0, 65)
     assert glyph != initial(0, 64), "reference glyph was not drawn"
     initial_clock = clock(initial_width, initial)
@@ -183,8 +190,8 @@ def exercise(guest, control, directory, split):
     guest.expect(b"lp\r", agent_prompt, b"Recall inputs")
     assert agent_header((width, 1100), green) == title_glyph
     guest.expect(b"/exit\r", shell)
-    _, cells = frame()
     cols = (width // 22 - int(split)) // (2 if split else 1)
+    _, cells = wait_frame(lambda _, cell: cell(0, cols - 1) != green)
     assert cells(0, cols - 1) != green, "Agent header remained after returning to the shell"
 
     if not split:

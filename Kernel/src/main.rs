@@ -22,6 +22,8 @@ mod entropy;
 mod serial_mux;
 mod scheduler;
 mod pipe;
+mod local_socket;
+mod shared_memory;
 mod process;
 mod procfs;
 mod git;
@@ -277,6 +279,7 @@ extern "C" fn kernel_main() -> ! {
         write_volatile(UART_LINE_CONTROL, WORD_LENGTH_8);
         write_volatile(UART_CONTROL, TX_ENABLE | UART_ENABLE | (1 << 9));
     }
+    user::init();
     #[cfg(feature = "retina")]
     graphics::init();
     print("LixinOS booted\nKernel ");
@@ -284,7 +287,6 @@ extern "C" fn kernel_main() -> ! {
     print("\n");
     entropy::init();
     net::init();
-    user::init();
     process::run()
 }
 

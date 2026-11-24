@@ -1,0 +1,209 @@
+--- a/codex-rs/exec/src/lib.rs
++++ b/codex-rs/exec/src/lib.rs
+@@ -227,6 +227,7 @@
+ }
+ 
+ struct ExecRunArgs {
++    ui: Option<interactive::Console>,
+     in_process_start_args: InProcessClientStartArgs,
+     state_db: Option<StateDbHandle>,
+     command: Option<ExecCommand>,
+@@ -272,7 +273,17 @@
+         .unwrap_or_else(|_| EnvFilter::new("error"))
+ }
+ 
++pub mod interactive;
++
+ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
++    run(cli, arg0_paths, None).await
++}
++
++pub async fn run_interactive(cli: Cli, paths: Arg0DispatchPaths, ui: interactive::Console) -> anyhow::Result<()> {
++    run(cli, paths, Some(ui)).await
++}
++
++async fn run(cli: Cli, arg0_paths: Arg0DispatchPaths, ui: Option<interactive::Console>) -> anyhow::Result<()> {
+     if let Some(endpoint) = codex_app_server_client::resolve_remote_endpoint(
+         cli.remote.clone(),
+         cli.remote_auth_token_env.clone(),
+@@ -639,7 +650,7 @@
+         review_model: None,
+         // Default to never ask for approvals in headless mode. Rebuild below if
+         // the fully resolved reviewer is AutoReview.
+-        approval_policy: Some(AskForApproval::Never),
++        approval_policy: ui.is_none().then_some(AskForApproval::Never),
+         approvals_reviewer: None,
+         sandbox_mode,
+         permission_profile: None,
+@@ -816,7 +827,7 @@
+         state_db: state_db.clone(),
+         environment_manager: std::sync::Arc::new(environment_manager),
+         config_warnings,
+-        session_source: SessionSource::Exec,
++        session_source: if ui.is_some() { SessionSource::Cli } else { SessionSource::Exec },
+         enable_codex_api_key_env: true,
+         client_name: "codex_exec".to_string(),
+         client_version: env!("CARGO_PKG_VERSION").to_string(),
+@@ -826,6 +837,7 @@
+         channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+     };
+     run_exec_session(ExecRunArgs {
++        ui,
+         in_process_start_args,
+         state_db,
+         command,
+@@ -928,6 +940,7 @@
+ 
+ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
+     let ExecRunArgs {
++        ui,
+         in_process_start_args,
+         state_db,
+         command,
+@@ -1062,7 +1075,7 @@
+             }
+         }
+         (None, root_prompt, imgs) => {
+-            let prompt_text = resolve_root_prompt(root_prompt);
++            let prompt_text = if ui.is_some() { root_prompt.expect("interactive prompt") } else { resolve_root_prompt(root_prompt) };
+             let mut items: Vec<UserInput> = imgs
+                 .into_iter()
+                 .map(|path| UserInput::LocalImage { path, detail: None })
+@@ -1263,7 +1276,11 @@
+ 
+     // Print the effective configuration and initial request so users can see what Codex
+     // is using.
+-    event_processor.print_config_summary(&config, &prompt_summary, &session_configured);
++    if ui.is_some() {
++        eprintln!("{} | {}", session_configured.model, config.cwd.display());
++    } else {
++        event_processor.print_config_summary(&config, &prompt_summary, &session_configured);
++    }
+     if !json_mode
+         && let Some(message) = codex_core::config::system_bwrap_warning(
+             &config.permissions.effective_permission_profile(),
+@@ -1392,6 +1409,7 @@
+         client,
+         request_ids,
+         ExecTurn {
++            ui,
+             thread_id: primary_thread_id.to_string(),
+             turn_id: task_id,
+             ephemeral: config.ephemeral,
+@@ -1405,6 +1423,7 @@
+ }
+ 
+ struct ExecTurn {
++    ui: Option<interactive::Console>,
+     thread_id: String,
+     turn_id: String,
+     ephemeral: bool,
+@@ -1420,8 +1439,9 @@
+     mut interrupt_rx: mpsc::UnboundedReceiver<()>,
+ ) -> anyhow::Result<()> {
+     let ExecTurn {
++        mut ui,
+         thread_id,
+-        turn_id: task_id,
++        turn_id: mut task_id,
+         ephemeral: thread_ephemeral,
+         history_mode,
+     } = turn;
+@@ -1432,8 +1452,16 @@
+     let mut interrupt_channel_open = true;
+     let primary_thread_id_for_requests = thread_id;
+     loop {
++        let interrupt = async {
++            if let Some(console) = &mut ui {
++                console.interrupted().await;
++                Some(())
++            } else {
++                interrupt_rx.recv().await
++            }
++        };
+         let server_event = tokio::select! {
+-            maybe_interrupt = interrupt_rx.recv(), if interrupt_channel_open => {
++            maybe_interrupt = interrupt, if interrupt_channel_open => {
+                 if maybe_interrupt.is_none() {
+                     interrupt_channel_open = false;
+                     continue;
+@@ -1467,7 +1495,11 @@
+ 
+         match server_event {
+             AppServerEvent::ServerRequest(request) => {
+-                handle_server_request(&client, *request, &mut error_seen).await;
++                if let Some(console) = &mut ui {
++                    console.handle_request(&client, *request, &mut error_seen).await?;
++                } else {
++                    handle_server_request(&client, *request, &mut error_seen).await;
++                }
+             }
+             AppServerEvent::ServerNotification(notification) => {
+                 let mut notification = *notification;
+@@ -1490,7 +1522,9 @@
+                     error_seen = true;
+                 }
+ 
+-                if should_process_notification(
++                let text_delta = ui.is_some() && matches!(&notification, ServerNotification::AgentMessageDelta(n)
++                    if n.thread_id == primary_thread_id_for_requests && n.turn_id == task_id);
++                if text_delta || should_process_notification(
+                     &notification,
+                     &primary_thread_id_for_requests,
+                     &task_id,
+@@ -1504,9 +1538,35 @@
+                     )
+                     .await;
+ 
+-                    match event_processor.process_server_notification(notification) {
++                    let status = match &mut ui {
++                        Some(console) => console.render(notification),
++                        None => event_processor.process_server_notification(notification),
++                    };
++                    match status {
+                         CodexStatus::Running => {}
+                         CodexStatus::InitiateShutdown => {
++                            if let Some(console) = &mut ui {
++                                if let Some(text) = console.prompt().await? {
++                                    let response: TurnStartResponse = send_request_with_response(
++                                        &client,
++                                        ClientRequest::TurnStart {
++                                            request_id: request_ids.next(),
++                                            params: TurnStartParams {
++                                                thread_id: primary_thread_id_for_requests.clone(),
++                                                input: vec![codex_app_server_protocol::UserInput::Text {
++                                                    text, text_elements: Vec::new()
++                                                }],
++                                                ..Default::default()
++                                            },
++                                        },
++                                        "turn/start",
++                                    ).await.map_err(anyhow::Error::msg)?;
++                                    task_id = response.turn.id;
++                                    error_seen = false;
++                                    continue;
++                                }
++                                error_seen = false;
++                            }
+                             if let Err(err) = request_shutdown(
+                                 &client,
+                                 &mut request_ids,
+@@ -1539,7 +1599,7 @@
+     if let Err(err) = client.shutdown().await {
+         warn!("in-process app-server shutdown failed: {err}");
+     }
+-    event_processor.print_final_output(bound_output)?;
++    if ui.is_none() { event_processor.print_final_output(bound_output)?; }
+     if error_seen {
+         std::process::exit(1);
+     }
+--- a/codex-rs/exec/src/remote.rs
++++ b/codex-rs/exec/src/remote.rs
+@@ -135,6 +135,7 @@
+         client,
+         ids,
+         ExecTurn {
++            ui: None,
+             thread_id: thread.id,
+             turn_id: response.turn.id,
+             ephemeral: thread.ephemeral,

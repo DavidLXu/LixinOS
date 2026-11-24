@@ -24,7 +24,7 @@ user_vectors:
 .endr
     b user_sync
     .balign 128
-    b user_timer_irq
+    b smp_primary_vector
     .balign 128
 .rept 6
     b kernel_vector_fault
@@ -40,7 +40,7 @@ user_sync:
     b.eq resume_shell
     cmp x8, #32
     b.eq suspend_for_child
-    cmp x8, #57
+    cmp x8, #60
     b.hi unknown_call
     // The kernel uses the soft-float target (no SIMD registers). Preserve
     // the user integer context across the shared Rust console implementation.

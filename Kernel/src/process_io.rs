@@ -616,7 +616,7 @@ impl Context {
                 let path = services.path(arg)?;
                 let mut contents = match services.volume.borrow().files.get(&path) {
                     Some(None) => return Err("is a directory"),
-                    Some(Some(bytes)) if index == 1 => bytes.clone(),
+                    Some(Some(bytes)) if index == 1 => bytes.to_vec(),
                     _ => Vec::new(),
                 };
                 if contents.len() + self.stream.len() > FILE_LIMIT {

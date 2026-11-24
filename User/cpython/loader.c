@@ -112,6 +112,9 @@ __attribute__((section(".text.start"), noreturn)) void _start(const char *cwd, c
     }
     *sp = v - sp - 1;
     *v++ = 0;
+#ifdef LX_CODEX
+    const uintptr_t *envp = v;
+#endif
     if (env_result > 0) {
         unsigned count = 0;
         for (size_t i = 0; i < env_len;) {
@@ -136,7 +139,7 @@ __attribute__((section(".text.start"), noreturn)) void _start(const char *cwd, c
     *v++ = (uintptr_t)"COMPILER_PATH=/lib/gcc/bin:/bin";
     *v++ = (uintptr_t)"PATH=/bin";
     *v++ = (uintptr_t)"TMPDIR=/tmp";
-#elif defined(LX_NODE)
+#elif defined(LX_NODE) || defined(LX_DBUS)
     *v++ = (uintptr_t)"PATH=/bin";
     *v++ = (uintptr_t)"HOME=/";
     *v++ = (uintptr_t)"TMPDIR=/tmp";
@@ -145,7 +148,7 @@ __attribute__((section(".text.start"), noreturn)) void _start(const char *cwd, c
     *v++ = (uintptr_t)"PATH=/bin";
     *v++ = (uintptr_t)"TMPDIR=/tmp";
     *v++ = (uintptr_t)"COMPILER_PATH=/lib/gcc/bin:/bin";
-#else
+#elif !defined(LX_CODEX)
     *v++ = (uintptr_t)"PYTHON_BASIC_REPL=1";
     *v++ = (uintptr_t)"_PYTHON_SYSCONFIGDATA_NAME=_lixin_sysconfig";
     *v++ = (uintptr_t)"PIP_DISABLE_PIP_VERSION_CHECK=1";
@@ -158,6 +161,22 @@ __attribute__((section(".text.start"), noreturn)) void _start(const char *cwd, c
 #endif
     *v++ = (uintptr_t)"LC_ALL=C.UTF-8";
     }
+#ifdef LX_CODEX
+    // Shell exports can contain only a provider key or a CA override.
+    static const char *const defaults[] = {
+        "HOME=/home/lixin", "PATH=/bin", "SHELL=/bin/bash", "TMPDIR=/tmp",
+        "SSL_CERT_FILE=/lib/cpython-3.14.5/roots.pem"
+    };
+    for (size_t i = 0; i < sizeof(defaults) / sizeof(defaults[0]); ++i) {
+        int found = 0;
+        for (const uintptr_t *entry = envp; entry < v && !found; ++entry) {
+            const char *a = (const char *)*entry, *b = defaults[i];
+            while (*b != '=' && *a == *b) { ++a; ++b; }
+            found = *a == '=' && *b == '=';
+        }
+        if (!found) *v++ = (uintptr_t)defaults[i];
+    }
+#endif
     *v++ = 0;
     *v++ = 3;
     *v++ = (uintptr_t)PHDR_ADDR; // AT_PHDR

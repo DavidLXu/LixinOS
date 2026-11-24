@@ -1,0 +1,73 @@
+--- a/meson.build
++++ b/meson.build
+@@ -41,6 +41,8 @@
+ gnome = import('gnome')
+ i18n = import('i18n')
+ pkg = import('pkgconfig')
++cc = meson.get_compiler('c')
++lixinos = cc.get_define('__lixinos__') != ''
+ 
+ prefix = get_option('prefix')
+ 
+@@ -72,7 +74,7 @@
+ host_cpu = host_machine.cpu()
+ supported_os = ['linux']
+ unsupported_cpus = ['alpha', 'ia64', 'm68k', 'sh4', 'sparc', 'sparc64']
+-if supported_os.contains(host_os) and not unsupported_cpus.contains(host_cpu)
++if not lixinos and supported_os.contains(host_os) and not unsupported_cpus.contains(host_cpu)
+   seccomp_dep = dependency('libseccomp')
+ else
+   seccomp_dep = dependency('', required: false)
+@@ -81,8 +83,6 @@
+ fontconfig_cache_path = fontconfig_dep.get_variable(pkgconfig: 'cachedir')
+ xkb_base = xkb_config_dep.get_variable(pkgconfig: 'xkb_base')
+ iso_codes_prefix = iso_codes_dep.get_variable(pkgconfig: 'prefix')
+-
+-cc = meson.get_compiler('c')
+ 
+ m_dep = cc.find_library('m', required: false)
+ rt_dep = cc.find_library('rt', required: false)
+@@ -93,7 +93,9 @@
+ 
+ subdir('libgnome-desktop')
+ subdir('po')
+-subdir('tests')
++if not lixinos
++  subdir('tests')
++endif
+ 
+ if get_option('desktop_docs')
+   subdir('desktop-docs/fdl')
+--- a/libgnome-desktop/meson.build
++++ b/libgnome-desktop/meson.build
+@@ -142,7 +142,7 @@
+       install: true,
+     )
+   else
+-    libgnome_desktop_base_gir = ''
++    libgnome_desktop_base_gir = []
+   endif
+ 
+   pkg.generate(
+@@ -168,7 +168,9 @@
+   )
+ 
+   subdir('gnome-bg')
+-  subdir('gnome-rr')
++  if not lixinos
++    subdir('gnome-rr')
++  endif
+ endif
+ 
+ ### Legacy ###
+--- a/libgnome-desktop/gnome-bg/meson.build
++++ b/libgnome-desktop/gnome-bg/meson.build
+@@ -53,7 +53,7 @@
+     install: true,
+   )
+ else
+-  libgnome_bg_gir = ''
++  libgnome_bg_gir = []
+ endif
+ libgnome_bg_dep = declare_dependency(
+   sources: [

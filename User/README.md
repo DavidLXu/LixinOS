@@ -39,9 +39,13 @@ The optional [Lite XL package](lite-xl/README.md) adds a desktop code
 editor with a project tree, mouse editing, and Chinese font fallback.
 The optional [GTK 3 package](gtk3/README.md) adds a native window backend,
 a C demo, and a host-side static library sysroot for porting GTK applications.
+The [Wayland port](wayland/README.md) provides native client and server
+libraries and a shared-memory display demo for both kernels.
 
 The [ClassiCube port](classicube/README.md) runs classic creative worlds in the
 graphical shell. Launch it with `classicube` after installing the package.
+The [Doom engine port](doom/README.md) runs Freedoom Phase 2 in the graphical
+shell. Launch it with `doom` after installing the package.
 
 ### LixinOS Bash
 

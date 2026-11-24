@@ -62,7 +62,7 @@ fn display_config() -> (u16, i32) {
         if hours >= 24 || minutes >= 60 { return 0; }
         (hours * 3600 + minutes * 60) * if sign == b'-' { -1 } else { 1 }
     });
-    (framebuffer.expect("missing QEMU ramfb"), offset)
+    (framebuffer.unwrap_or(0), offset)
 }
 
 fn configure_ramfb(selector: u16, width: usize, height: usize) {
@@ -255,6 +255,25 @@ impl Terminal {
         self.parse(fb, byte);
         self.cursor(fb);
     }
+    fn visible_byte(&mut self, start: usize, byte: u8) {
+        let (x, y) = (self.x, self.y);
+        let local = self.selection.is_none() && self.history.offset == 0
+            && matches!(self.parser, ansi::Parser::Ground)
+            && match byte {
+                32..=126 => !self.wrap_pending,
+                8 | 9 | 13 => true,
+                10..=12 => y != self.margins.map_or(self.rows - 1, |(_, last)| last),
+                _ => false,
+            };
+        self.byte(unsafe { &mut (&mut (*FB).0)[start..] }, byte);
+        let (left, top) = (start % W, start / W);
+        if local {
+            display::damage(left + x * CW, top + y * CH, CW, CH);
+            display::damage(left + self.x * CW, top + self.y * CH, CW, CH);
+        } else {
+            display::damage(left, top, self.cols * CW, self.rows * CH);
+        }
+    }
     fn cursor(&self, fb: &mut [u32]) {
         if !self.cursor_visible || self.history.offset != 0 { return; }
         let start = ((self.y + 1) * CH - 3) * self.stride + self.x * CW;
@@ -271,18 +290,21 @@ pub fn put(byte: u8) -> bool {
     if (id != 0 || popup::active_tab().is_some()) && id != popup::terminal_id() {
         return false;
     }
+    // TTY diagnostics still go to the UART. Scrolling the framebuffer here
+    // would invalidate the undamaged pixels retained by a graphical client.
+    if id == 0 && popup::terminal_id() == 0 && unsafe { CANVAS_OPEN[ACTIVE] } {
+        return true;
+    }
     if crate::scheduler::background() {
         let id=popup::terminal_id();
-        if id!=crate::scheduler::terminal_id() || (id==0 && unsafe {CANVAS_OPEN[ACTIVE]}) {return true;}
+        if id!=crate::scheduler::terminal_id() {return true;}
     }
-    sample();
     let _pointer = suspend_text_pointer();
     if popup::write_popup(byte) { return true; }
     unsafe {
-        let fb = &mut (*FB).0;
         let term = &mut TERMS[ACTIVE];
         let start = (1 + term.bar_rows()) * BAR_PIXELS + ACTIVE * (pane_width() + CW);
-        term.byte(&mut fb[start..], byte);
+        term.visible_byte(start, byte);
     }
     true
 }
@@ -294,6 +316,7 @@ pub fn switch_pane() {
 }
 #[cfg(feature = "split")]
 pub fn focus_changed() {
+    display::damage(0, 0, W, CH);
     hide_text_pointer();
     reset_pointer();
     unsafe { focus_label(&mut (&mut (*FB).0)[..BAR_PIXELS]); }
@@ -319,7 +342,7 @@ static mut KEYBOARD: Option<Keyboard> = None;
 pub fn init() {
     let layout = core::alloc::Layout::new::<Frame>();
     unsafe {
-        FB = alloc::alloc::alloc_zeroed(layout).cast();
+        FB = alloc::alloc::alloc(layout).cast();
         if FB.is_null() { alloc::alloc::handle_alloc_error(layout); }
     }
     display::init();
@@ -508,7 +531,7 @@ struct StorageUsage {
 static mut STORAGE: Option<StorageUsage> = None;
 
 pub fn set_storage_usage(files: usize, used_bytes: usize, capacity_bytes: usize) {
-    // The disk and status sampler both run on the guest's single vCPU.
+    // The disk and status sampler both run on the primary CPU.
     unsafe {
         *addr_of_mut!(STORAGE) = Some(StorageUsage {
             files,
@@ -572,6 +595,7 @@ fn start_status() {
     draw_status(None);
 }
 pub fn sample() {
+    display::refresh();
     let u = unsafe { &mut *addr_of_mut!(USAGE) };
     let now = crate::monitor::cpu_counters();
     if now.ticks.wrapping_sub(u.start.ticks) < u.frequency {
@@ -583,6 +607,7 @@ pub fn sample() {
 }
 
 fn draw_status(cpu: Option<u64>) {
+    display::damage(0, 0, W, CH);
     let stack = crate::monitor::kernel_stack_usage().map_or_else(|| "--".into(), |(used, total)| {
         let used = memory_value(used);
         let total = memory_value(total);
@@ -831,6 +856,7 @@ fn pointer_focused() -> bool {
 }
 
 fn console_selection(event: u64) {
+    display::damage(0, CH, W, H);
     let down = event & (1 << 24) != 0;
     let inside = event & (1 << 25) != 0;
     unsafe {
@@ -881,7 +907,9 @@ fn present_rect(arena: &crate::user::UserArena, generation: u64) -> u64 {
     unsafe {
         let pixels = core::slice::from_raw_parts(address as *const u32, bytes / 4);
         let fb = &mut (*FB).0;
-        let start = BAR_PIXELS + ACTIVE * (pane_width() + CW) + 2 * (y * W + x);
+        let left = ACTIVE * (pane_width() + CW) + 2 * x;
+        display::damage(left, CH + 2 * y, 2 * w, 2 * h);
+        let start = BAR_PIXELS + 2 * y * W + left;
         for row in 0..h {
             let src = &pixels[row * stride..row * stride + w];
             let offset = start + 2 * row * W;
@@ -919,6 +947,7 @@ impl Canvas {
             original.try_reserve_exact(pane_width() * canvas_h() * 2).ok()?;
         }
         begin_canvas();
+        display::damage(0, CH, W, H);
         unsafe {
             let fb = &mut (*FB).0;
             let term = &mut TERMS[pane];
@@ -951,6 +980,7 @@ impl Canvas {
 }
 impl Drop for Canvas {
     fn drop(&mut self) {
+        display::damage(0, CH, W, H);
         crate::clipboard::cancel_paste();
         if unsafe { ACTIVE } == self.pane && pointer_focused() {
             hide_text_pointer();
@@ -991,6 +1021,7 @@ static mut TEXT_POINTER: Option<TextPointer> = None;
 static mut POINTER_OVERLAY: mouse_cursor::Overlay = mouse_cursor::Overlay::new();
 
 fn paint_pointer((x, y, text): TextPointer, show: bool) {
+    display::damage(x, y, 2 * mouse_cursor::WIDTH, 2 * mouse_cursor::HEIGHT);
     let fb = unsafe { &mut (*FB).0 };
     let right = x / (pane_width() + CW) * (pane_width() + CW) + pane_width();
     let bottom = CH + 2 * canvas_h();

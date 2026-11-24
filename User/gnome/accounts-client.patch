@@ -1,0 +1,310 @@
+--- a/meson.build
++++ b/meson.build
+@@ -54,6 +54,16 @@
+ 
+ # i18n
+ config_h.set_quoted('GETTEXT_PACKAGE', act_gettext)
++
++lixinos = cc.get_define('__lixinos__') != ''
++if lixinos
++  gio_dep = dependency('gio-2.0', version: '>= 2.64')
++  gio_unix_dep = dependency('gio-unix-2.0')
++  glib_dep = dependency('glib-2.0')
++  configure_file(output: 'config.h', configuration: config_h)
++  subdir('src')
++  subdir_done()
++endif
+ 
+ # headers
+ check_headers = [
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -47,6 +47,11 @@
+   link_with: libaccounts_generated,
+ )
+ 
++if lixinos
++  subdir('libaccountsservice')
++  subdir_done()
++endif
++
+ sources = files(
+   'daemon.c',
+   'extensions.c',
+--- a/src/libaccountsservice/meson.build
++++ b/src/libaccountsservice/meson.build
+@@ -29,18 +29,22 @@
+ )
+ 
+ deps = [
+-  crypt_dep,
+   gio_unix_dep,
+   glib_dep,
+   libaccounts_generated_dep,
+-  logind_dep,
+ ]
++
++if not lixinos
++  deps += [crypt_dep, logind_dep]
++endif
+ 
+ symbol_map = join_paths(meson.current_source_dir(), 'symbol.map')
+ ldflags = cc.get_supported_link_arguments('-Wl,--version-script,@0@'.format(symbol_map))
+ 
+-libaccountsservice = shared_library(
++libaccountsservice = build_target(
+   act_name,
++  target_type: lixinos ? 'static_library' : 'shared_library',
++  link_whole: lixinos ? [libaccounts_generated] : [],
+   sources: sources + enum_sources,
+   version: libversion,
+   include_directories: top_inc,
+@@ -73,7 +77,7 @@
+     'gio-2.0',
+     'glib-2.0',
+     'gobject-2.0',
+-    'polkit-gobject-1',
++    lixinos ? [] : ['polkit-gobject-1'],
+   ],
+ )
+ 
+--- a/src/libaccountsservice/act-user-manager.c
++++ b/src/libaccountsservice/act-user-manager.c
+@@ -40,7 +40,9 @@
+ #include <glib-object.h>
+ #include <gio/gio.h>
+ #include <gio/gunixinputstream.h>
++#ifndef __lixinos__
+ #include <systemd/sd-login.h>
++#endif
+ 
+ #include "act-user-manager.h"
+ #include "act-user-private.h"
+@@ -100,7 +102,9 @@
+         char                   *id;
+         char                   *session_id;
+         guint                   load_idle_id;
++#ifndef __lixinos__
+         sd_login_monitor       *session_monitor;
++#endif
+         GInputStream           *session_monitor_stream;
+         guint                   session_monitor_source_id;
+ } ActUserManagerSeat;
+@@ -209,7 +213,9 @@
+ static void     act_user_manager_finalize (GObject *object);
+ 
+ static gboolean ensure_accounts_proxy (ActUserManager *manager);
++#ifndef __lixinos__
+ static gboolean load_seat_incrementally (ActUserManager *manager);
++#endif
+ static void     unload_seat (ActUserManager *manager);
+ static void     load_users (ActUserManager *manager);
+ static void     load_user (ActUserManager *manager,
+@@ -299,6 +305,9 @@
+ session_is_login_window (ActUserManager *manager,
+                          const char     *session_id)
+ {
++#ifdef __lixinos__
++        return FALSE;
++#else
+         int res;
+         g_autofree gchar *session_class = NULL;
+ 
+@@ -311,12 +320,16 @@
+         }
+ 
+         return g_strcmp0 (session_class, "greeter") == 0;
++#endif
+ }
+ 
+ static gboolean
+ session_is_on_our_seat (ActUserManager *manager,
+                         const char     *session_id)
+ {
++#ifdef __lixinos__
++        return FALSE;
++#else
+         ActUserManagerPrivate *priv = act_user_manager_get_instance_private (manager);
+         int res;
+         g_autofree gchar *session_seat = NULL;
+@@ -332,6 +345,7 @@
+         }
+ 
+         return g_strcmp0 (priv->seat.id, session_seat) == 0;
++#endif
+ }
+ 
+ /**
+@@ -368,6 +382,9 @@
+ static gboolean
+ _can_activate_systemd_sessions (ActUserManager *manager)
+ {
++#ifdef __lixinos__
++        return FALSE;
++#else
+         ActUserManagerPrivate *priv = act_user_manager_get_instance_private (manager);
+         int res;
+ 
+@@ -379,6 +396,7 @@
+         }
+ 
+         return res > 0;
++#endif
+ }
+ 
+ /**
+@@ -515,13 +533,16 @@
+ static void
+ queue_load_seat_incrementally (ActUserManager *manager)
+ {
++#ifndef __lixinos__
+         ActUserManagerPrivate *priv = act_user_manager_get_instance_private (manager);
+ 
+         if (priv->seat.load_idle_id == 0) {
+                 priv->seat.load_idle_id = g_idle_add ((GSourceFunc) load_seat_incrementally, manager);
+         }
+-}
+-
++#endif
++}
++
++#ifndef __lixinos__
+ static gboolean
+ _systemd_session_is_graphical (const char *session_id)
+ {
+@@ -653,6 +674,8 @@
+         priv->seat.id = g_strdup (seat_id);
+         priv->seat.state++;
+ }
++
++#endif
+ 
+ static gint
+ match_name_cmpfunc (gconstpointer a,
+@@ -1126,6 +1149,7 @@
+         remove_user (manager, user);
+ }
+ 
++#ifndef __lixinos__
+ static void
+ get_current_session_id (ActUserManager *manager)
+ {
+@@ -1143,6 +1167,8 @@
+ 
+         queue_load_seat_incrementally (manager);
+ }
++
++#endif
+ 
+ static void
+ unload_new_session (ActUserManagerNewSession *new_session)
+@@ -1188,6 +1214,9 @@
+ static void
+ get_uid_for_new_session (ActUserManagerNewSession *new_session)
+ {
++#ifdef __lixinos__
++        unload_new_session (new_session);
++#else
+         uid_t uid;
+         int res;
+ 
+@@ -1205,6 +1234,7 @@
+         new_session->state++;
+ 
+         load_new_session_incrementally (new_session);
++#endif
+ }
+ 
+ static void
+@@ -1368,6 +1398,9 @@
+ static void
+ get_x11_display_for_new_session (ActUserManagerNewSession *new_session)
+ {
++#ifdef __lixinos__
++        unload_new_session (new_session);
++#else
+         g_autofree gchar *session_type = NULL;
+         g_autofree gchar *x11_display = NULL;
+         int res;
+@@ -1409,6 +1442,7 @@
+         new_session->state++;
+ 
+         load_new_session_incrementally (new_session);
++#endif
+ }
+ 
+ static void
+@@ -1618,6 +1652,7 @@
+         g_slist_free (sessions_to_remove);
+ }
+ 
++#ifndef __lixinos__
+ static void
+ reload_systemd_sessions (ActUserManager *manager)
+ {
+@@ -1721,6 +1756,8 @@
+         _monitor_for_systemd_session_changes (manager);
+         priv->seat.state++;
+ }
++
++#endif
+ 
+ static void
+ unload_seat (ActUserManager *manager)
+@@ -2210,12 +2247,15 @@
+         return retval;
+ }
+ 
++#ifndef __lixinos__
+ static void
+ load_sessions (ActUserManager *manager)
+ {
+         reload_systemd_sessions (manager);
+         maybe_set_is_loaded (manager);
+ }
++
++#endif
+ 
+ static void
+ load_users (ActUserManager *manager)
+@@ -2250,6 +2290,7 @@
+         priv->list_cached_users_done = TRUE;
+ }
+ 
++#ifndef __lixinos__
+ static gboolean
+ load_seat_incrementally (ActUserManager *manager)
+ {
+@@ -2283,13 +2324,20 @@
+         return FALSE;
+ }
+ 
++#endif
++
+ static gboolean
+ load_idle (ActUserManager *manager)
+ {
+         ActUserManagerPrivate *priv = act_user_manager_get_instance_private (manager);
+ 
++#ifdef __lixinos__
++        load_users (manager);
++        maybe_set_is_loaded (manager);
++#else
+         priv->seat.state = ACT_USER_MANAGER_SEAT_STATE_UNLOADED + 1;
+         load_seat_incrementally (manager);
++#endif
+         priv->load_id = 0;
+ 
+         return FALSE;
+@@ -2670,9 +2718,11 @@
+                 g_source_remove (priv->seat.load_idle_id);
+         }
+ 
++#ifndef __lixinos__
+         if (priv->seat.session_monitor != NULL) {
+                 sd_login_monitor_unref (priv->seat.session_monitor);
+         }
++#endif
+ 
+         if (priv->seat.session_monitor_stream != NULL) {
+                 g_object_unref (priv->seat.session_monitor_stream);

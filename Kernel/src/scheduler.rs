@@ -1,4 +1,4 @@
-//! Time-sliced continuations on one vCPU. Input focus is independent of execution.
+//! Kernel continuations run on CPU 0. CPU 1 runs independent EL0 quanta. Input focus is independent of execution.
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -9,6 +9,14 @@ use core::{
 
 global_asm!(include_str!("scheduler.S"));
 unsafe extern "C" {
+    fn smp_init(gic3: i32);
+    pub(crate) fn smp_cpus() -> u32;
+    pub(crate) fn smp_busy_ticks() -> u64;
+    fn smp_submit(frame: *mut u8, root: usize) -> i32;
+    fn smp_current_root() -> usize;
+    fn smp_finished() -> i32;
+    fn smp_collect() -> u64;
+    fn smp_revoke_clock();
     fn swap_stack(save: *mut usize, resume: usize, fresh_top: usize);
 }
 pub const CAPACITY: usize = 16;
@@ -18,6 +26,7 @@ type Entry = Box<dyn FnOnce() -> ExitStatus>;
 #[derive(Clone, Copy, PartialEq)]
 enum State {
     Free,
+    Remote,
     Ready,
     Waiting(usize),
     Foreground(usize, u64),
@@ -128,6 +137,7 @@ pub(crate) fn process_list() -> alloc::string::String {
         let task = task(slot);
         let state = match task.state {
             State::Free => continue,
+            State::Remote => "running",
             State::Ready if slot == active() => "running",
             State::Ready => "ready",
             State::Waiting(_) | State::Foreground(_, _) | State::Channel(_) => "waiting",
@@ -149,12 +159,12 @@ pub fn set_task_name(path: &str) {
 // ABI 29/9: wall ticks, idle ticks, RAM bytes; each row has six u64s and a 32-byte name.
 pub fn resource_snapshot(out: &mut [u64]) -> usize {
     let now = crate::monitor::cpu_counters();
-    out[..3].copy_from_slice(&[now.ticks,now.idle_ticks,crate::inspect::ram_size().unwrap_or(0) as u64]);
+    out[..3].copy_from_slice(&[now.ticks,now.normalized_idle(),crate::inspect::ram_size().unwrap_or(0) as u64]);
     let mut n=3;
     for id in 0..CAPACITY {
         let t=task(id);
         let state=match t.state {
-            State::Free=>continue, State::Ready if id==active()=>1, State::Ready=>2,
+            State::Free=>continue, State::Remote=>1, State::Ready if id==active()=>1, State::Ready=>2,
             State::Sleeping(_)=>3, State::Exited(_)=>5, _=>4,
         };
         let mut cpu=t.ticks.saturating_sub(t.idle);
@@ -245,7 +255,7 @@ pub fn init() {
             write_volatile(0x0801_0004 as *mut u32, 255);
             write_volatile(0x0801_0000 as *mut u32, 1);
         } else {
-            // QEMU virt GICv3, single redistributor. Virtual timer is PPI 27.
+            // QEMU virt GICv3 redistributor for CPU 0. Virtual timer is PPI 27.
             let waker = 0x080a_0014 as *mut u32;
             write_volatile(waker, read_volatile(waker) & !2);
             while read_volatile(waker) & 4 != 0 {
@@ -260,6 +270,7 @@ pub fn init() {
             asm!("dsb sy", "mrs x9, ICC_SRE_EL1", "orr x9,x9,#1", "msr ICC_SRE_EL1,x9", "isb",
              "mov x9,#255", "msr ICC_PMR_EL1,x9","mov x9,#1","msr ICC_IGRPEN1_EL1,x9","isb",out("x9") _);
         }
+        smp_init(GIC3 as i32);
         rearm();
         asm!("mov x9,#1","msr cntv_ctl_el0,x9","isb",out("x9") _);
     }
@@ -273,7 +284,7 @@ fn rearm() {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn task_timer_irq() {
+extern "C" fn smp_primary_tick(frame: *mut u8) {
     let id: u64;
     unsafe {
         if GIC3 {
@@ -300,6 +311,12 @@ extern "C" fn task_timer_irq() {
     if id == 27 {
         #[cfg(feature = "retina")]
         crate::graphics::poll_window();
+        unsafe {
+            if !(&*addr_of_mut!(READY)).is_empty() && smp_submit(frame, smp_current_root()) != 0 {
+                while smp_finished() == 0 { block(State::Remote); }
+                task(active()).ticks += smp_collect();
+            }
+        }
         checkpoint();
         #[cfg(feature = "retina")]
         crate::graphics::sample();
@@ -349,6 +366,7 @@ pub fn stopped() -> u8 { task(active()).stop }
 
 fn stop_tree(slot: usize, status: u8) {
     if matches!(task(slot).state, State::Free | State::Exited(_)) { return; }
+    if task(slot).state == State::Remote { unsafe { smp_revoke_clock(); } }
     task(slot).stop = status;
     let waiters = unsafe { &mut *addr_of_mut!(WAITERS) };
     if let Some(i) = waiters.iter().position(|&id| id == slot) {
@@ -470,6 +488,7 @@ pub fn schedule() {
     }
     let new = loop {
         let now = crate::monitor::ticks();
+        if unsafe { smp_finished() != 0 } { notify(|s| s == State::Remote); }
         notify(|s| matches!(s,State::Sleeping(deadline) | State::Foreground(_, deadline) if deadline<=now));
         if let Some(next) = unsafe { (&mut *addr_of_mut!(READY)).pop_front() } {
             if next == old {

@@ -1,0 +1,18 @@
+--- a/cordis.patch.yml
++++ b/cordis.patch.yml
+@@ -201,6 +201,7 @@
+ 
+     - id: otel
+       name: '@deepseek-ai/dsh-otel'
++      disabled: !!js typeof Intl === 'undefined'
+ 
+     # OTel releases a Session-log prefix only after explicit user feedback,
+     # regardless of model provider. Ordinary activity never triggers capture.
+@@ -217,6 +218,7 @@
+     # Every CLI exit path drains by disposing the root on SIGINT/SIGTERM.
+     - id: session-telemetry-otel
+       name: '@deepseek-ai/dsh-session-telemetry-otel'
++      disabled: !!js typeof Intl === 'undefined'
+       config:
+         mode: !!js process.env.DSH_TELEMETRY_MODE || 'FEEDBACK_ONLY'
+         shutdownTimeoutMillis: 3000

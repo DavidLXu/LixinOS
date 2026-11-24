@@ -11,7 +11,7 @@ src="$work/Python-3.14.5"
 musl="$work/musl-1.2.5"
 sysroot="$work/sysroot"
 cache=$(dirname "$work")
-build_key=$(cat "$cache/links-port/anchors.h" "$port/../links/tls.c" "$port"/*.c "$port"/*.h "$port"/*.S "$port"/*.py "$port"/*.ld "$port"/build.sh "$port"/../{console.h,tcc/api.c,tcc/lixin.h,file-time.h,ls/link.ld} | shasum -a 256)
+build_key=$(cat "$cache/links-port/anchors.h" "$port/../links/tls.c" "$port"/*.c "$port"/*.h "$port"/*.S "$port"/*.py "$port"/*.ld "$port"/build.sh "$port"/../{console.h,tcc/api.c,tcc/lixin.h,file-time.h,ls/link.ld} "$port/../../Kernel/native/ipc.h" | shasum -a 256)
 if [[ -s cpython.pkg && -f complete && $(cat complete) == "$build_key" && -s package/bin/python3 ]]; then exit 0; fi
 
 unpack() {

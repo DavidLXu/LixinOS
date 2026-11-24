@@ -1,0 +1,160 @@
+--- a/src/event-loop.c
++++ b/src/event-loop.c
+@@ -731,7 +731,8 @@
+ 	sigemptyset(&mask);
+ 	sigaddset(&mask, signal_number);
+ 	source->base.fd = signalfd(-1, &mask, SFD_CLOEXEC | SFD_NONBLOCK);
+-	sigprocmask(SIG_BLOCK, &mask, NULL);
++	if (source->base.fd >= 0)
++		sigprocmask(SIG_BLOCK, &mask, NULL);
+ 
+ 	source->func = func;
+ 
+@@ -1087,7 +1088,22 @@
+ WL_EXPORT int
+ wl_event_loop_get_fd(struct wl_event_loop *loop)
+ {
+-	return loop->epoll_fd;
++	/* This port dispatches directly through poll. */
++	errno = ENOTSUP;
++	return -1;
++}
++
++WL_EXPORT int
++lx_wayland_event_loop_pollfds(struct wl_event_loop *loop, struct pollfd *fds,
++                              unsigned capacity, int *timeout_ms)
++{
++	if (!loop || !timeout_ms) {
++		errno = EINVAL;
++		return -1;
++	}
++	if (!wl_list_empty(&loop->idle_list))
++		*timeout_ms = 0;
++	return lx_wayland_poll_prepare(loop->epoll_fd, fds, capacity, timeout_ms);
+ }
+ 
+ /** Register a destroy listener for an event loop context
+--- a/src/wayland-server.c
++++ b/src/wayland-server.c
+@@ -39,7 +39,6 @@
+ #include <dlfcn.h>
+ #include <sys/time.h>
+ #include <fcntl.h>
+-#include <sys/eventfd.h>
+ #include <sys/file.h>
+ #include <sys/stat.h>
+ 
+@@ -109,7 +108,7 @@
+ 	wl_display_global_filter_func_t global_filter;
+ 	void *global_filter_data;
+ 
+-	int terminate_efd;
++	int terminate_pipe[2];
+ 	struct wl_event_source *term_source;
+ 
+ 	size_t max_buffer_size;
+@@ -1206,12 +1205,11 @@
+ 		return NULL;
+ 	}
+ 
+-	display->terminate_efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+-	if (display->terminate_efd < 0)
+-		goto err_eventfd;
++	if (pipe2(display->terminate_pipe, O_CLOEXEC | O_NONBLOCK) < 0)
++		goto err_pipe;
+ 
+ 	display->term_source = wl_event_loop_add_fd(display->loop,
+-						    display->terminate_efd,
++						    display->terminate_pipe[0],
+ 						    WL_EVENT_READABLE,
+ 						    handle_display_terminate,
+ 						    NULL);
+@@ -1240,8 +1238,9 @@
+ 	return display;
+ 
+ err_term_source:
+-	close(display->terminate_efd);
+-err_eventfd:
++	close(display->terminate_pipe[0]);
++	close(display->terminate_pipe[1]);
++err_pipe:
+ 	wl_event_loop_destroy(display->loop);
+ 	free(display);
+ 	return NULL;
+@@ -1252,8 +1251,10 @@
+ {
+ 	if (s->source)
+ 		wl_event_source_remove(s->source);
++#ifndef __lixinos__
+ 	if (s->addr.sun_path[0])
+ 		unlink(s->addr.sun_path);
++#endif
+ 	if (s->fd >= 0)
+ 		close(s->fd);
+ 	if (s->lock_addr[0])
+@@ -1304,7 +1305,8 @@
+ 		wl_socket_destroy(s);
+ 	}
+ 
+-	close(display->terminate_efd);
++	close(display->terminate_pipe[0]);
++	close(display->terminate_pipe[1]);
+ 	wl_event_source_remove(display->term_source);
+ 
+ 	wl_event_loop_destroy(display->loop);
+@@ -1569,7 +1571,7 @@
+ 
+ 	display->run = false;
+ 
+-	ret = write(display->terminate_efd, &terminate, sizeof(terminate));
++	ret = write(display->terminate_pipe[1], &terminate, sizeof(terminate));
+ 	if (ret < 0 && errno != EAGAIN)
+ 		wl_abort("Write failed at shutdown\n");
+ }
+@@ -1699,6 +1701,13 @@
+ {
+ 	struct stat socket_stat;
+ 
++#ifdef __lixinos__
++	/* Kernel socket names are exclusive and create no filesystem node. */
++	if (lstat(socket->addr.sun_path, &socket_stat) < 0)
++		return errno == ENOENT ? 0 : -1;
++	errno = EADDRINUSE;
++	return -1;
++#else
+ 	snprintf(socket->lock_addr, sizeof socket->lock_addr,
+ 		 "%s%s", socket->addr.sun_path, LOCK_SUFFIX);
+ 
+@@ -1741,6 +1750,7 @@
+ 	*socket->addr.sun_path = 0;
+ 
+ 	return -1;
++#endif
+ }
+ 
+ static int
+@@ -1843,6 +1853,13 @@
+ 			continue;
+ 
+ 		if (_wl_display_add_socket(display, s) < 0) {
++#ifdef __lixinos__
++			if (errno == EADDRINUSE && s->fd >= 0) {
++				close(s->fd);
++				s->fd = -1;
++				continue;
++			}
++#endif
+ 			wl_socket_destroy(s);
+ 			return NULL;
+ 		}
+--- a/src/wayland-os.c
++++ b/src/wayland-os.c
+@@ -25,7 +25,7 @@
+ 
+ #define _GNU_SOURCE
+ 
+-#include "../config.h"
++#include "config.h"
+ 
+ #include <sys/types.h>
+ #include <sys/socket.h>

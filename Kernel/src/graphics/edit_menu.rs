@@ -29,6 +29,7 @@ pub(super) fn active() -> bool {
 pub(super) fn hide() -> bool {
     let Some(menu) = (unsafe { (*addr_of_mut!(MENU)).as_mut() }) else { return false; };
     if !menu.drawn { return false; }
+    display::damage(menu.x, menu.y, WIDTH, HEIGHT);
     let fb = unsafe { &mut (*FB).0 };
     for (row, saved) in unsafe { &*addr_of!(UNDERLAY) }.chunks_exact(WIDTH).enumerate() {
         let start = (menu.y + row) * W + menu.x;
@@ -41,6 +42,7 @@ pub(super) fn hide() -> bool {
 pub(super) fn show() {
     let Some(menu) = (unsafe { (*addr_of_mut!(MENU)).as_mut() }) else { return; };
     if menu.drawn { return; }
+    display::damage(menu.x, menu.y, WIDTH, HEIGHT);
     let fb = unsafe { &mut (*FB).0 };
     let start = menu.y * W + menu.x;
     for (row, saved) in unsafe { &mut *addr_of_mut!(UNDERLAY) }.chunks_exact_mut(WIDTH).enumerate() {

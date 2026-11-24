@@ -140,7 +140,7 @@ impl Trace {
         let mut line = serde_json_wasm::to_vec(&record).map_err(|_| "could not encode trace event")?;
         line.push(b'\n');
         let mut bytes = if self.path.is_some() {
-            volume.files.get(&path).and_then(Option::as_ref).ok_or("trace file was removed")?.clone()
+            volume.files.get(&path).and_then(Option::as_ref).ok_or("trace file was removed")?.to_vec()
         } else {
             alloc::vec::Vec::new()
         };

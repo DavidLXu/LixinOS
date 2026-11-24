@@ -12,6 +12,8 @@ ROOT = HERE.parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 from disk_image import disk_entries, edit_files
 
+FILES = ("board.h", "solver.h", "learn.h", "learn-panel.h", "game.c", "LICENSE")
+
 def build(source, release):
     serial = runpy.run_path(str(ROOT / "scripts/test-user.py"))
     package = ROOT / "Kernel/target/user-build/2048-package"
@@ -22,7 +24,7 @@ def build(source, release):
 
         def stage(rows):
             rows[b"/lib/2048"] = (bytes(8), None)
-            for name in ("board.h", "game.c", "LICENSE"):
+            for name in FILES:
                 rows[f"/lib/2048/{name}".encode()] = (bytes(8), (HERE/name).read_bytes())
 
         edit_files(disk, stage)
@@ -42,7 +44,7 @@ def build(source, release):
         if not executable.startswith(b"LXE1"):
             raise ValueError("Expected a guest-built LXE1 executable")
         library.mkdir(parents=True, exist_ok=True)
-        for name in ("game.c", "board.h", "LICENSE"):
+        for name in FILES:
             shutil.copyfile(HERE/name, library/name)
         (package/"bin").mkdir(exist_ok=True)
         (package/"bin/2048.win3").write_bytes(executable)

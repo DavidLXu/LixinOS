@@ -1,0 +1,11 @@
+--- a/libgeoclue/meson.build
++++ b/libgeoclue/meson.build
+@@ -77,7 +77,7 @@
+                 libgeoclue_headers,
+                 libgeoclue_public_api_gen_sources[1] ]
+ 
+-if gir.found()
++if get_option('introspection') and gir.found()
+   geo_gir = gnome.generate_gir(libgeoclue,
+                                sources: gir_sources,
+                                namespace: 'Geoclue',

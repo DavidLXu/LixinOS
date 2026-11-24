@@ -1,0 +1,22 @@
+--- a/gck/meson.build
++++ b/gck/meson.build
+@@ -82,7 +82,7 @@
+   '-Wl,--version-script,@0@'.format(gck_symbolmap),
+ )
+ 
+-gck_lib = shared_library(gck_basename,
++gck_lib = library(gck_basename,
+   gck_sources,
+   dependencies: gck_deps,
+   c_args: gck_cflags,
+--- a/gcr/meson.build
++++ b/gcr/meson.build
+@@ -164,7 +164,7 @@
+   '-Wl,--version-script,@0@'.format(gcr_symbolmap),
+ )
+ 
+-gcr_lib = shared_library(gcr_basename,
++gcr_lib = library(gcr_basename,
+   gcr_sources,
+   dependencies: gcr_deps,
+   c_args: gcr_cflags,

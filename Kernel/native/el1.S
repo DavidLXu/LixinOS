@@ -21,7 +21,7 @@
 enable_mmu:
     MSR(TTBR0,0)
     MSR(VBAR,1)
-    mov x9,#0xbb // Normal write-through RAM supports exclusive accesses.
+    mov x9,#0xff // Normal write-back RAM supports exclusive accesses.
     MSR(MAIR,9)
     mov x9,#0x803019
     lsl x2,x2,#32
@@ -33,7 +33,7 @@ enable_mmu:
     dsb sy
     isb
     MRS(9,SCTLR)
-    mov x10,#5 // MMU and data cache
+    mov x10,#0x1005 // MMU, data cache, and instruction cache
     orr x9,x9,x10
     MSR(SCTLR,9)
     isb
@@ -83,7 +83,7 @@ native_vectors:
 .endr
     b user_sync
     .balign 128
-    b native_irq
+    b smp_primary_vector
     .balign 128
 .rept 6
     b fatal_vector
@@ -198,73 +198,13 @@ clock_hz:
     MRS(0,SYSREG(3,3,14,0,0)) // cntfrq_el0
     ret
 
-// Interrupts may arrive between any two user instructions. C preserves
-// the AAPCS callee-saved integers. Save every other register here.
-native_irq:
-    stp x0,x1,[sp,#-16]!
-    stp x2,x3,[sp,#-16]!
-    stp x4,x5,[sp,#-16]!
-    stp x6,x7,[sp,#-16]!
-    stp x8,x9,[sp,#-16]!
-    stp x10,x11,[sp,#-16]!
-    stp x12,x13,[sp,#-16]!
-    stp x14,x15,[sp,#-16]!
-    stp x16,x17,[sp,#-16]!
-    stp x18,x30,[sp,#-16]!
-    PUSHQ(0,1)
-    PUSHQ(2,3)
-    PUSHQ(4,5)
-    PUSHQ(6,7)
-    PUSHQ(8,9)
-    PUSHQ(10,11)
-    PUSHQ(12,13)
-    PUSHQ(14,15)
-    PUSHQ(16,17)
-    PUSHQ(18,19)
-    PUSHQ(20,21)
-    PUSHQ(22,23)
-    PUSHQ(24,25)
-    PUSHQ(26,27)
-    PUSHQ(28,29)
-    PUSHQ(30,31)
-    bl timer_interrupt
-    bl agent_test_expired
-    .long 0xf100001f // cmp x0,#0
-    bne test_timeout
-    POPQ(30,31)
-    POPQ(28,29)
-    POPQ(26,27)
-    POPQ(24,25)
-    POPQ(22,23)
-    POPQ(20,21)
-    POPQ(18,19)
-    POPQ(16,17)
-    POPQ(14,15)
-    POPQ(12,13)
-    POPQ(10,11)
-    POPQ(8,9)
-    POPQ(6,7)
-    POPQ(4,5)
-    POPQ(2,3)
-    POPQ(0,1)
-    ldp x18,x30,[sp],#16
-    ldp x16,x17,[sp],#16
-    ldp x14,x15,[sp],#16
-    ldp x12,x13,[sp],#16
-    ldp x10,x11,[sp],#16
-    ldp x8,x9,[sp],#16
-    ldp x6,x7,[sp],#16
-    ldp x4,x5,[sp],#16
-    ldp x2,x3,[sp],#16
-    ldp x0,x1,[sp],#16
-    ERET
-
-test_timeout:
-    // Drop the interrupted EL0 integer and SIMD register frames.
-    add sp,sp,#672
+.global smp_check_stop
+smp_check_stop:
+    b agent_test_expired
+.global smp_abort_user
+smp_abort_user:
     stp x9,x30,[sp,#-16]!
     b finish_user
-
 .global swap_task
 swap_task:
     stp x19,x20,[sp,#-16]!

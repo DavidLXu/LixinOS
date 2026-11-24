@@ -1,0 +1,59 @@
+--- a/libupower-glib/meson.build
++++ b/libupower-glib/meson.build
+@@ -37,7 +37,7 @@
+     subdir: 'libupower-glib'
+ )
+ 
+-libupower_glib = shared_library('upower-glib',
++libupower_glib = library('upower-glib',
+     sources: libupower_glib_headers + libupower_glib_sources,
+     dependencies: [ gobject_dep, gio_dep, upowerd_dbus_dep ],
+     include_directories: [ '..' ],
+--- a/libupower-glib/meson.build
++++ b/libupower-glib/meson.build
+@@ -39,8 +39,9 @@
+ 
+ libupower_glib = library('upower-glib',
+     sources: libupower_glib_headers + libupower_glib_sources,
+-    dependencies: [ gobject_dep, gio_dep, upowerd_dbus_dep ],
+-    include_directories: [ '..' ],
++    dependencies: [ gobject_dep, gio_dep, gio_unix_dep ],
++    link_whole: upowerd_dbus,
++    include_directories: [ '..', '../dbus' ],
+     c_args: [
+         '-DUP_COMPILATION',
+         '-DG_LOG_DOMAIN="libupower-glib"',
+--- a/meson.build
++++ b/meson.build
+@@ -130,16 +130,21 @@
+ # Generate configuration file
+ config_h = configure_file(output: 'config.h', configuration: cdata)
+ 
+-subdir('etc')
+-subdir('rules')
+-subdir('po')
+-subdir('dbus')
+-subdir('libupower-glib')
+-subdir('src')
+-subdir('tools')
+-subdir('doc')
+-subdir('data/zsh-completion')
+-subdir('policy')
++if cc.get_define('__lixinos__') != ''
++  subdir('dbus')
++  subdir('libupower-glib')
++else
++  subdir('etc')
++  subdir('rules')
++  subdir('po')
++  subdir('dbus')
++  subdir('libupower-glib')
++  subdir('src')
++  subdir('tools')
++  subdir('doc')
++  subdir('data/zsh-completion')
++  subdir('policy')
++endif
+ 
+ pkgconfig = import('pkgconfig')
+ pkgconfig.generate(

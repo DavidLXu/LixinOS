@@ -1,0 +1,86 @@
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -1297,10 +1297,12 @@
+   ],
+ )
+ 
++mutter_main_sources = files('core/mutter.c')
++if lixinos
++  mutter_main_sources += files('compositor/plugins/default.c')
++endif
+ mutter = executable('mutter',
+-  sources: [
+-    files('core/mutter.c'),
+-  ],
++  sources: mutter_main_sources,
+   include_directories: mutter_includes,
+   c_args: [
+     mutter_c_args,
+@@ -1372,7 +1374,9 @@
+   install_dir: pcdir,
+ )
+ 
+-subdir('compositor/plugins')
++if not lixinos
++  subdir('compositor/plugins')
++endif
+ if have_x11_client
+   subdir('frames')
+ endif
+--- a/src/compositor/plugins/default.c
++++ b/src/compositor/plugins/default.c
+@@ -119,8 +119,13 @@
+   ClutterActor          *background_group;
+ };
+ 
++#ifdef __lixinos__
++GType meta_default_plugin_get_type (void);
++G_DEFINE_TYPE_WITH_PRIVATE (MetaDefaultPlugin, meta_default_plugin, META_TYPE_PLUGIN)
++#else
+ META_PLUGIN_DECLARE_WITH_CODE (MetaDefaultPlugin, meta_default_plugin,
+                                G_ADD_PRIVATE_DYNAMIC (MetaDefaultPlugin));
++#endif
+ 
+ /*
+  * Per actor private data we attach to each actor.
+--- a/src/core/mutter.c
++++ b/src/core/mutter.c
+@@ -64,7 +64,11 @@
+     }
+ }
+ 
++#ifdef __lixinos__
++GType meta_default_plugin_get_type (void);
++#else
+ static const char *plugin = "libdefault";
++#endif
+ static char **argv_ignored = NULL;
+ 
+ GOptionEntry mutter_options[] = {
+@@ -74,12 +78,14 @@
+     N_("Print version"),
+     NULL
+   },
++#ifndef __lixinos__
+   {
+     "mutter-plugin", 0, 0, G_OPTION_ARG_STRING,
+     &plugin,
+     N_("Mutter plugin to use"),
+     "PLUGIN",
+   },
++#endif
+   {
+     G_OPTION_REMAINING,
+     .arg = G_OPTION_ARG_STRING_ARRAY,
+@@ -135,7 +141,11 @@
+       return EXIT_FAILURE;
+     }
+ 
++#ifdef __lixinos__
++  meta_context_set_plugin_gtype (context, meta_default_plugin_get_type ());
++#else
+   meta_context_set_plugin_name (context, plugin);
++#endif
+ 
+   init_signal_handlers (context);
+ 

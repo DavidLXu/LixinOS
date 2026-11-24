@@ -54,7 +54,7 @@ pub fn run(
         let expected = borrowed
             .files
             .get(&path)
-            .map(|v| v.clone().ok_or("is a directory"))
+            .map(|v| v.as_ref().map(disk::FileData::to_vec).ok_or("is a directory"))
             .transpose()?;
         let bytes = expected.as_deref().unwrap_or_default();
         if bytes.len() > EDITOR_LIMIT { return Err("file too large for editor"); }
@@ -88,7 +88,7 @@ pub fn run(
         file.as_ref().map_or("", |f| f.path.as_str())
     );
     let source = alloc::format!("{length}");
-    let native = volume.borrow().files.get(&alloc::format!("/libexec/{name}")).cloned().flatten();
+    let native = volume.borrow().files.get(&alloc::format!("/libexec/{name}")).and_then(Option::as_ref).map(disk::FileData::to_vec);
     let slot = SLOTS[user::bank()].0.get();
     unsafe {
         *slot = Some(Context {
@@ -218,7 +218,7 @@ pub fn io(value: u64, op: u64) -> u64 {
         return 1;
     }
     let mut volume = ctx.volume.borrow_mut();
-    if volume.files.get(&grant.path).map(Option::as_ref) != grant.expected.as_ref().map(Some) {
+    if volume.files.get(&grant.path).map(Option::as_deref) != grant.expected.as_deref().map(Some) {
         return 2;
     }
     let bytes =

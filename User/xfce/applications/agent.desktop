@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=LixinOS Agent
+Exec=/bin/agent.win3
+TryExec=/bin/agent.win3

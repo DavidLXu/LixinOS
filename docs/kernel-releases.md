@@ -27,6 +27,10 @@ Rust 和 TCC 都会用该标签的 ELF 启动。启动器校验并按需缓存�
 `data/shared.img` 和项目自带的磁盘。TCC 的发布模式直接加载发布的 ELF，盘内
 `/boot/kernel.elf` 仍供自举模式使用。
 
+双核版本默认启动两个 vCPU。Rust 和 TCC 都由 CPU 0 处理设备及文件、网络等系统调用。有多个可运行进程时，CPU 1 可以同时执行另一个进程的用户态代码。普通用户进程在 CPU 1 查询单调时钟时会就地读 ARM 虚拟计数器，并继续使用当前时间片。其他系统调用、异常和时间片到期仍会交回进程。受限进程沿用 CPU 0 的权限和超时检查。单线程程序要利用第二核，可以启动独立的工作进程。用 `cpuinfo` 查看已上线的核心数，`cat /proc/stat` 可查看 `cpu0` 和 `cpu1` 的累计时间。
+
+要用同一内核与单核对照，可以运行 `LIXINOS_CPUS=1 ./scripts/run-kernel.sh --kernel rust --release latest --serial`，或把 `rust` 换成 `tcc`。
+
 尚未设置工作盘时，如果 macOS 把共享盘移到了 iCloud，图形选择器会列出可用的本地桌面盘名称。
 点击「启动本地桌面盘」后，本次使用该盘自己的文件和历史。要继续使用共享盘，
 请在 Finder 中对 `data/shared.img` 选择「立即下载」，等下载完成后重新启动。

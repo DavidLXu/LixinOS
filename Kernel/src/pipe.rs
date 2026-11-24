@@ -26,29 +26,28 @@ impl Reader {
         (self.read_into(&mut data) > 0).then_some(data[0])
     }
     pub fn read_into(&self, data: &mut [u8]) -> usize {
-        if data.is_empty() {
-            return 0;
-        }
         let channel = Rc::as_ptr(&self.0) as usize;
         loop {
-            let mut buf = self.0.borrow_mut();
-            let n = data.len().min(buf.bytes.len());
-            if n != 0 {
-                let full = buf.bytes.len() == 4096;
-                for (dst, b) in data.iter_mut().zip(buf.bytes.drain(..n)) {
-                    *dst = b;
-                }
-                if full {
-                    crate::scheduler::wake(channel);
-                }
+            if let Some(n) = self.try_read(data) {
                 return n;
             }
-            if !buf.writer || crate::scheduler::stopped() != 0 {
+            if crate::scheduler::stopped() != 0 {
                 return 0;
             }
-            drop(buf);
             crate::scheduler::park(channel);
         }
+    }
+    pub fn try_read(&self, data: &mut [u8]) -> Option<usize> {
+        if data.is_empty() { return Some(0); }
+        let mut buf = self.0.borrow_mut();
+        let n = data.len().min(buf.bytes.len());
+        if n == 0 && buf.writer { return None; }
+        let full = buf.bytes.len() == 4096;
+        for (dst, b) in data.iter_mut().zip(buf.bytes.drain(..n)) {
+            *dst = b;
+        }
+        if full { crate::scheduler::wake(Rc::as_ptr(&self.0) as usize); }
+        Some(n)
     }
 }
 impl Writer {
@@ -65,22 +64,24 @@ impl Writer {
         }
         let channel = Rc::as_ptr(&self.0) as usize;
         loop {
-            let mut buf = self.0.borrow_mut();
-            if !buf.reader || crate::scheduler::stopped() != 0 {
-                return None;
+            if crate::scheduler::stopped() != 0 { return None; }
+            match self.try_write(data) {
+                Err(()) => return None,
+                Ok(Some(n)) => return Some(n),
+                Ok(None) => crate::scheduler::park(channel),
             }
-            let n = data.len().min(4096 - buf.bytes.len());
-            if n != 0 {
-                let empty = buf.bytes.is_empty();
-                buf.bytes.extend(&data[..n]);
-                if empty {
-                    crate::scheduler::wake(channel);
-                }
-                return Some(n);
-            }
-            drop(buf);
-            crate::scheduler::park(channel);
         }
+    }
+    pub fn try_write(&self, data: &[u8]) -> Result<Option<usize>, ()> {
+        if data.is_empty() { return Ok(Some(0)); }
+        let mut buf = self.0.borrow_mut();
+        if !buf.reader { return Err(()); }
+        let n = data.len().min(4096 - buf.bytes.len());
+        if n == 0 { return Ok(None); }
+        let empty = buf.bytes.is_empty();
+        buf.bytes.extend(&data[..n]);
+        if empty { crate::scheduler::wake(Rc::as_ptr(&self.0) as usize); }
+        Ok(Some(n))
     }
 }
 impl Drop for Reader {

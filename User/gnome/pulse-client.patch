@@ -1,0 +1,65 @@
+--- a/meson.build
++++ b/meson.build
+@@ -612,7 +612,7 @@
+   cdata.set('HAVE_GLIB20', 1) # to match the AM_CONDITIONAL for CMake file generation
+ endif
+ 
+-sndfile_dep = dependency('sndfile', version : '>= 1.0.20')
++sndfile_dep = dependency('sndfile', version : '>= 1.0.20', required : get_option('daemon'))
+ 
+ libsystemd_dep = dependency('libsystemd', required : get_option('systemd'))
+ if libsystemd_dep.found()
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -65,8 +65,11 @@
+   'pulsecore/time-smoother_2.c',
+   'pulsecore/tokenizer.c',
+   'pulsecore/usergroup.c',
+-  'pulsecore/sndfile-util.c',
+-]
++  ]
++
++if sndfile_dep.found()
++  libpulsecommon_sources += ['pulsecore/sndfile-util.c']
++endif
+ 
+ libpulsecommon_headers = [
+   'pulse/client-conf.h',
+@@ -198,7 +201,7 @@
+   libpulse_dep = dependency('libpulse', required : true)
+   libpulse_simple_dep = dependency('libpulse-simple', required : true)
+ else
+-  libpulsecommon = shared_library('pulsecommon-' + pa_version_major_minor,
++  libpulsecommon = library('pulsecommon-' + pa_version_major_minor,
+     libpulsecommon_sources,
+     libpulsecommon_headers,
+     include_directories : [configinc, topinc],
+--- a/src/pulse/meson.build
++++ b/src/pulse/meson.build
+@@ -80,7 +80,7 @@
+   versioning_link_args = []
+ endif
+ 
+-libpulse = shared_library('pulse',
++libpulse = library('pulse',
+   libpulse_sources,
+   libpulse_headers,
+   version : libpulse_version,
+@@ -101,7 +101,7 @@
+   subdir : 'pulse'
+ )
+ 
+-libpulse_simple = shared_library('pulse-simple',
++libpulse_simple = library('pulse-simple',
+   'simple.c',
+   'simple.h',
+   version : libpulse_simple_version,
+@@ -116,7 +116,7 @@
+ libpulse_simple_dep = declare_dependency(link_with: libpulse_simple)
+ 
+ if glib_dep.found()
+-  libpulse_mainloop_glib = shared_library('pulse-mainloop-glib',
++  libpulse_mainloop_glib = library('pulse-mainloop-glib',
+     'glib-mainloop.c',
+     'glib-mainloop.h',
+     version : libpulse_mainloop_glib_version,
