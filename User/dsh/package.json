@@ -1,0 +1,14 @@
+{
+  "dependencies": {
+    "@deepseek-ai/dsh-app-boot": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-base": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-cmdline": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-headless": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-http-proxy": "0.2.1-rc.5",
+    "commander": "15.0.0",
+    "@whatwg-node/node-fetch": "0.9.4",
+    "text-encoding-utf-8": "1.0.2"
+  },
+  "name": "lixinos-dsh-launcher",
+  "private": true
+}

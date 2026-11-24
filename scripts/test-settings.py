@@ -1,4 +1,5 @@
 """Open Settings from Apps on disposable desktop disks and check the real consumers."""
+from launcher_grid import installed_apps, select_icon
 import argparse
 import json
 import os
@@ -30,7 +31,7 @@ def exercise(guest, control, directory):
     guest.expect(b"echo 'export EDITOR=nano  # keep this comment' > /home/lixin/.profile\r", prompt)
     guest.expect(b"echo 'export SAMPLE=unchanged' >> /home/lixin/.profile\r", prompt)
     guest.send(b"ls -1 /bin | cat\r")
-    names = [n for n in guest.until(prompt).splitlines() if n == b"nxeyes" or n.endswith((b".win", b".win2", b".win3"))]
+    names = installed_apps(guest.until(prompt))
     index = names.index(b"settings.win3")
     guest.send(b"desktop\r")
     frame = directory / "screen.ppm"
@@ -75,10 +76,8 @@ def exercise(guest, control, directory):
 
     wait(75, 2, "5b4050")
     guest.send(b"\x07")
-    wait(82, 6, "233c3d")
-    for _ in range(index//7):
-        click(385, 284)
-    click(128, 60+32*(index%7))
+    wait(82, 6, "203f51")
+    select_icon(click,qmp,1177,682,index+6,len(names)+6)
     saved()
     # Wheel scrolling moves the viewport while preserving the selected row.
     row(1)
@@ -170,7 +169,7 @@ if __name__ == "__main__":
         stub = directory / "qemu-system-aarch64"
         stub.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\" \"$DEEPSEEK_MODEL\"\n")
         env = dict(os.environ, PATH=f"{directory}:{os.environ['PATH']}",
-                   LIXINOS_DISK=str(disk), DEEPSEEK_API_KEY="")
+                   LIXINOS_DISK=str(disk), LIXINOS_QEMU=str(stub), DEEPSEEK_API_KEY="")
         for name in ("DEEPSEEK_MODEL", "LIXINOS_TIMEZONE"):
             env.pop(name, None)
         command = [here / "run-kernel.sh", "--kernel", "rust", "--release", release]

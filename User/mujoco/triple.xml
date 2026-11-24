@@ -1,0 +1,26 @@
+<mujoco model="lixinos-three-link">
+  <option timestep="0.0020833333333333333" gravity="0 0 -9.8" integrator="RK4"/>
+  <default>
+    <joint type="hinge" axis="0 -1 0"/>
+    <geom type="capsule" fromto="0 0 0 0 0 -0.65" size="0.015" contype="0" conaffinity="0"/>
+  </default>
+  <worldbody>
+    <body name="rod1">
+      <inertial pos="0 0 -0.325" mass="0.65" diaginertia="0.02288541666666667 0.02288541666666667 0.00001"/>
+      <joint name="base"/><geom/>
+      <body name="rod2" pos="0 0 -0.65">
+        <inertial pos="0 0 -0.325" mass="0.65" diaginertia="0.02288541666666667 0.02288541666666667 0.00001"/>
+        <joint name="middle"/><geom/>
+        <body name="rod3" pos="0 0 -0.65">
+          <inertial pos="0 0 -0.325" mass="0.65" diaginertia="0.02288541666666667 0.02288541666666667 0.00001"/>
+          <joint name="tip"/><geom/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <motor joint="base" ctrlrange="-16 16"/>
+    <motor joint="middle" ctrlrange="-8 8"/>
+    <motor joint="tip" ctrlrange="-3 3"/>
+  </actuator>
+</mujoco>

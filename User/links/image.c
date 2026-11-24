@@ -6,7 +6,7 @@
 #define STBI_ONLY_GIF
 #define STBI_MAX_DIMENSIONS 8192
 #define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
+#include "../gui/stb_image.h"
 #include "page.h"
 
 int decode_picture(struct page_media *media,const struct page_source *src,int available,int wanted) {

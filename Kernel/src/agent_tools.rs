@@ -1330,7 +1330,7 @@ impl Project<'_> {
         }
         let mut undo = Vec::new();
         for (path, candidate) in &self.pending {
-            let old = volume.files.insert(path.clone(), Some(candidate.source.as_bytes().to_vec()));
+            let old = volume.files.insert(path.clone(), Some(crate::disk::FileData::from_vec(candidate.source.as_bytes().to_vec())));
             undo.push((path.clone(), old));
         }
         if let Err(error) = volume.save_changes(undo.iter().map(|(path, old)| (path.as_str(), old.is_some())), &crate::disk::Times::new()) {

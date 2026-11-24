@@ -39,9 +39,7 @@ fn device_tree() -> Option<fdt::Fdt<'static>> {
 }
 
 pub fn cpu() -> String {
-    let vcpus = device_tree()
-        .and_then(|tree| tree.find_node("/cpus").map(|_| tree.cpus().count()))
-        .filter(|&count| count != 0);
+    let vcpus = unsafe { crate::scheduler::smp_cpus() };
     let frequency = seconds_to_ticks(1);
     let start = monitor::cpu_counters();
     crate::scheduler::sleep_ms(250);
@@ -50,10 +48,9 @@ pub fn cpu() -> String {
     let sample_ms = end.ticks.wrapping_sub(start.ticks) * 1000 / frequency;
     let uptime = crate::scheduler::uptime_ticks() / frequency;
     format!(
-        "architecture={ARCHITECTURE}\nvcpus={} (QEMU boot device tree)\n\
+        "architecture={ARCHITECTURE}\nvcpus={vcpus}\n\
          uptime_seconds={uptime}\narchitectural_timer_hz={frequency}\n\
          guest_busy_percent={}\nsample_ms={sample_ms}\nscope=guest_scheduler",
-        measurement(vcpus),
         measurement(busy)
     )
 }

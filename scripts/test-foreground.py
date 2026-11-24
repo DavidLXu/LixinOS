@@ -62,7 +62,12 @@ def test(guest_build=False):
             s.expect(b"abc\x13", b"3 bytes written on disk")
             s.expect(b"\x11", cwd)
             s.expect(b"cat exact | wc -l\r", cwd, b"\n0\n")
-            s.expect(b"htop\r", b"htop (console polling)")
+            s.expect(b"htop\r", b"Tasks: ")
+            s.expect(b"M", b"Sort [MEM%]")
+            s.expect(b"/zzzz", b"No matching processes")
+            s.expect(b"\x1b", b"F1 Help")
+            s.expect(b"?", b"Toggle process tree")
+            s.expect(b"\r", b"F1 Help")
             s.expect(b"q", cwd)
             s.expect(b"echo " + b"x"*255 + b" > big\r", cwd)
             for _ in range(8):

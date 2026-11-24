@@ -95,7 +95,7 @@ typedef struct {
 enum FileColumn { BY_NAME, BY_TYPE, BY_SIZE, BY_DATE, FILE_COLUMNS };
 enum FileAction { F_OPEN, F_NEW_DIR, F_NEW_FILE, F_RENAME, F_COPY, F_CUT, F_PASTE,
                   F_TRASH, F_FIND, F_LOCATION, F_BACK, F_FORWARD, F_SHOW_TRASH, F_USE_EDITOR, F_USE_NANO, F_RESTORE, F_UNDO, F_ALL, F_ALWAYS_EDITOR, F_ALWAYS_NANO, F_PIN, F_PLACES, F_COUNT };
-enum { EDITOR_NAME = 1, FILE_PROMPT = 2, HISTORY = 12 };
+enum { EDITOR_NAME = 1, FILE_PROMPT = 2, WALL_PROMPT = FILE_PROMPT + F_COUNT, HISTORY = 12 };
 enum { ANY, SINGLE, REGULAR, MANY, CLIP, PREVIOUS, NEXT, TRASH_ITEMS, UNDOABLE, LIST, EXTENSION };
 static const UiCommand actions[F_COUNT] = {
     {"打开",13,SINGLE},{"新建文件夹",14,ANY},{"新建文件",0,ANY},{"重命名",18,SINGLE},
@@ -112,20 +112,53 @@ typedef struct { FilePath source,target,origin; } FilePair;
 typedef struct { FilePair *items; int count,action,conflict; } FileBatch;
 enum AppGroup { GROUP_ALL, GROUP_SYSTEM, GROUP_EDIT, GROUP_TOOLS, GROUP_GAMES, GROUP_DEV, GROUP_OTHER, GROUP_COUNT };
 static const char *const group_labels[GROUP_COUNT] = {"全部","系统","编辑","工具","游戏","开发","其他"};
-typedef struct { const char *file, *title; enum AppGroup group; } AppInfo;
-static const AppInfo catalog[] = {
-    {"app-store.win3","应用商店",GROUP_SYSTEM},
-    {"settings.win3","系统设置",GROUP_SYSTEM}, {"settings.win2","系统设置",GROUP_SYSTEM},
-    {"tasks.win2","任务管理器",GROUP_SYSTEM}, {"nautilus.win3","Nautilus",GROUP_SYSTEM},
-    {"lite-xl.win3","Lite XL",GROUP_EDIT}, {"mousepad.win3","Mousepad",GROUP_EDIT},
-    {"calendar.win2","日历",GROUP_TOOLS}, {"map.win2","地图",GROUP_TOOLS},
-    {"stopwatch.win2","秒表",GROUP_TOOLS}, {"ristretto.win3","Ristretto",GROUP_TOOLS},
-    {"2048.win3","2048",GROUP_GAMES}, {"tetravex.win3","数字拼图",GROUP_GAMES},
-    {"mines.win3","扫雷",GROUP_GAMES}, {"mahjongg.win3","麻将接龙",GROUP_GAMES},
-    {"nxeyes","Eyes",GROUP_GAMES}, {"agent.win3","Agent",GROUP_DEV},
-    {"gtk3-demo.win3","GTK 3 示例",GROUP_DEV}, {"counter.win","计数器示例",GROUP_DEV},
-    {"widgets-demo.win3","控件示例",GROUP_DEV}
+enum LauncherIcon { ICON_FOLDER, ICON_GLOBE, ICON_CALC, ICON_TERMINAL, ICON_SHEET, ICON_PENCIL, ICON_STORE, ICON_GEAR, ICON_CHART, ICON_TILES, ICON_PLAY, ICON_CALENDAR, ICON_PIN, ICON_WATCH, ICON_PHOTO, ICON_MINE, ICON_MAHJONG, ICON_EYES, ICON_AGENT, ICON_CODE, ICON_COUNTER, ICON_WIDGETS, ICON_NUMBER };
+static const struct { unsigned color; unsigned short rows[16]; } launcher_icons[] = {
+    [ICON_FOLDER] = {0xe48c32, {0x0000,0x0000,0x0000,0x00fc,0x00fc,0x7ffe,0x7ffe,0x7ffe,0x7ffe,0x7ffe,0x7ffe,0x7ffe,0x7ffe,0x0000,0x0000,0x0000}},
+    [ICON_GLOBE] = {0x247ab9, {0x0000,0x03c0,0x0ff0,0x1e78,0x342c,0x342c,0x6426,0x6426,0x7ffe,0x6426,0x342c,0x342c,0x1e78,0x0ff0,0x03c0,0x0000}},
+    [ICON_CALC] = {0x378679, {0x0000,0x1ff8,0x1ff8,0x1818,0x1818,0x1818,0x1ff8,0x1ff8,0x1a58,0x1818,0x1818,0x1a58,0x1818,0x1ff8,0x1ff8,0x0000}},
+    [ICON_TERMINAL] = {0x394f72, {0x0000,0x0000,0x0000,0x0000,0x0008,0x001c,0x0038,0x0070,0x00e0,0x0070,0x0038,0x001c,0x7f08,0x7f00,0x0000,0x0000}},
+    [ICON_SHEET] = {0x9a556c, {0x0000,0x0000,0x3ffc,0x3ffc,0x300c,0x300c,0x3ffc,0x3ffc,0x300c,0x37ec,0x37ec,0x31ec,0x31ec,0x3ffc,0x3ffc,0x0000}},
+    [ICON_PENCIL] = {0x526fc3, {0x0000,0x0800,0x1c00,0x3a00,0x7700,0xef80,0x5fc0,0x3fe0,0x1ff0,0x0ff8,0x07f8,0x03fc,0x01fc,0x00fe,0x0002,0x0000}},
+    [ICON_STORE] = {0x3581c2, {0x0000,0x0180,0x03c0,0x0660,0x0660,0x0660,0x3ffc,0x3ffc,0x318c,0x300c,0x300c,0x300c,0x300c,0x3ffc,0x3ffc,0x0000}},
+    [ICON_GEAR] = {0x647c8c, {0x0000,0x03c0,0x13c0,0x3bd0,0x1ff8,0x0ff0,0x7e7e,0x7c3e,0x7c3e,0x7e7e,0x0ff0,0x1ff8,0x3bd0,0x13c0,0x03c0,0x0000}},
+    [ICON_CHART] = {0x38856f, {0x0000,0x0000,0x7000,0x7000,0x7000,0x7380,0x7380,0x7380,0x7380,0x739c,0x739c,0x739c,0x739c,0x739c,0x0000,0x0000}},
+    [ICON_TILES] = {0x9e6199, {0x0000,0x0000,0x3e7c,0x3e7c,0x366c,0x3e7c,0x3e7c,0x0000,0x0000,0x3e7c,0x3e7c,0x366c,0x3e7c,0x3e7c,0x0000,0x0000}},
+    [ICON_PLAY] = {0xd56356, {0x0000,0x0000,0x0010,0x0070,0x00f0,0x03f0,0x0ff0,0x1ff0,0x7ff0,0x1ff0,0x0ff0,0x03f0,0x00f0,0x0070,0x0010,0x0000}},
+    [ICON_CALENDAR] = {0xd66257, {0x0000,0x0000,0x3ffc,0x3ffc,0x300c,0x300c,0x3ffc,0x3ffc,0x300c,0x37ec,0x37ec,0x31ec,0x31ec,0x3ffc,0x3ffc,0x0000}},
+    [ICON_PIN] = {0x38997d, {0x0000,0x03c0,0x0ff0,0x1ff8,0x3e7c,0x3c3c,0x3c3c,0x3e7c,0x3ffc,0x1ff8,0x0ff0,0x07e0,0x07c0,0x0380,0x0380,0x0100}},
+    [ICON_WATCH] = {0xc18336, {0x0000,0x03c0,0x03c0,0x0000,0x03c0,0x0ff0,0x1d38,0x1918,0x310c,0x310c,0x3f0c,0x300c,0x1818,0x1c38,0x0ff0,0x03c0}},
+    [ICON_PHOTO] = {0x6175b8, {0x0000,0x0000,0x7ffe,0x7ffe,0x6006,0x6026,0x6806,0x6c06,0x7c46,0x7ee6,0x7ff6,0x7ffe,0x7ffe,0x7ffe,0x0000,0x0000}},
+    [ICON_MINE] = {0x877195, {0x0000,0x0000,0x3e00,0x3e00,0x0300,0x03c0,0x07e0,0x0ff0,0x1fb8,0x1ff8,0x1ff8,0x1ff8,0x0ff0,0x07e0,0x03c0,0x0000}},
+    [ICON_MAHJONG] = {0x288888, {0x0000,0x1ff8,0x1ff8,0x1818,0x1b18,0x1b18,0x1ff8,0x1ff8,0x1b18,0x1b18,0x1b18,0x1b18,0x1818,0x1ff8,0x1ff8,0x0000}},
+    [ICON_EYES] = {0x825aa3, {0x0000,0x0000,0x0000,0x0000,0x3c3c,0x7e7e,0x7e7e,0xefef,0xc7c7,0xefef,0x7e7e,0x7e7e,0x3c3c,0x0000,0x0000,0x0000}},
+    [ICON_AGENT] = {0x3b948c, {0x0000,0x0100,0x0300,0x0300,0x0300,0x7ffe,0x7ffe,0x6006,0x6c36,0x6c36,0x6006,0x7ffe,0x7ffe,0x0000,0x0000,0x0000}},
+    [ICON_CODE] = {0x5f73a8, {0x0000,0x0000,0x0000,0x0020,0x0870,0x1c38,0x381c,0x700e,0xe004,0x700e,0x381c,0x1c38,0x0870,0x0020,0x0000,0x0000}},
+    [ICON_COUNTER] = {0xad6b44, {0x0000,0x0000,0x0380,0x03c0,0x03e0,0x0340,0x0300,0x0300,0x0300,0x0300,0x0300,0x0300,0x0300,0x0fe0,0x0fe0,0x0000}},
+    [ICON_WIDGETS] = {0xb46f8c, {0x0000,0x0000,0x3e7c,0x3e7c,0x367c,0x3e7c,0x3e7c,0x0000,0x0000,0x3e7c,0x3e7c,0x3e6c,0x3e7c,0x3e7c,0x0000,0x0000}},
+    [ICON_NUMBER] = {0xe2953d, {0x0000,0x0000,0x3e7c,0x3e7c,0x3e7c,0x3e7c,0x3e7c,0x0000,0x0000,0x3e7c,0x3e7c,0x3e7c,0x3e7c,0x3e7c,0x0000,0x0000}},
 };
+typedef struct { const char *file, *title; enum AppGroup group; enum LauncherIcon icon; } AppInfo;
+static const AppInfo catalog[] = {
+    {"app-store.win3","应用商店",GROUP_SYSTEM,ICON_STORE},
+    {"settings.win3","系统设置",GROUP_SYSTEM,ICON_GEAR}, {"settings.win2","系统设置",GROUP_SYSTEM,ICON_GEAR},
+    {"tasks.win2","任务管理器",GROUP_SYSTEM,ICON_CHART}, {"nautilus.win3","Nautilus",GROUP_SYSTEM,ICON_FOLDER},
+    {"lite-xl.win3","Lite XL",GROUP_EDIT,ICON_PENCIL}, {"mousepad.win3","Mousepad",GROUP_EDIT,ICON_SHEET},
+    {"physics.win3","物理仿真器",GROUP_TOOLS,ICON_CHART},
+    {"video.win3","视频播放器",GROUP_TOOLS,ICON_PLAY}, {"calendar.win2","日历",GROUP_TOOLS,ICON_CALENDAR}, {"map.win2","地图",GROUP_TOOLS,ICON_PIN},
+    {"stopwatch.win2","秒表",GROUP_TOOLS,ICON_WATCH}, {"ristretto.win3","Ristretto",GROUP_TOOLS,ICON_PHOTO},
+    {"2048.win3","2048",GROUP_GAMES,ICON_NUMBER}, {"tetravex.win3","数字拼图",GROUP_GAMES,ICON_TILES},
+    {"mines.win3","扫雷",GROUP_GAMES,ICON_MINE}, {"mahjongg.win3","麻将接龙",GROUP_GAMES,ICON_MAHJONG},
+    {"nxeyes","Eyes",GROUP_GAMES,ICON_EYES}, {"agent.win3","Agent",GROUP_DEV,ICON_AGENT},
+    {"gtk3-demo.win3","GTK 3 示例",GROUP_DEV,ICON_CODE}, {"counter.win","计数器示例",GROUP_DEV,ICON_COUNTER},
+    {"widgets-demo.win3","控件示例",GROUP_DEV,ICON_WIDGETS}
+};
+static const AppInfo dock_apps[] = {
+    {NULL,"文件",GROUP_SYSTEM,ICON_FOLDER}, {NULL,"浏览器",GROUP_TOOLS,ICON_GLOBE},
+    {NULL,"计算器",GROUP_TOOLS,ICON_CALC}, {NULL,"终端",GROUP_DEV,ICON_TERMINAL},
+    {NULL,"Nano",GROUP_EDIT,ICON_SHEET}, {NULL,"文本编辑器",GROUP_EDIT,ICON_PENCIL}
+};
+typedef struct { FilePath name; const AppInfo *info; int dock_id; } LauncherApp;
 static const AppInfo *app_info(const char *name) {
     for (unsigned i=0; i<sizeof catalog/sizeof catalog[0]; ++i)
         if (!strcmp(name,catalog[i].file)) return &catalog[i];
@@ -139,11 +172,14 @@ typedef struct {
     WindowClient *clients;
     char client_path[CLIENT_LIMIT][513];
     int wallpaper, wallpaper_menu, wallpaper_x, wallpaper_y;
+    uint32_t *wall_image;
+    FilePath wall_file;
     int client_grab;
-    int menu, app_page, app_count, app_more;
+    int menu, app_count, app_capacity, app_scroll;
+    int app_press_x, app_press_y, app_press_scroll, app_dragged;
     enum AppGroup app_group;
     unsigned app_totals[GROUP_COUNT];
-    char app_paths[APPS][513];
+    LauncherApp *apps;
     int order[APPS], captured;
     char cwd[513];
     int mx, my, inside, down;
@@ -167,7 +203,7 @@ typedef struct {
 
 static int min(int a, int b) { return a < b ? a : b; }
 static void box(Desktop *d, int x, int y, int w, int h, uint32_t color) {
-    for (int j = y; j < y + h; ++j)
+    for (int j = y < 0 ? 0 : y; j < min(d->h, y + h); ++j)
         for (int i = x; i < x + w; ++i)
             d->pixels[j * d->w + i] = color;
 }
@@ -231,25 +267,25 @@ static void label(Desktop *d, int x, int y, int room, const char *s, uint32_t co
         if (room < advance)
             break;
         if (latin) {
-            for (int j = 0; j < 16; ++j)
+            for (int j = y < -3 ? -y-3 : 0; j < min(16,d->h-y-3); ++j)
                 for (int i = 0; i < min(18, advance); ++i) {
                     uint32_t *p = d->pixels + (y + j + 3) * d->w + x + i;
                     *p = blend(*p, color, latin[j * 20 + i + 2]);
                 }
         } else if (pingfang) {
-            for (int j = 0; j < 16; ++j)
+            for (int j = y < -3 ? -y-3 : 0; j < min(16,d->h-y-3); ++j)
                 for (int i = 0; i < 16; ++i) {
                     uint32_t *p = d->pixels + (y + j + 3) * d->w + x + i;
                     *p = blend(*p, color, pingfang[j * 16 + i]);
                 }
         } else if (bits) {
-            for (int j = 0; j < 16; ++j)
+            for (int j = y < -3 ? -y-3 : 0; j < min(16,d->h-y-3); ++j)
                 for (int i = 0; i < 16; ++i)
                     if (bits[j * 2 + i / 8] & (0x80 >> (i % 8)))
                         d->pixels[(y + j + 3) * d->w + x + i + 1] = color;
         } else {
             const unsigned char *alpha = desktop_font + glyph * 18 * 22;
-            for (int j = 0; j < 22; ++j)
+            for (int j = y < 0 ? -y : 0; j < min(22,d->h-y); ++j)
                 for (int i = 0; i < advance; ++i) {
                     uint32_t *p = d->pixels + (y + j) * d->w + x + i;
                     *p = blend(*p, color, alpha[j * 18 + i]);
@@ -450,23 +486,28 @@ static const char *window_name(Desktop *d, int id) {
     const AppInfo *info = app_info(name);
     return info ? info->title : name;
 }
-static void list_app(Desktop *d, const char *name, unsigned *skip) {
-    const AppInfo *info = app_info(name);
-    enum AppGroup group = info ? info->group : GROUP_OTHER;
+static int list_app(Desktop *d, const char *name, const AppInfo *info, int dock_id) {
+    if (d->app_count == d->app_capacity) {
+        int capacity = d->app_capacity ? d->app_capacity * 2 : 32;
+        LauncherApp *apps = realloc(d->apps, capacity * sizeof *apps);
+        if (!apps) return 0;
+        d->apps = apps;
+        d->app_capacity = capacity;
+    }
+    LauncherApp *app = &d->apps[d->app_count++];
+    strcpy(app->name, name);
+    app->info = info;
+    app->dock_id = dock_id;
     ++d->app_totals[GROUP_ALL];
-    ++d->app_totals[group];
-    if (d->app_group != GROUP_ALL && d->app_group != group) return;
-    if (*skip) { --*skip; return; }
-    if (d->app_count == APPS) { d->app_more = 1; return; }
-    char *path = d->app_paths[d->app_count++];
-    strcpy(path, "/bin/");
-    strcat(path, name);
+    ++d->app_totals[info ? info->group : GROUP_OTHER];
+    return 1;
 }
 static void scan_apps(Desktop *d) {
-    unsigned skip = d->app_page * APPS;
-    d->app_count = d->app_more = 0;
+    d->app_count = 0;
     memset(d->app_totals, 0, sizeof d->app_totals);
-    list_app(d, "agent.win3", &skip);
+    for (int id = 0; id < EYES_ICON; ++id)
+        if (!list_app(d, "", &dock_apps[id], id)) goto full;
+    if (!list_app(d,"agent.win3",app_info("agent.win3"),-1)) goto full;
     for (unsigned i = 0;; ++i) {
         char name[513];
         long size = lx_dir("/bin", i, name);
@@ -474,21 +515,18 @@ static void scan_apps(Desktop *d) {
         if (size == LX_DIR || !strcmp(name,"agent.win3")
             || (!window_app_name(name) && strcmp(name, "nxeyes")) || strlen(name) > 507)
             continue;
-        list_app(d,name,&skip);
+        if (!list_app(d,name,app_info(name),-1)) goto full;
     }
-    if (!d->app_totals[d->app_group] && d->app_group != GROUP_ALL) {
-        d->app_group = GROUP_ALL;
-        d->app_page = 0;
-        scan_apps(d);
-    } else if (!d->app_count && d->app_page) {
-        d->app_page = (d->app_totals[d->app_group]-1)/APPS;
-        scan_apps(d);
-    }
+    if (!d->app_totals[d->app_group]) d->app_group = GROUP_ALL;
+    return;
+full:
+    strcpy(d->message,"内存不足，应用列表未完整加载");
 }
 static void show_menu(Desktop *d, int menu) {
     d->menu = menu;
     if (menu == MENU_APPS) {
-        d->app_page = 0;
+        d->app_scroll = 0;
+        d->app_dragged = 1;
         scan_apps(d);
     }
 }
@@ -787,73 +825,109 @@ static void draw_calc(Desktop *d, Bounds r) {
     }
 }
 static Bounds menu_rect(Desktop *d) {
-    return (Bounds){DOCK + 4, 4, min(d->menu == MENU_APPS ? 420 : 340, d->w - DOCK - 8), 84 + APPS * 32};
+    return (Bounds){DOCK + 4, 4, min(340, d->w - DOCK - 8), 84 + APPS * 32};
 }
-static int app_list_width(Bounds r) { return r.w - min(110,r.w/3); }
-/* Empty groups have no row. Drawing and hit testing use this same mapping. */
-static int group_at_row(const Desktop *d, int row) {
-    for (int group=0; group<GROUP_COUNT; ++group)
-        if (d->app_totals[group] && row-- == 0) return group;
-    return -1;
+
+enum { GRID_TOP = 108, GRID_ROW = 136, GRID_PAD = 24 };
+static int grid_columns(Desktop *d) {
+    int columns = (d->w - 2 * GRID_PAD) / 145;
+    return columns > 0 ? min(columns, 6) : 1;
+}
+static Bounds grid_cell(Desktop *d, int index) {
+    int columns = grid_columns(d), width = (d->w - 2 * GRID_PAD) / columns;
+    return (Bounds){GRID_PAD + index % columns * width,
+                    GRID_TOP + index / columns * GRID_ROW - d->app_scroll, width, GRID_ROW};
+}
+static int grid_limit(Desktop *d) {
+    int cols = grid_columns(d), rows = (d->app_totals[d->app_group] + cols - 1) / cols;
+    int limit = GRID_TOP + rows * GRID_ROW + 12 - d->h;
+    return limit > 0 ? limit : 0;
+}
+static int grid_scroll(Desktop *d, int offset) {
+    int next = clamp(offset, grid_limit(d));
+    if (next == d->app_scroll) return 0;
+    d->app_scroll = next;
+    return 1;
+}
+static int grid_visible(Desktop *d, LauncherApp *app) {
+    return d->app_group == GROUP_ALL || d->app_group == (app->info ? app->info->group : GROUP_OTHER);
+}
+static Bounds group_button(Desktop *d, int group) {
+    int count = 0, index = 0;
+    for (int i = 0; i < GROUP_COUNT; ++i) if (d->app_totals[i]) {
+        if (i < group) ++index;
+        ++count;
+    }
+    int width = min(66,(d->w-2*GRID_PAD)/count);
+    return (Bounds){GRID_PAD+width*index,62,width-4,30};
+}
+static void grid_icon(Desktop *d, LauncherApp *app, Bounds cell) {
+    const AppInfo *info = app->info;
+    int icon = info ? info->icon : ICON_WIDGETS;
+    unsigned color = launcher_icons[icon].color;
+    int x = cell.x + cell.w/2 - 37, y = cell.y + 10;
+    roundbox(d,x,y+3,74,74,17,0x183344);
+    roundbox(d,x,y,74,74,17,color);
+    for (int row = 0; row < 16; ++row) {
+        unsigned bits = launcher_icons[icon].rows[row];
+        for (int col = 0; col < 16; ++col)
+            if (bits & (1u << col)) box(d,x+13+3*col,y+13+3*row,3,3,0xfffcf2);
+    }
+    const char *title = info ? info->title : app->name;
+    int width = min(cell.w-8,label_width(title));
+    label(d,cell.x+(cell.w-width)/2,y+82,width,title,0xf4f8fa);
+}
+static void draw_launcher(Desktop *d) {
+    for (int y = 0; y < d->h; y += 4)
+        box(d,0,y,d->w,4,blend(0x203f51,0x294d5e,y*255/d->h));
+    int shown = 0;
+    for (int i = 0; i < d->app_count; ++i) {
+        if (!grid_visible(d,&d->apps[i])) continue;
+        Bounds cell = grid_cell(d,shown++);
+        if (cell.y >= d->h) break;
+        if (cell.y + GRID_ROW > GRID_TOP) grid_icon(d,&d->apps[i],cell);
+    }
+    int limit = grid_limit(d);
+    if (limit) {
+        int track = d->h-GRID_TOP-12, thumb = track*track/(track+limit);
+        if (thumb < 18) thumb = 18;
+        box(d,d->w-10,GRID_TOP+(track-thumb)*d->app_scroll/limit,3,thumb,0x87a6ae);
+    }
+    box(d,0,0,d->w,GRID_TOP,0x203f51);
+    label(d,GRID_PAD,20,120,"应用程序",PAPER);
+    roundbox(d,d->w-148,14,60,32,12,0x34576a);
+    label(d,d->w-136,19,40,"窗口",PAPER);
+    roundbox(d,d->w-78,14,60,32,12,0x426978);
+    label(d,d->w-66,19,40,"完成",PAPER);
+    for (int i = 0; i < GROUP_COUNT; ++i) if (d->app_totals[i]) {
+        Bounds r = group_button(d,i);
+        int selected = (int)d->app_group == i;
+        if (selected) roundbox(d,r.x,r.y,r.w,r.h,12,0xc6e4dc);
+        int width = min(label_width(group_labels[i]),r.w-4);
+        label(d,r.x+(r.w-width)/2,r.y+4,width,group_labels[i],selected ? INK : 0xcadadd);
+    }
 }
 static void draw_menu(Desktop *d) {
     Bounds r = menu_rect(d);
-    box(d, r.x, r.y, r.w, r.h, PAPER);
-    const char *tabs[] = {"应用程序", "窗口"};
-    for (int tab = MENU_APPS; tab <= MENU_WINDOWS; ++tab) {
-        int x = r.x + (tab - 1) * (r.w / 2);
-        box(d, x, r.y, r.w / 2, 38, tab == d->menu ? INK : BAR);
-        label(d, x + 12, r.y + 8, r.w / 2 - 18, tabs[tab-1], tab == d->menu ? PAPER : INK);
-    }
-    int list_w = d->menu == MENU_APPS ? app_list_width(r) : r.w;
-    if (d->menu == MENU_APPS) {
-        int x = r.x + list_w, width = r.w - list_w;
-        box(d,x,r.y+42,1,APPS*32,LINE);
-        for (int j=0; j<GROUP_COUNT; ++j) {
-            int group = group_at_row(d,j);
-            if (group < 0) break;
-            int y = r.y+42+j*32, selected = group == (int)d->app_group;
-            if (selected) box(d,x+3,y,width-6,30,BAR);
-            label(d,x+10,y+3,width-40,group_labels[group],selected ? INK : MUTED);
-            char count[24];
-            number(count,d->app_totals[group]);
-            int cw = label_width(count);
-            label(d,r.x+r.w-cw-10,y+3,cw,count,MUTED);
-        }
-    }
+    box(d,r.x,r.y,r.w,r.h,PAPER);
+    box(d,r.x,r.y,r.w/2,38,BAR);
+    box(d,r.x+r.w/2,r.y,r.w/2,38,INK);
+    label(d,r.x+12,r.y+8,r.w/2-18,"应用程序",INK);
+    label(d,r.x+r.w/2+12,r.y+8,r.w/2-18,"窗口",PAPER);
     int row = 0;
     for (int i = 0; i < APPS; ++i) {
-        if (d->menu == MENU_APPS ? i >= d->app_count : !d->windows[i].open) continue;
+        if (!d->windows[i].open) continue;
         int y = r.y + 42 + 32 * row++;
-        const char *name = d->menu == MENU_APPS ? d->app_paths[i] + 5 : window_name(d, i);
-        if (d->menu == MENU_APPS) {
-            const AppInfo *info = app_info(name);
-            int room = list_w-20;
-            if (d->app_group == GROUP_ALL && list_w >= 200) {
-                const char *tag = group_labels[info ? info->group : GROUP_OTHER];
-                int tw = label_width(tag);
-                label(d,r.x+list_w-tw-10,y+3,tw,tag,MUTED);
-                room -= tw+12;
-            }
-            label(d,r.x+10,y+3,room,info ? info->title : name,INK);
-        } else label(d,r.x+10,y+3,r.w-94,name,INK);
-        if (d->menu == MENU_WINDOWS) {
+        label(d,r.x+10,y+3,r.w-94,window_name(d,i),INK);
+        if (i >= FIRST_CLIENT) {
             char slot[24];
-            if (i >= FIRST_CLIENT) {
-                number(slot, i - FIRST_CLIENT + 1);
-                label(d, r.x + r.w - 84, y + 3, 18, slot, MUTED);
-            }
-            label(d, r.x + r.w - 65, y + 3, 62, d->windows[i].shown ? "Open" : "Hidden", MUTED);
+            number(slot, i - FIRST_CLIENT + 1);
+            label(d,r.x+r.w-84,y+3,18,slot,MUTED);
         }
-        box(d, r.x + 8, y + 30, list_w - 16, 1, LINE);
+        label(d,r.x+r.w-65,y+3,62,d->windows[i].shown ? "Open" : "Hidden",MUTED);
+        box(d,r.x+8,y+30,r.w-16,1,LINE);
     }
-    if (!row) label(d, r.x + 12, r.y + 49, r.w - 24,
-                    d->menu == MENU_WINDOWS ? "没有打开的窗口" : "暂无应用", MUTED);
-    if (d->menu == MENU_APPS) {
-        int y = r.y + r.h - 30;
-        if (d->app_page) label(d, r.x + 12, y, 100, "上一页", INK);
-        if (d->app_more) label(d, r.x + r.w - 72, y, 64, "下一页", INK);
-    }
+    if (!row) label(d,r.x+12,r.y+49,r.w-24,"没有打开的窗口",MUTED);
 }
 static uint32_t rgb565(unsigned pixel) {
     return ((pixel & 0xf800) << 8) | ((pixel & 0x07e0) << 5) | ((pixel & 31) << 3);
@@ -896,12 +970,64 @@ static int present_patch(Desktop *d, int id) {
     if (x < d->mx+CUR_W && y < d->my+CUR_H && x+u.w > d->mx-4 && y+u.h > d->my-7) cursor(d, 1);
     return 1;
 }
-enum { WALL_WIDTH=200, WALL_ROW=30, WALL_COUNT=3, WALL_HEIGHT=(WALL_COUNT+1)*WALL_ROW };
+enum { WALL_WIDTH=200, WALL_ROW=30, WALL_COUNT=3, WALL_HEIGHT=(WALL_COUNT+2)*WALL_ROW };
 static const char *const wall_names[]={"暮色","青山","海岸"};
 static const uint32_t skies[]={0x38253e,0xb7d9ce,0x6cacc3};
 static const uint32_t horizons[]={0x6a3747,0xf2e0bf,0xf3ddbd};
 static const char wall_path[]="/home/lixin/.wallpaper";
-static void render(Desktop *d) {
+#include "wallpaper.h"
+
+static void restore_wallpaper(Desktop *d) {
+    long size = lx_stat(wall_path);
+    if (size < 1 || size > 512) return;
+    int fd = lx_open(wall_path);
+    if (fd < 0) return;
+    char saved[513];
+    int used = 0;
+    while (used < size) {
+        int n = lx_read(fd,saved + used,size - used);
+        if (n <= 0) break;
+        used += n;
+    }
+    lx_close(fd);
+    saved[used] = 0;
+    if (used != size || strlen(saved) != (size_t)used) return;
+    if (used == 1 && saved[0] >= '0' && saved[0] < '0' + WALL_COUNT) {
+        d->wallpaper = saved[0] - '0';
+    } else if (saved[0] == '/') {
+        d->wall_image = load_wall_image(saved,d->w - DOCK,d->h);
+        if (d->wall_image) strcpy(d->wall_file,saved);
+        else strcpy(d->message,"无法加载已保存的壁纸");
+    }
+}
+static int set_image_wallpaper(Desktop *d) {
+    char path[513];
+    if (!ui_file_path(path,d->cwd,d->filename)) {
+        strcpy(d->message,"图片路径为空或过长");
+        return 0;
+    }
+    uint32_t *image = load_wall_image(path,d->w - DOCK,d->h);
+    if (!image) {
+        strcpy(d->message,"无法读取图片，请检查 PNG 或 JPG 文件及大小");
+        return 0;
+    }
+    if (lx_save_file(wall_path,path,strlen(path)) < 0) {
+        free(image);
+        strcpy(d->message,"无法保存壁纸设置");
+        return 0;
+    }
+    free(d->wall_image);
+    d->wall_image = image;
+    strcpy(d->wall_file,path);
+    return 1;
+}
+static void paint_wallpaper(Desktop *d) {
+    if (d->wall_image) {
+        int width = d->w - DOCK;
+        for (int y=0; y<d->h; ++y)
+            memcpy(d->pixels + y*d->w + DOCK,d->wall_image + y*width,width*sizeof(uint32_t));
+        return;
+    }
     for (int y = 0; y < d->h; y += 8)
         box(d, DOCK, y, d->w - DOCK, min(8, d->h - y), blend(skies[d->wallpaper], horizons[d->wallpaper], y * 255 / d->h));
     if (d->wallpaper) {
@@ -916,6 +1042,13 @@ static void render(Desktop *d) {
             box(d,x,y,width,d->h-y,mountain?0x355f58:0x28677b);
         }
     }
+}
+static void render(Desktop *d) {
+    if (d->menu == MENU_APPS) {
+        draw_launcher(d);
+        goto overlays;
+    }
+    paint_wallpaper(d);
     dock(d);
     for (int i = 0; i < APPS; i++) {
         int id = d->order[i];
@@ -952,15 +1085,19 @@ static void render(Desktop *d) {
         label(d,x+12,y+4,170,"切换壁纸",INK);
         for(int i=0;i<WALL_COUNT;i++) {
             int row=y+(i+1)*WALL_ROW;
-            if(i==d->wallpaper) box(d,x,row,WALL_WIDTH,WALL_ROW,0xd8e9dc);
+            if(!d->wall_image && i==d->wallpaper) box(d,x,row,WALL_WIDTH,WALL_ROW,0xd8e9dc);
             box(d,x+12,row+7,24,16,skies[i]);
             label(d,x+48,row+4,140,wall_names[i],INK);
         }
+        int row = y + (WALL_COUNT+1)*WALL_ROW;
+        if (d->wall_image) box(d,x,row,WALL_WIDTH,WALL_ROW,0xd8e9dc);
+        label(d,x+12,row+4,WALL_WIDTH-24,"指定图片 PNG / JPG",INK);
     }
     if (d->naming) {
         int x = d->dialog_x, y = d->dialog_y;
         box(d, x, y, 440, 120, PAPER);
-        titlebar(d, x, y, 440, d->naming == EDITOR_NAME ? "文本编辑器" : actions[d->naming - FILE_PROMPT].label, 0);
+        titlebar(d, x, y, 440, d->naming == EDITOR_NAME ? "文本编辑器" :
+                 d->naming == WALL_PROMPT ? "壁纸图片路径 (PNG / JPG)" : actions[d->naming - FILE_PROMPT].label, 0);
         box(d, x + 12, y + 50, 416, 28, BAR);
         const char *tail = d->filename + d->name_offset;
         const char *caret = d->filename + d->name.caret;
@@ -995,6 +1132,7 @@ static void render(Desktop *d) {
             label(d,x+127,y+87,54,"取消",INK);
         }
     }
+overlays:
     if (d->message[0]) {
         box(d, 8, d->h - 30, d->w - 16, 28, INK);
         label(d, 18, d->h - 27, d->w - 36, d->message, PAPER);
@@ -1094,7 +1232,7 @@ static int install_agent_window(void) {
     return pid > 0 && console_call(51,pid) == 0;
 }
 
-static void open_client(Desktop *d, const char *path) {
+static void open_client(Desktop *d, const char *path, const char *argument) {
     for (int i = 0; i < CLIENT_LIMIT; ++i) {
         WindowClient *client = &d->clients[i];
         if (client->pid) continue;
@@ -1102,7 +1240,7 @@ static void open_client(Desktop *d, const char *path) {
             strcpy(d->message,"Could not compile the Agent window");
             return;
         }
-        if (!client_open(client, d->cwd, path)) {
+        if (!client_open_argument(client, d->cwd, path, argument)) {
             strcpy(d->message, "Could not start window application");
             return;
         }
@@ -1120,7 +1258,41 @@ static void open_client(Desktop *d, const char *path) {
     }
     strcpy(d->message, "All four application windows are in use");
 }
+static int click(Desktop *d, int x, int y);
 static void menu_click(Desktop *d, int x, int y) {
+    if (d->menu == MENU_APPS) {
+        if (y >= 14 && y < 46 && x >= d->w-148 && x < d->w-88)
+            show_menu(d,MENU_WINDOWS);
+        else if (y >= 14 && y < 46 && x >= d->w-78 && x < d->w-18)
+            d->menu = MENU_CLOSED;
+        else if (y < GRID_TOP) {
+            for (int i = 0; i < GROUP_COUNT; ++i) {
+                if (d->app_totals[i] && contains(group_button(d,i),x,y)) {
+                    d->app_group = i;
+                    d->app_scroll = 0;
+                    break;
+                }
+            }
+        } else {
+            int index = 0;
+            for (int i = 0; i < d->app_count; ++i) {
+                LauncherApp *app = &d->apps[i];
+                if (!grid_visible(d,app)) continue;
+                Bounds cell = grid_cell(d,index++);
+                Bounds tile = {cell.x+4,cell.y+8,cell.w-8,106};
+                if (!contains(tile,x,y)) continue;
+                d->menu = MENU_CLOSED;
+                if (app->dock_id >= 0) click(d,DOCK/2,8+app->dock_id*step(d)+20);
+                else {
+                    FilePath path = "/bin/";
+                    strcat(path,app->name);
+                    open_client(d,path,NULL);
+                }
+                break;
+            }
+        }
+        return;
+    }
     Bounds r = menu_rect(d);
     if (contains(r, x, y)) {
         x -= r.x; y -= r.y;
@@ -1128,33 +1300,13 @@ static void menu_click(Desktop *d, int x, int y) {
             show_menu(d, x < r.w/2 ? MENU_APPS : MENU_WINDOWS);
             return;
         }
-        if (d->menu == MENU_APPS && y >= r.h - 34) {
-            if (x < r.w/2 && d->app_page) --d->app_page;
-            else if (x >= r.w/2 && d->app_more) ++d->app_page;
-            scan_apps(d);
-            return;
-        }
         if (y < 42 || y >= 42 + APPS * 32) return;
         int row = (y - 42) / 32;
-        if (d->menu == MENU_APPS) {
-            if (x >= app_list_width(r)) {
-                int group = group_at_row(d,row);
-                if (group >= 0) {
-                    d->app_group = (enum AppGroup)group;
-                    d->app_page = 0;
-                    scan_apps(d);
-                }
-                return;
-            }
-            if (row >= d->app_count) return;
-            open_client(d, d->app_paths[row]);
-        } else {
-            int id = 0;
-            for (; id < APPS; ++id) if (d->windows[id].open && row-- == 0) break;
-            if (id == APPS) return;
-            d->windows[id].shown = 1;
-            raise_window(d, id);
-        }
+        int id = 0;
+        for (; id < APPS; ++id) if (d->windows[id].open && row-- == 0) break;
+        if (id == APPS) return;
+        d->windows[id].shown = 1;
+        raise_window(d, id);
     }
     d->menu = MENU_CLOSED;
 }
@@ -1280,12 +1432,30 @@ static int copy_tree(Desktop *d, char source[513], char target[513]) {
     return 1;
 }
 #include "file-operations.h"
+static int video_filename(const char *name) {
+    const char *ext = strrchr(name,'.');
+    if (!ext || strlen(ext) > 5) return 0;
+    char lower[6];
+    for (int i=0;;++i) {
+        char c=ext[i];
+        lower[i]=c>='A' && c<='Z' ? c+('a'-'A') : c;
+        if (!c) break;
+    }
+    const char *types[]={".mp4",".m4v",".mov",".avi",".mkv",".webm",".mpg",".mpeg"};
+    for (unsigned i=0;i<sizeof types/sizeof types[0];++i)
+        if (!strcmp(lower,types[i])) return 1;
+    return 0;
+}
 static void open_marked(Desktop *d) {
     Entry *e = &d->rows[d->marked];
     if (!child_path(d,d->filename,d->path,e->name)) return;
     if (e->size == LX_DIR) { navigate(d,d->filename,-1); return; }
     if (window_app_name(e->name)) {
-        open_client(d, d->filename);
+        open_client(d, d->filename, NULL);
+        return;
+    }
+    if (video_filename(e->name) && lx_stat("/bin/video.win3") >= 0) {
+        open_client(d, "/bin/video.win3", d->filename);
         return;
     }
     int app = 0;
@@ -1338,7 +1508,9 @@ static void submit_file_prompt(Desktop *d) {
     while (*scan) {
         if (utf8_next(&scan) == 0xfffd) { strcpy(d->message,"文件名编码无效"); return; }
     }
-    if (a == F_FIND) {
+    if (d->naming == WALL_PROMPT) {
+        if (!set_image_wallpaper(d)) return;
+    } else if (a == F_FIND) {
         strcpy(d->filter,d->filename);
         d->first = 0;
         load(d);
@@ -1430,7 +1602,7 @@ static int click(Desktop *d, int x, int y) {
             show_menu(d, MENU_APPS);
         } else if (id == EYES_ICON) {
             int eye = eye_window(d);
-            if (eye < 0) open_client(d, "/bin/nxeyes");
+            if (eye < 0) open_client(d, "/bin/nxeyes", NULL);
             else {
                 d->windows[eye].shown = 1;
                 raise_window(d, eye);
@@ -1508,9 +1680,19 @@ static int click(Desktop *d, int x, int y) {
             win->maximized = !win->maximized;
             configure_window(d, id);
             if (id == FILE_WIN) scroll_files(d,d->first);
-        } else if (id >= FIRST_CLIENT && d->clients[id - FIRST_CLIENT].extended)
-            client_event(&d->clients[id - FIRST_CLIENT], (WindowEvent){.type = WINDOW_CLIENT_CLOSE});
-        else
+        } else if (id >= FIRST_CLIENT && d->clients[id - FIRST_CLIENT].extended) {
+            WindowClient *client = &d->clients[id - FIRST_CLIENT];
+            long now = console_call(38, 0);
+            if (client->confirm_force_close) {
+                close_window(d, id);
+            } else if (!client->close_requested_at) {
+                client->close_requested_at = now;
+                client_event(client, (WindowEvent){.type = WINDOW_CLIENT_CLOSE});
+            } else if (now - client->close_requested_at >= 2000) {
+                client->confirm_force_close = 1;
+                strcpy(d->message, "应用未响应。再点关闭将强制退出，未保存内容将丢失");
+            }
+        } else
             close_window(d, id);
         return 1;
     }
@@ -1659,16 +1841,11 @@ __attribute__((noreturn)) void desktop_start(const char *cwd, const char *args, 
     Desktop d = {0};
     d.places=&favorites;
     memset(clients, 0, sizeof clients);
-    int pref=lx_open(wall_path);
-    if(pref>=0) {
-        char value;
-        if(lx_read(pref,&value,1)==1 && value>='0' && value<'0'+WALL_COUNT) d.wallpaper=value-'0';
-        lx_close(pref);
-    }
     d.clients = clients;
     d.client_grab = -1;
     d.w = size & 65535;
     d.h = size >> 16;
+    restore_wallpaper(&d);
     d.pixels = (uint32_t *)0x68000000;
     int work = d.w - DOCK;
     int widths[] = {600, 850, 376}, heights[] = {391, 540, 378};
@@ -1793,7 +1970,7 @@ __attribute__((noreturn)) void desktop_start(const char *cwd, const char *args, 
             } else if (update && d.windows[FIRST_CLIENT + i].shown && !repaint)
                 repaint = !present_patch(&d, FIRST_CLIENT + i);
         }
-        if (repaint) render(&d);
+        if (repaint && d.menu != MENU_APPS) render(&d);
         long e;
         int active = focus(&d);
         long pointer_options = d.naming && d.name.caret != d.name.anchor ? LX_COPY_ENABLED : 0;
@@ -1837,6 +2014,31 @@ __attribute__((noreturn)) void desktop_start(const char *cwd, const char *args, 
             d.inside = (e >> 25) & 1;
             int down = (e >> 24) & 1, changed = 0;
             d.modifiers=(e>>32)&3;
+            if (d.menu == MENU_APPS) {
+                int wheel = ((e >> 26) & 1) - ((e >> 27) & 1);
+                if (wheel && d.inside) {
+                    changed = grid_scroll(&d,d.app_scroll-wheel*48);
+                    if (down) d.app_dragged = 1;
+                } else if (down && !d.down) {
+                    d.app_press_x = d.mx;
+                    d.app_press_y = d.my;
+                    d.app_press_scroll = d.app_scroll;
+                    d.app_dragged = !d.inside;
+                } else if (down && d.down) {
+                    if (abs(d.my-d.app_press_y) > 6 || abs(d.mx-d.app_press_x) > 6)
+                        d.app_dragged = 1;
+                    if (d.app_dragged && d.app_press_y >= GRID_TOP)
+                        changed = grid_scroll(&d,d.app_press_scroll+d.app_press_y-d.my);
+                } else if (!down && d.down && d.inside && !d.app_dragged) {
+                    d.message[0] = 0;
+                    menu_click(&d,d.mx,d.my);
+                    changed = 1;
+                }
+                d.down = down;
+                if (changed) render(&d);
+                else cursor(&d,1);
+                continue;
+            }
             if(e & LX_RIGHT_PRESS) {
                 d.wallpaper_menu=0;
                 int id = d.inside && !d.naming && !d.menu ? window_at(&d,d.mx,d.my) : -1;
@@ -1875,9 +2077,23 @@ __attribute__((noreturn)) void desktop_start(const char *cwd, const char *args, 
             if(d.wallpaper_menu && down && !d.down) {
                 int x=d.mx-d.wallpaper_x,y=d.my-d.wallpaper_y;
                 if(d.inside && x>=0 && x<WALL_WIDTH && y>=WALL_ROW && y<WALL_HEIGHT) {
-                    d.wallpaper=y/WALL_ROW-1;
-                    char value='0'+d.wallpaper;
-                    if(lx_save_file(wall_path,&value,1)<0) strcpy(d.message,"Wallpaper could not be saved");
+                    int choice = y/WALL_ROW-1;
+                    d.message[0] = 0;
+                    if (choice == WALL_COUNT) {
+                        d.naming = WALL_PROMPT;
+                        strcpy(d.filename,d.wall_file);
+                        name_begin(&d,1);
+                    } else {
+                        char value = '0'+choice;
+                        if (lx_save_file(wall_path,&value,1) < 0)
+                            strcpy(d.message,"无法保存壁纸设置");
+                        else {
+                            free(d.wall_image);
+                            d.wall_image = NULL;
+                            d.wall_file[0] = 0;
+                            d.wallpaper = choice;
+                        }
+                    }
                 }
                 d.wallpaper_menu=0; d.down=1; render(&d); continue;
             }

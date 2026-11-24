@@ -1,0 +1,12 @@
+--- a/lib/cli.js
++++ b/lib/cli.js
+@@ -1,7 +1,8 @@
+ try {
+   const { enableCompileCache } = require('node:module')
+   /* istanbul ignore next */
+-  if (enableCompileCache) {
++  // Each new cache file commits a filesystem snapshot on LixinOS.
++  if (enableCompileCache && process.platform !== 'lixinos') {
+     enableCompileCache()
+   }
+ } catch (e) { /* istanbul ignore next */ }

@@ -1,0 +1,11 @@
+--- a/p11-kit/meson.build
++++ b/p11-kit/meson.build
+@@ -136,7 +136,7 @@
+   '-Wl,-z,nodelete'
+ ])
+ 
+-libp11_kit = shared_library('p11-kit',
++libp11_kit = library('p11-kit',
+                             libp11_kit_sources,
+                             install: true,
+                             version: library_version,

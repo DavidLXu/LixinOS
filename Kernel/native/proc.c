@@ -1,5 +1,6 @@
 #include "native.h"
 #include "version.h"
+#include "smp.h"
 
 /* A physical /proc on an older disk takes precedence over the virtual mount. */
 static const char *names[] = {"cpuinfo", "meminfo", "stat", "uptime", "version"};
@@ -42,7 +43,10 @@ int vfs_lookup(const char *path, struct file *f) {
     static char buffer[NATIVE_TASKS][512];
     char *text = buffer[task_active()], *p = text;
     if (i == 0)
-        p = add_text(p, "processor\t: 0\nmodel name\t: LixinOS aarch64 vCPU\n");
+        for (unsigned cpu = 0; cpu < smp_cpus(); cpu++) {
+            p = add_number(add_text(p, "processor\t: "), cpu);
+            p = add_text(p, "\nmodel name\t: LixinOS aarch64 vCPU\n");
+        }
     if (i == 1) {
         u64 free = (heap_capacity_bytes() - heap_bytes()) / 1024;
         p = add_number(add_text(p, "MemTotal:       "), native_ram_bytes() / 1024);
@@ -53,10 +57,13 @@ int vfs_lookup(const char *path, struct file *f) {
     if (i == 2 || i == 3) {
         u64 hz = clock_hz(), time = clock_ticks() * 100 / hz, idle = idle_ticks() * 100 / hz;
         if (i == 2) {
-            for (unsigned cpu = 0; cpu < 2; cpu++) {
-                p = add_number(add_text(p, cpu ? "cpu0 0 0 " : "cpu  0 0 "), time - idle);
+            u64 remote = smp_busy_ticks() * 100 / hz;
+            u64 other_idle = smp_cpus() == 2 && time > remote ? time - remote : 0;
+            for (unsigned cpu = 0; cpu <= smp_cpus(); cpu++) {
+                p = add_number(add_text(p, cpu == 2 ? "cpu1 0 0 " : cpu ? "cpu0 0 0 " : "cpu  0 0 "),
+                               cpu == 2 ? remote : time - idle + (cpu ? 0 : remote));
                 *p++ = ' ';
-                p = add_number(p, idle);
+                p = add_number(p, cpu == 2 ? other_idle : idle + (cpu ? 0 : other_idle));
                 p = add_text(p, " 0 0 0 0 0 0\n");
             }
         } else {

@@ -1,6 +1,6 @@
 # LixinOS
 
-**0.4.0** · [中文系统手册](docs/README.md) · [版本说明](docs/0.4.0.md)
+**0.5.0** · [中文系统手册](docs/README.md) · [版本说明](docs/0.5.0.md)
 
 ## Choose a kernel at startup
 

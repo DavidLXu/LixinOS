@@ -1,4 +1,3 @@
-//! Time-sliced continuations on one vCPU. Input focus is independent of execution.
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -9,6 +8,14 @@ use core::{
 
 global_asm!(include_str!("scheduler.S"));
 unsafe extern "C" {
+    fn smp_init(gic3: i32);
+    pub(crate) fn smp_cpus() -> u32;
+    pub(crate) fn smp_busy_ticks() -> u64;
+    fn smp_cpu() -> u32;
+    pub(crate) fn smp_idle_ticks(cpu: u32) -> u64;
+    fn smp_idle_wait(delay: u64);
+    fn smp_kernel_yield();
+    fn smp_revoke_clock(cpu: u32);
     fn swap_stack(save: *mut usize, resume: usize, fresh_top: usize);
 }
 pub const CAPACITY: usize = 16;
@@ -18,6 +25,7 @@ type Entry = Box<dyn FnOnce() -> ExitStatus>;
 #[derive(Clone, Copy, PartialEq)]
 enum State {
     Free,
+    Idle,
     Ready,
     Waiting(usize),
     Foreground(usize, u64),
@@ -27,6 +35,7 @@ enum State {
 }
 struct Task {
     state: State,
+    core: usize,
     pid: usize,
     pane: usize,
     parent: usize,
@@ -46,6 +55,7 @@ struct Task {
 impl Task {
     const EMPTY: Self = Self {
         state: State::Free,
+        core: 0,
         pid: 0,
         pane: 0,
         parent: 0,
@@ -92,10 +102,10 @@ fn notify(mut condition: impl FnMut(State) -> bool) {
         }
     });
 }
-static mut TASKS: [Task; CAPACITY] = [const { Task::EMPTY }; CAPACITY];
+static mut TASKS: [Task; CAPACITY + 2] = [const { Task::EMPTY }; CAPACITY + 2];
 #[cfg(feature = "split")]
 static mut INPUT: [VecDeque<u8>; 2] = [const { VecDeque::new() }; 2];
-static mut ACTIVE: usize = 0;
+static mut ACTIVE: [usize; 2] = [0, CAPACITY + 1];
 static mut NEXT_PID: usize = 2;
 #[cfg(feature = "split")]
 static mut FOCUS: usize = 0;
@@ -104,8 +114,8 @@ static mut RETIRED: Option<usize> = None;
 static mut STARTUP_DEADLINE: u64 = 0;
 static mut ONLINE: bool = false;
 static mut START_TICKS: u64 = 0;
-static mut LAST_IDLE: u64 = 0;
-static mut LAST_SWITCH: u64 = 0;
+static mut LAST_IDLE: [u64; 2] = [0; 2];
+static mut LAST_SWITCH: [u64; 2] = [0; 2];
 static mut TIMER_INTERRUPTS:u64=0;
 pub fn timer_interrupts()->u64 {unsafe {TIMER_INTERRUPTS}}
 static mut GIC3: bool = false;
@@ -113,7 +123,36 @@ fn task(slot: usize) -> &'static mut Task {
     unsafe { &mut (*addr_of_mut!(TASKS))[slot] }
 }
 pub fn active() -> usize {
-    unsafe { ACTIVE }
+    unsafe { ACTIVE[core_id()] }
+}
+
+pub(crate) fn core_id() -> usize { unsafe { smp_cpu() as usize } }
+fn choose_core() -> usize {
+    if unsafe { smp_cpus() } == 1 { return 0; }
+    let mut load = [0usize; 2];
+    let mut children = [0usize; 2];
+    let parent = pid();
+    for i in 0..CAPACITY {
+        let t = task(i);
+        if matches!(t.state, State::Free | State::Exited(_)) { continue; }
+        if t.parent == parent { children[t.core] += 1; }
+        if t.state == State::Ready { load[t.core] += 1; }
+    }
+    if children[0] != children[1] { return usize::from(children[1] < children[0]); }
+    if load[0] == load[1] { 1 - core_id() } else { usize::from(load[1] < load[0]) }
+}
+#[unsafe(no_mangle)]
+extern "C" fn smp_bind_kernel() {
+    #[cfg(feature = "split")]
+    if active() < CAPACITY { crate::graphics::select_pane(pane()); }
+}
+#[unsafe(no_mangle)]
+extern "C" fn smp_secondary_schedule() -> ! {
+    unsafe { LAST_SWITCH[1] = crate::monitor::ticks(); }
+    idle_scheduler()
+}
+fn idle_scheduler() -> ! {
+    loop { schedule(); }
 }
 
 pub(crate) fn parent_slot(slot: usize) -> Option<usize> {
@@ -128,7 +167,8 @@ pub(crate) fn process_list() -> alloc::string::String {
         let task = task(slot);
         let state = match task.state {
             State::Free => continue,
-            State::Ready if slot == active() => "running",
+            State::Idle => "idle",
+            State::Ready if unsafe { (*core::ptr::addr_of!(ACTIVE)).contains(&slot) } => "running",
             State::Ready => "ready",
             State::Waiting(_) | State::Foreground(_, _) | State::Channel(_) => "waiting",
             State::Sleeping(_) => "sleeping",
@@ -149,16 +189,16 @@ pub fn set_task_name(path: &str) {
 // ABI 29/9: wall ticks, idle ticks, RAM bytes; each row has six u64s and a 32-byte name.
 pub fn resource_snapshot(out: &mut [u64]) -> usize {
     let now = crate::monitor::cpu_counters();
-    out[..3].copy_from_slice(&[now.ticks,now.idle_ticks,crate::inspect::ram_size().unwrap_or(0) as u64]);
+    out[..3].copy_from_slice(&[now.ticks,now.normalized_idle(),crate::inspect::ram_size().unwrap_or(0) as u64]);
     let mut n=3;
     for id in 0..CAPACITY {
         let t=task(id);
         let state=match t.state {
-            State::Free=>continue, State::Ready if id==active()=>1, State::Ready=>2,
+            State::Free=>continue, State::Idle=>continue, State::Ready if unsafe { ACTIVE[t.core] }==id=>1, State::Ready=>2,
             State::Sleeping(_)=>3, State::Exited(_)=>5, _=>4,
         };
         let mut cpu=t.ticks.saturating_sub(t.idle);
-        if id==active() { unsafe { cpu+=(now.ticks-LAST_SWITCH).saturating_sub(now.idle_ticks-LAST_IDLE); } }
+        if unsafe { ACTIVE[t.core] } == id { unsafe { cpu += (now.ticks-LAST_SWITCH[t.core]).saturating_sub(smp_idle_ticks(t.core as u32)-LAST_IDLE[t.core]); } }
         out[n..n+6].copy_from_slice(&[t.pid as u64,t.parent as u64,cpu,crate::user::private_bytes(id) as u64,state,t.background as u64]);
         for (i,bytes) in t.name.chunks_exact(8).enumerate() { out[n+6+i]=u64::from_le_bytes(bytes.try_into().unwrap()); }
         n+=10;
@@ -183,7 +223,7 @@ pub fn pid() -> usize {
     task(active()).pid
 }
 pub fn ticks() -> u64 {
-    unsafe { task(active()).ticks + crate::monitor::ticks().wrapping_sub(LAST_SWITCH) }
+    unsafe { task(active()).ticks + crate::monitor::ticks().wrapping_sub(LAST_SWITCH[core_id()]) }
 }
 pub(crate) fn uptime_ticks() -> u64 {
     crate::monitor::ticks().wrapping_sub(unsafe { START_TICKS })
@@ -211,6 +251,7 @@ pub fn spawn(entry: Entry, pane: usize) -> Result<usize, &'static str> {
     crate::user::setup_bank(slot)?;
     *task(slot) = Task {
         state: State::Ready,
+        core: choose_core(),
         pid,
         pane,
         // A login on another pane has its own controlling terminal.
@@ -230,13 +271,19 @@ pub fn spawn(entry: Entry, pane: usize) -> Result<usize, &'static str> {
     Ok(pid)
 }
 pub fn init() {
+    for c in 0..2 {
+        let idle = task(CAPACITY+c);
+        idle.core = c;
+        idle.state = State::Idle;
+        idle.stack.resize(STACK_BYTES/16, 0);
+    }
     task(0).state = State::Ready;
     task(0).pid = 1;
     unsafe {
         START_TICKS = crate::monitor::ticks();
-        LAST_SWITCH = START_TICKS;
+        LAST_SWITCH[0] = START_TICKS;
         ONLINE = true;
-        STARTUP_DEADLINE = LAST_SWITCH + crate::monitor::seconds_to_ticks(1);
+        STARTUP_DEADLINE = START_TICKS + crate::monitor::seconds_to_ticks(1);
         GIC3 = read_volatile(0x0800_ffe8 as *const u32) >> 4 & 15 >= 3;
         if !GIC3 {
             write_volatile(0x0800_0100 as *mut u32, 1 << 27);
@@ -245,7 +292,7 @@ pub fn init() {
             write_volatile(0x0801_0004 as *mut u32, 255);
             write_volatile(0x0801_0000 as *mut u32, 1);
         } else {
-            // QEMU virt GICv3, single redistributor. Virtual timer is PPI 27.
+            // QEMU virt GICv3 redistributor for CPU 0. Virtual timer is PPI 27.
             let waker = 0x080a_0014 as *mut u32;
             write_volatile(waker, read_volatile(waker) & !2);
             while read_volatile(waker) & 4 != 0 {
@@ -260,6 +307,7 @@ pub fn init() {
             asm!("dsb sy", "mrs x9, ICC_SRE_EL1", "orr x9,x9,#1", "msr ICC_SRE_EL1,x9", "isb",
              "mov x9,#255", "msr ICC_PMR_EL1,x9","mov x9,#1","msr ICC_IGRPEN1_EL1,x9","isb",out("x9") _);
         }
+        smp_init(GIC3 as i32);
         rearm();
         asm!("mov x9,#1","msr cntv_ctl_el0,x9","isb",out("x9") _);
     }
@@ -273,7 +321,7 @@ fn rearm() {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn task_timer_irq() {
+extern "C" fn smp_timer_irq(_frame: *mut u8) {
     let id: u64;
     unsafe {
         if GIC3 {
@@ -318,6 +366,7 @@ fn collect_retired() {
 extern "C" fn start_task() -> ! {
     collect_retired();
     let slot = active();
+    if slot >= CAPACITY { idle_scheduler(); }
     let status = task(slot).entry.take().unwrap()();
     finish(status)
 }
@@ -349,6 +398,8 @@ pub fn stopped() -> u8 { task(active()).stop }
 
 fn stop_tree(slot: usize, status: u8) {
     if matches!(task(slot).state, State::Free | State::Exited(_)) { return; }
+    let cpu = task(slot).core;
+    if unsafe { ACTIVE[cpu] } == slot { unsafe { smp_revoke_clock(cpu as u32); } }
     task(slot).stop = status;
     let waiters = unsafe { &mut *addr_of_mut!(WAITERS) };
     if let Some(i) = waiters.iter().position(|&id| id == slot) {
@@ -464,49 +515,37 @@ pub fn schedule() {
     let old = active();
     for step in 1..CAPACITY {
         let i = (old + step) % CAPACITY;
-        if matches!(task(i).state, State::Exited(_)) && task(i).parent == 0 {
+        if matches!(task(i).state, State::Exited(_)) && task(i).parent == 0 && i != old {
             *task(i) = Task::EMPTY;
         }
     }
-    let new = loop {
-        let now = crate::monitor::ticks();
-        notify(|s| matches!(s,State::Sleeping(deadline) | State::Foreground(_, deadline) if deadline<=now));
-        if let Some(next) = unsafe { (&mut *addr_of_mut!(READY)).pop_front() } {
-            if next == old {
-                return;
-            }
-            break next;
-        }
-        if task(old).state == State::Ready {
-            return;
-        }
-        // IRQs stay masked in EL1; sleep until the next virtual-timer poll.
-        let delay = crate::monitor::seconds_to_ticks(1) / 1000;
-        let idle_start = crate::monitor::ticks();
-        unsafe {
-            asm!("msr cntv_tval_el0, {}","isb","wfi", in(reg)delay);
-        }
-        crate::monitor::record_idle_since(idle_start);
+    let cpu = core_id();
+    let now = crate::monitor::ticks();
+    notify(|s| matches!(s,State::Sleeping(deadline) | State::Foreground(_,deadline) if deadline<=now));
+    let ready = unsafe { &mut *addr_of_mut!(READY) };
+    let next = ready.iter().position(|&i| task(i).core == cpu).and_then(|p| ready.remove(p));
+    let new = match next {
+        Some(id) if id != old => id,
+        _ if task(old).state == State::Ready => { unsafe { smp_kernel_yield(); } return; }
+        _ if old < CAPACITY => CAPACITY + cpu,
+        _ => { unsafe { smp_idle_wait(crate::monitor::seconds_to_ticks(1)/1000); } return; }
     };
     if task(old).state == State::Ready && !unsafe { (&*addr_of_mut!(READY)).contains(&old) } {
         runnable(old);
     }
     let now = crate::monitor::ticks();
     unsafe {
-        task(old).ticks += now.wrapping_sub(LAST_SWITCH);
-        let idle = crate::monitor::cpu_counters().idle_ticks;
-        task(old).idle += idle - LAST_IDLE;
-        LAST_IDLE = idle;
-        LAST_SWITCH = now;
+        task(old).ticks += now.wrapping_sub(LAST_SWITCH[core_id()]);
+        let idle = smp_idle_ticks(cpu as u32);
+        task(old).idle += idle - LAST_IDLE[cpu];
+        LAST_IDLE[cpu] = idle;
+        LAST_SWITCH[cpu] = now;
         if matches!(task(old).state, State::Exited(_)) {
             RETIRED = Some(old);
         }
-        ACTIVE = new;
-        #[cfg(feature = "split")]
-        if task(old).pane != task(new).pane {
-            crate::graphics::switch_pane();
-        }
-        crate::user::select_bank(new);
+        ACTIVE[cpu] = new;
+        smp_bind_kernel();
+        crate::user::select_bank(if new < CAPACITY { new } else { 0 });
         let stack = &task(new).stack;
         let top = stack.as_ptr() as usize + stack.len() * 16;
         swap_stack(addr_of_mut!(task(old).sp), task(new).sp, top);
@@ -545,7 +584,7 @@ pub fn checkpoint() {
         return;
     }
     let now = crate::monitor::ticks();
-    if now.wrapping_sub(unsafe { LAST_SWITCH }) >= crate::monitor::seconds_to_ticks(1) / 100 {
+    if now.wrapping_sub(unsafe { LAST_SWITCH[core_id()] }) >= crate::monitor::seconds_to_ticks(1) / 100 {
         schedule();
     }
 }

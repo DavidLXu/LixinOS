@@ -1,7 +1,7 @@
 //! Launch foreground applications with a per-pane grant for one file, or read-only metrics.
 const EDITOR_LIMIT: usize = 1024 * 1024;
 
-use crate::{disk, monitor, process::Volume, user};
+use crate::{disk, monitor, process::Volume, scheduler, user};
 use alloc::{rc::Rc, string::String, vec::Vec};
 use core::cell::{RefCell, UnsafeCell};
 
@@ -54,7 +54,7 @@ pub fn run(
         let expected = borrowed
             .files
             .get(&path)
-            .map(|v| v.clone().ok_or("is a directory"))
+            .map(|v| v.as_ref().map(disk::FileData::to_vec).ok_or("is a directory"))
             .transpose()?;
         let bytes = expected.as_deref().unwrap_or_default();
         if bytes.len() > EDITOR_LIMIT { return Err("file too large for editor"); }
@@ -88,7 +88,7 @@ pub fn run(
         file.as_ref().map_or("", |f| f.path.as_str())
     );
     let source = alloc::format!("{length}");
-    let native = volume.borrow().files.get(&alloc::format!("/libexec/{name}")).cloned().flatten();
+    let native = volume.borrow().files.get(&alloc::format!("/libexec/{name}")).and_then(Option::as_ref).map(disk::FileData::to_vec);
     let slot = SLOTS[user::bank()].0.get();
     unsafe {
         *slot = Some(Context {
@@ -167,6 +167,19 @@ pub fn io(value: u64, op: u64) -> u64 {
     if op == 37 {
         return if ctx.heap.grow(value as usize).is_ok() { user::WEB_HEAP_BASE as u64 } else { u64::MAX };
     }
+    if op == 16 && value == 1 {
+        // Header followed by the same per-process records as sysinfo 29/9.
+        let words = unsafe { core::slice::from_raw_parts_mut(user::git_mailbox().cast::<u64>(), 512) };
+        words[0] = scheduler::uptime_ticks();
+        words[1] = monitor::seconds_to_ticks(1);
+        words[2] = monitor::heap_usage().1 as u64;
+        let cores = unsafe { scheduler::smp_cpus() };
+        words[3] = u64::from(cores);
+        for cpu in 0..2 {
+            words[4 + cpu as usize] = if cpu < cores { unsafe { scheduler::smp_idle_ticks(cpu) } } else { 0 };
+        }
+        return (48 + scheduler::resource_snapshot(&mut words[6..])) as u64;
+    }
     if op == 16 {
         let (files, dirs, bytes) = disk::file_counts(&ctx.volume.borrow().files);
         let (used, free) = monitor::heap_usage();
@@ -218,7 +231,7 @@ pub fn io(value: u64, op: u64) -> u64 {
         return 1;
     }
     let mut volume = ctx.volume.borrow_mut();
-    if volume.files.get(&grant.path).map(Option::as_ref) != grant.expected.as_ref().map(Some) {
+    if volume.files.get(&grant.path).map(Option::as_deref) != grant.expected.as_deref().map(Some) {
         return 2;
     }
     let bytes =

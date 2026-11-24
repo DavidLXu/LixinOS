@@ -1,0 +1,122 @@
+--- a/meson.build
++++ b/meson.build
+@@ -14,6 +14,22 @@
+ 
+ # Use GNU extensions if available
+ add_project_arguments('-D_GNU_SOURCE', language: 'c')
++
++lixinos = cc.get_define('__lixinos__') != ''
++if lixinos
++  config_h_dir = include_directories('.')
++  glib_dep = dependency('glib-2.0', version: '>= 2.68')
++  gobject_dep = dependency('gobject-2.0')
++  gio_dep = dependency('gio-2.0')
++  gio_unix_dep = dependency('gio-unix-2.0')
++  config = configuration_data()
++  config.set_quoted('GETTEXT_PACKAGE', 'gdm')
++  config.set('ENABLE_WAYLAND_SUPPORT', 1)
++  config.set('ENABLE_USER_DISPLAY_SERVER', 1)
++  configure_file(output: 'config.h', configuration: config)
++  subdir('libgdm')
++  subdir_done()
++endif
+ 
+ # Options
+ gdm_prefix = get_option('prefix')
+--- a/libgdm/meson.build
++++ b/libgdm/meson.build
+@@ -56,9 +56,11 @@
+   glib_dep,
+   gio_dep,
+   gio_unix_dep,
+-  logind_dep,
+-  libgdmcommon_dep,
+ ]
++
++if not lixinos
++  libgdm_deps += [logind_dep, libgdmcommon_dep]
++endif
+ 
+ libgdm_link_flags = [
+   '-Wl,--version-script,@0@/libgdm.map'.format(meson.current_source_dir()),
+@@ -86,6 +88,7 @@
+   sources: libgdm_built_sources,
+ )
+ 
++if not lixinos
+ libgdm_gir = gnome.generate_gir(libgdm,
+   sources: [
+     libgdm_headers,
+@@ -99,6 +102,8 @@
+   install: true,
+ )
+ 
++endif
++
+ # Pkg-config file
+ pkgconfig.generate(libgdm,
+   name: 'GDM Client Library',
+--- a/libgdm/gdm-sessions.c
++++ b/libgdm/gdm-sessions.c
+@@ -35,7 +35,9 @@
+ #include <glib/gi18n.h>
+ #include <glib/gstdio.h>
+ 
++#ifndef __lixinos__
+ #include <systemd/sd-login.h>
++#endif
+ 
+ #include "gdm-sessions.h"
+ 
+@@ -60,6 +62,7 @@
+   g_free (session);
+ }
+ 
++#ifndef __lixinos__
+ static char *
+ get_systemd_session (void)
+ {
+@@ -104,6 +107,8 @@
+ 
+         return g_steal_pointer (&seat);
+ }
++
++#endif
+ 
+ /* adapted from gnome-menus desktop-entries.c */
+ static gboolean
+@@ -138,7 +143,11 @@
+                 g_error_free (error);
+         }
+ 
++#ifdef __lixinos__
++        seat = g_strdup (g_getenv ("XDG_SEAT"));
++#else
+         seat = get_systemd_seat ();
++#endif
+ 
+         only_headless_allowed = seat == NULL;
+ 
+--- a/libgdm/gdm-user-switching.c
++++ b/libgdm/gdm-user-switching.c
+@@ -19,12 +19,20 @@
+  *
+  */
+ 
++#ifndef __lixinos__
+ #include "common/gdm-common.h"
++#endif
+ #include "gdm-user-switching.h"
+ 
+ gboolean
+ gdm_goto_login_session_sync (GCancellable  *cancellable,
+                              GError       **error)
+ {
++#ifdef __lixinos__
++        g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
++                             "No GDM seat is managing the LixinOS session");
++        return FALSE;
++#else
+         return gdm_goto_login_session (cancellable, error);
++#endif
+ }

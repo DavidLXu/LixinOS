@@ -1,0 +1,14 @@
+--- a/codex-rs/exec-server/src/lib.rs
++++ b/codex-rs/exec-server/src/lib.rs
+@@ -141,6 +141,11 @@
+ pub use fs_helper_main::main as run_fs_helper_main;
+ pub use local_file_system::LOCAL_FS;
+ pub use local_file_system::LocalFileSystem;
++#[cfg(lixinos)]
++mod lixinos_output;
++#[cfg(lixinos)]
++pub use lixinos_output::BoundOutput;
++#[cfg(not(lixinos))]
+ pub use no_follow::BoundOutput;
+ pub use noise_channel::NoiseChannelError;
+ pub use noise_channel::NoiseChannelIdentity;

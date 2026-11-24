@@ -45,7 +45,7 @@ uint8_t findTarget(uint8_t array[SIZE], uint8_t x, uint8_t stop)
 	return x;
 }
 
-bool slideArray(uint8_t array[SIZE], uint32_t *score)
+static bool slideLine(uint8_t array[SIZE], uint32_t *score, uint8_t *targets)
 {
 	bool success = false;
 	uint8_t x, t, stop = 0;
@@ -55,6 +55,7 @@ bool slideArray(uint8_t array[SIZE], uint32_t *score)
 		if (array[x] != 0)
 		{
 			t = findTarget(array, x, stop);
+			if (targets) targets[x] = t;
 			// if target is not original position, then move or merge
 			if (t != x)
 			{
@@ -80,80 +81,32 @@ bool slideArray(uint8_t array[SIZE], uint32_t *score)
 	return success;
 }
 
-void rotateBoard(uint8_t board[SIZE][SIZE])
-{
-	uint8_t i, j, n = SIZE;
-	uint8_t tmp;
-	for (i = 0; i < n / 2; i++)
-	{
-		for (j = i; j < n - i - 1; j++)
-		{
-			tmp = board[i][j];
-			board[i][j] = board[j][n - i - 1];
-			board[j][n - i - 1] = board[n - i - 1][n - j - 1];
-			board[n - i - 1][n - j - 1] = board[n - j - 1][i];
-			board[n - j - 1][i] = tmp;
-		}
-	}
+enum Direction { LEFT, RIGHT, UP, DOWN, NO_MOVE };
+typedef uint8_t Board[SIZE][SIZE];
+
+/* Positions are numbered x*SIZE+y. Each original tile has one destination,
+ * including both tiles participating in a merge. */
+static int position(enum Direction d, int line, int step) {
+    if (d == RIGHT || d == DOWN) step = SIZE-1-step;
+    return (d == UP || d == DOWN) ? line*SIZE+step : step*SIZE+line;
 }
 
-bool moveUp(uint8_t board[SIZE][SIZE], uint32_t *score)
-{
-	bool success = false;
-	uint8_t x;
-	for (x = 0; x < SIZE; x++)
-	{
-		success |= slideArray(board[x], score);
-	}
-	return success;
-}
-
-bool moveLeft(uint8_t board[SIZE][SIZE], uint32_t *score)
-{
-	bool success;
-	rotateBoard(board);
-	success = moveUp(board, score);
-	rotateBoard(board);
-	rotateBoard(board);
-	rotateBoard(board);
-	return success;
-}
-
-bool moveDown(uint8_t board[SIZE][SIZE], uint32_t *score)
-{
-	bool success;
-	rotateBoard(board);
-	rotateBoard(board);
-	success = moveUp(board, score);
-	rotateBoard(board);
-	rotateBoard(board);
-	return success;
-}
-
-bool moveRight(uint8_t board[SIZE][SIZE], uint32_t *score)
-{
-	bool success;
-	rotateBoard(board);
-	rotateBoard(board);
-	rotateBoard(board);
-	success = moveUp(board, score);
-	rotateBoard(board);
-	return success;
-}
-
-bool findPairDown(uint8_t board[SIZE][SIZE])
-{
-	bool success = false;
-	uint8_t x, y;
-	for (x = 0; x < SIZE; x++)
-	{
-		for (y = 0; y < SIZE - 1; y++)
-		{
-			if (board[x][y] == board[x][y + 1])
-				return true;
-		}
-	}
-	return success;
+static bool slideBoard(Board b, enum Direction d, uint32_t *score, uint8_t *dest) {
+    bool changed = false;
+    for (int line = 0; line < SIZE; ++line) {
+        uint8_t values[SIZE], targets[SIZE] = {0};
+        for (int i = 0; i < SIZE; ++i) {
+            int p = position(d,line,i);
+            values[i] = b[p/SIZE][p%SIZE];
+        }
+        changed |= slideLine(values, score, dest ? targets : 0);
+        for (int i = 0; i < SIZE; ++i) {
+            int p = position(d,line,i);
+            b[p/SIZE][p%SIZE] = values[i];
+            if (dest) dest[p] = position(d,line,targets[i]);
+        }
+    }
+    return changed;
 }
 
 uint8_t countEmpty(uint8_t board[SIZE][SIZE])
@@ -173,18 +126,10 @@ uint8_t countEmpty(uint8_t board[SIZE][SIZE])
 	return count;
 }
 
-bool gameEnded(uint8_t board[SIZE][SIZE])
-{
-	bool ended = true;
-	if (countEmpty(board) > 0)
-		return false;
-	if (findPairDown(board))
-		return false;
-	rotateBoard(board);
-	if (findPairDown(board))
-		ended = false;
-	rotateBoard(board);
-	rotateBoard(board);
-	rotateBoard(board);
-	return ended;
+static bool gameEnded(Board b) {
+    for (int x = 0; x < SIZE; ++x)
+        for (int y = 0; y < SIZE; ++y)
+            if (!b[x][y] || (x && b[x][y] == b[x-1][y]) || (y && b[x][y] == b[x][y-1]))
+                return false;
+    return true;
 }

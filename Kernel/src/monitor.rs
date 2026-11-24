@@ -17,30 +17,34 @@ pub fn seconds_to_ticks(seconds: u64) -> u64 {
 pub(crate) struct CpuCounters {
     pub ticks: u64,
     pub idle_ticks: u64,
+    secondary_busy: u64,
 }
 
 impl CpuCounters {
     #[cfg(feature = "retina")]
-    pub const ZERO: Self = Self { ticks: 0, idle_ticks: 0 };
+    pub const ZERO: Self = Self { ticks: 0, idle_ticks: 0, secondary_busy: 0 };
+
+    // Keep the resource snapshot ABI in wall-clock units.
+    pub fn normalized_idle(self) -> u64 {
+        if unsafe { crate::scheduler::smp_cpus() } == 1 { return self.idle_ticks; }
+        (self.idle_ticks + self.ticks.saturating_sub(self.secondary_busy)) / 2
+    }
 
     pub fn busy_percent(self, start: Self) -> Option<u64> {
         let elapsed = self.ticks.wrapping_sub(start.ticks);
         let idle = self.idle_ticks.wrapping_sub(start.idle_ticks);
-        let busy = elapsed.saturating_sub(idle);
+        let remote = (self.secondary_busy - start.secondary_busy).min(elapsed);
+        let busy = elapsed.saturating_sub(idle) + remote;
+        let elapsed = elapsed * u64::from(unsafe { crate::scheduler::smp_cpus() });
         let rounded = u128::from(busy) * 100 + u128::from(elapsed / 2);
         (elapsed != 0).then(|| (rounded / u128::from(elapsed)) as u64)
     }
 }
 
-// Scheduler idle waits execute with IRQs masked on the guest's single vCPU.
-static mut IDLE_TICKS: u64 = 0;
-
-pub(crate) fn record_idle_since(start: u64) {
-    unsafe { IDLE_TICKS = IDLE_TICKS.wrapping_add(ticks().wrapping_sub(start)); }
-}
-
 pub(crate) fn cpu_counters() -> CpuCounters {
-    CpuCounters { ticks: ticks(), idle_ticks: unsafe { IDLE_TICKS } }
+    unsafe extern "C" { fn smp_idle_ticks(cpu: u32) -> u64; }
+    CpuCounters { ticks: ticks(), idle_ticks: unsafe { smp_idle_ticks(0) },
+        secondary_busy: unsafe { crate::scheduler::smp_busy_ticks() } }
 }
 
 pub fn heap_usage() -> (usize, usize) {

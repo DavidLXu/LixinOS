@@ -1,0 +1,8 @@
+model = "deepseek-flash"
+model_provider = "deepseek"
+web_search = "disabled"
+
+[model_providers.deepseek]
+name = "DeepSeek"
+base_url = "http://10.0.2.102:8765/v1"
+wire_api = "responses"

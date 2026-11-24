@@ -1,0 +1,10 @@
+<mujoco model="lixinos-pendulum">
+  <option timestep="0.002" gravity="0 0 -9.8" integrator="RK4"/>
+  <worldbody>
+    <body name="rod">
+      <joint name="pivot" type="hinge" axis="0 1 0"/>
+      <geom type="capsule" fromto="0 0 0 0 0 -0.65" size="0.02" mass="0.65"/>
+    </body>
+  </worldbody>
+  <keyframe><key name="release" qpos="0.5"/></keyframe>
+</mujoco>

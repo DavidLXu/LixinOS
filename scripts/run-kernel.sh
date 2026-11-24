@@ -71,6 +71,7 @@ fi
 tcc_loader=${LIXINOS_TCC_LOADER:-$tcc_loader}
 
 release_dir="$root/kernel-artifacts"
+auto_release=false
 if "$source_boot"; then
     release_dir=
 elif [[ -n $release ]]; then
@@ -78,43 +79,46 @@ elif [[ -n $release ]]; then
         echo '不能同时指定已发布版本和自定义引导镜像。' >&2
         exit 2
     fi
-    if [[ $release == latest ]]; then
-        release=$(python3 "$root/scripts/kernel-release.py" latest)
-        [[ -n $release ]] || { echo '没有可用的本地内核发布版本。' >&2; exit 1; }
-    fi
 elif [[ ! -f "$release_dir/manifest.json" && -z ${LIXINOS_KERNEL:-} &&
         -z ${LIXINOS_TCC_LOADER:-} &&
         ( -z ${LIXINOS_DISK:-} || $LIXINOS_DISK -ef $rust_default ) &&
         ( -z ${LIXINOS_TCC_DISK:-} || $LIXINOS_TCC_DISK -ef $tcc_default ) ]]; then
-    release=$(python3 "$root/scripts/kernel-release.py" latest)
-fi
-
-rust_label="Rust 原版内核"
-tcc_label="TCC 自举内核（磁盘引导）"
-if [[ -n $release ]]; then
-    rust_label="Rust · $release"
-    tcc_label="TCC · $release"
+    auto_release=true
 fi
 
 cd "$root/Kernel"
 tcc_ready=false
-if [[ -s $tcc_disk && -r $tcc_disk && ( -n $release || ( -s $tcc_loader && -r $tcc_loader ) ) ]]; then
+if [[ -s $tcc_disk && -r $tcc_disk && ( -n $release || "$auto_release" == true || ( -s $tcc_loader && -r $tcc_loader ) ) ]]; then
     tcc_ready=true
 fi
 
-read_preferences() {
-    local values
-    values=$(python3 ../scripts/disk_image.py --boot-preferences "$1") || return
-    read -r preferred_mode preferred_zone preferred_kernel preferred_port preferred_model <<< "$values"
-    preferences_disk=$1
-}
 preferences_disk=
 menu_kernel=rust
-# Custom images and noninteractive runs with an explicit disk are already configured.
+explicit_release=$release
+# Only run the early helper when the interactive menu needs tag labels or saved preferences.
 if [[ -z $choice && -z ${LIXINOS_KERNEL:-} ]] && [[ -t 0 || -z ${LIXINOS_DISK:-} ]]; then
+    early_args=(--phase early)
+    if [[ -n $release ]]; then early_args+=(--release "$release"); fi
+    if "$auto_release"; then early_args+=(--auto-release); fi
     if "$tcc_ready" && [[ ${LIXINOS_DISK:-$rust_default} -ef $tcc_disk ]]; then
-        read_preferences "$tcc_disk"
-        menu_kernel=$preferred_kernel
+        early_args+=(--read-prefs-disk "$tcc_disk")
+    fi
+    prep_out=$(python3 "$root/scripts/boot_prep.py" "${early_args[@]}") || exit $?
+    eval "$prep_out"
+    if [[ $explicit_release == latest && -z $release ]]; then
+        echo '没有可用的本地内核发布版本。' >&2; exit 1
+    fi
+    auto_release=false
+    [[ -z ${preferred_kernel:-} ]] || menu_kernel=$preferred_kernel
+    tcc_ready=false
+    if [[ -s $tcc_disk && -r $tcc_disk && ( -n $release || ( -s $tcc_loader && -r $tcc_loader ) ) ]]; then
+        tcc_ready=true
+    fi
+    rust_label="Rust 原版内核"
+    tcc_label="TCC 自举内核（磁盘引导）"
+    if [[ -n $release ]]; then
+        rust_label="Rust · $release"
+        tcc_label="TCC · $release"
     fi
     case $mode in
         --window|--cocoa|--split|--terminal)
@@ -124,8 +128,6 @@ if [[ -z $choice && -z ${LIXINOS_KERNEL:-} ]] && [[ -t 0 || -z ${LIXINOS_DISK:-}
                 alternate=$(python3 ../scripts/disk_image.py --local-alternative "$rust_default")
             fi
             if [[ -n $alternate ]]; then
-                # A source-mode TCC loader belongs to its disk. Published TCC
-                # kernels boot the selected data disk directly.
                 if [[ -n $release ]]; then
                     tcc_ready=true
                 else
@@ -175,13 +177,9 @@ fi
 case $choice in
     rust) unset LIXINOS_KERNEL ;;
     tcc)
-        if ! "$tcc_ready"; then
+        if [[ ! ( -s $tcc_disk && -r $tcc_disk && ( -n $release || "$auto_release" == true || ( -s $tcc_loader && -r $tcc_loader ) ) ) ]]; then
             echo '缺少 TCC 引导程序或系统磁盘，请按 Kernel/native/README.md 制盘。' >&2
             exit 1
-        fi
-        if [[ -n $release ]]; then
-            boot_files=$(python3 ../scripts/kernel-release.py boot-files "$release" tcc)
-            tcc_loader="$boot_files/tcc-kernel.elf"
         fi
         export LIXINOS_KERNEL="$tcc_loader" LIXINOS_DISK="$tcc_disk"
         ;;
@@ -190,60 +188,60 @@ case $choice in
 esac
 
 disk=${LIXINOS_DISK:-$rust_default}
-# Only the selected disk supplies preferences. Explicit launcher options win.
-if [[ $preferences_disk != "$disk" ]]; then read_preferences "$disk"; fi
-if [[ -z $explicit_mode ]]; then mode=--$preferred_mode; fi
-timezone=${LIXINOS_TIMEZONE:-$preferred_zone}
+prep_args=(
+    --phase=launch
+    --disk="$disk"
+    --release="$release"
+    --choice="$choice"
+    --explicit-mode="$explicit_mode"
+    --mode="$mode"
+    --gpu="${LIXINOS_GPU:-auto}"
+    --qemu="${LIXINOS_QEMU:-}"
+    --custom-kernel="${LIXINOS_KERNEL:-}"
+    --release-dir="$release_dir"
+    --timezone="${LIXINOS_TIMEZONE:-}"
+)
+if "$auto_release"; then prep_args+=(--auto-release); fi
+if "$source_boot"; then prep_args+=(--source-boot); fi
+prep_out=$(python3 "$root/scripts/boot_prep.py" "${prep_args[@]}") || exit $?
+eval "$prep_out"
+if [[ -n $custom_kernel ]]; then export LIXINOS_KERNEL="$custom_kernel"; fi
 if [[ $mode == --ssh ]]; then export LIXINOS_SSH_PORT=${LIXINOS_SSH_PORT:-$preferred_port}; fi
 if [[ $preferred_model != auto ]]; then export DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-$preferred_model}; fi
 
 machine=virt
 case $mode in
     --window|--cocoa|--split)
-        # Let Cocoa size the window to the first guest framebuffer before enabling dragging.
-        display=(-name LixinOS -display cocoa,zoom-to-fit=off -serial null
-                 -device ramfb -device virtio-keyboard-device,bus=virtio-mmio-bus.1
+        cocoa=cocoa,zoom-to-fit=off
+        case $gpu_mode in
+            ramfb) gpu_device=ramfb ;;
+            virtio) gpu_device=virtio-gpu-device,bus=virtio-mmio-bus.7 ;;
+            virgl)
+                gpu_device=virtio-gpu-gl-device,bus=virtio-mmio-bus.7
+                cocoa+=,gl=es
+                ;;
+            *) echo "LIXINOS_GPU must be auto, ramfb, virtio or virgl" >&2; exit 2 ;;
+        esac
+        display=(-name LixinOS -display "$cocoa" -serial null
+                 -device "$gpu_device" -device virtio-keyboard-device,bus=virtio-mmio-bus.1
                  -device virtio-tablet-device,bus=virtio-mmio-bus.3)
-        profile=retina
         if [[ $mode == --split ]]; then
-            profile=split
             machine=virt,gic-version=3
         fi
         features=(--features "$profile")
         ;;
     --terminal)
         display=(-display none -chardev stdio,id=console,signal=off -serial chardev:console)
-        profile=window
         features=(--features window-console)
         ;;
     --serial|--ssh)
         display=(-display none -chardev stdio,id=console,signal=off -serial chardev:console)
-        profile=release
         features=()
         if [[ $mode == --ssh ]]; then features=(--features ssh-mux); fi
         ;;
 esac
 
-kernel_image=${LIXINOS_KERNEL:-target/aarch64-unknown-none-softfloat/$profile/lixin-kernel}
-cpython_package=target/user-build/cpython-port/cpython.pkg
-use_release=false
-if [[ -z ${LIXINOS_KERNEL:-} ]]; then
-    variant=$profile
-    if [[ $mode == --ssh ]]; then variant=ssh; fi
-    if [[ -n $release ]]; then
-        release_dir=$(python3 ../scripts/kernel-release.py boot-files "$release" "$variant")
-        use_release=true
-    elif [[ -n $release_dir && -f "$release_dir/manifest.json" ]]; then
-        use_release=true
-    fi
-    if "$use_release"; then
-        kernel_image="$release_dir/rust-$variant.elf"
-        cpython_package="$release_dir/cpython.pkg"
-    fi
-fi
-if [[ -n ${LIXINOS_KERNEL:-} ]] || "$use_release"; then
-    [[ -r "$kernel_image" ]] || { printf 'Cannot read kernel image: %s\n' "$kernel_image" >&2; exit 1; }
-else
+if [[ -z ${LIXINOS_KERNEL:-} ]] && ! "$use_release"; then
     if ! rustup_bin=$(command -v rustup); then
         rustup_bin="${CARGO_HOME:-$HOME/.cargo}/bin/rustup"
     fi
@@ -251,42 +249,39 @@ else
         printf '%s\n' 'Install rustup to build the LixinOS kernel. See README.md for setup.' >&2
         exit 1
     fi
-
     # Bash 3.2 with nounset requires this form for an empty array.
     "$rustup_bin" run stable cargo build --locked --target-dir target --profile "$profile" ${features[@]+"${features[@]}"}
 fi
 printf 'LixinOS 启动盘：%s\n' "$disk" >&2
-# Keep existing standalone kernels on the layout they were built to read.
-ram=640M
-if [[ -z ${LIXINOS_KERNEL:-} ]]; then
+if ! "$disk_prepared"; then
+    ram=640M
     python3 ../scripts/disk_image.py "$disk"
-elif LC_ALL=C grep -aq LIXDISK4 "$kernel_image"; then
-    python3 ../scripts/disk_image.py "$disk"
-    ram=1536M
-else
-    python3 ../scripts/disk_image.py --previous-layout "$disk"
+    if [[ $(head -c8 "$disk") == LIXBLD01 ]]; then ram=12G; fi
 fi
-if [[ $(head -c8 "$disk") == LIXBLD01 ]]; then
-    if [[ -n ${LIXINOS_KERNEL:-} ]]; then
-        if ! LC_ALL=C grep -aq LIXBLD01 "$kernel_image"; then
-            echo "This TCC image needs a loader with build-volume support." >&2
-            exit 1
-        fi
-        ram=24G
-    else
-        ram=12G
-    fi
-fi
-clock_offset=$(TZ="$timezone" date +%z)
-launcher=("$(command -v qemu-system-aarch64)")
+[[ -n $qemu ]] || { echo "找不到 qemu-system-aarch64。" >&2; exit 1; }
+launcher=("$qemu")
 if [[ $mode == --terminal ]]; then
     launcher=(python3 ../scripts/open-terminal.py "${launcher[@]}")
 fi
+need_clipboard=false
 if [[ "$profile" == retina || "$profile" == split ]]; then
-    launcher=(python3 ../scripts/clipboard-bridge.py "${launcher[@]}")
+    need_clipboard=true
 fi
+outbound="user,id=outbound,net=10.0.2.0/24,host=10.0.2.2,guestfwd=tcp:10.0.2.100:22-cmd:../scripts/gpu20-tunnel.sh,guestfwd=tcp:10.0.2.101:8080-cmd:../scripts/map-tile.py"
+codex_bridge=${LIXINOS_CODEX_DEEPSEEK:-auto}
+if [[ $codex_bridge == 1 || ( $codex_bridge == auto && $disk -ef "$work_disk" ) ]]; then
+    outbound+=,guestfwd=tcp:10.0.2.102:8765-cmd:../scripts/codex-deepseek-bridge.py
+fi
+codex_shell=${LIXINOS_CODEX_SHELL:-auto}
+if [[ $codex_shell == 1 || ( $codex_shell == auto && $disk -ef "$work_disk" ) ]]; then
+    export LIXINOS_SHELL_RELEASE=${release:-latest}
+    export LIXINOS_SHELL_FLAVOR=${choice:-rust}
+    outbound+=,guestfwd=tcp:10.0.2.103:8766-cmd:../scripts/codex-shell-worker.py
+fi
+vcpus=${LIXINOS_CPUS:-2}
+case $vcpus in 1|2) ;; *) echo 'LIXINOS_CPUS must be 1 or 2' >&2; exit 2 ;; esac
 vm_args=(
-    -machine "$machine" -accel hvf -cpu host -smp 1 -m "$ram" \
+    -machine "$machine" -accel hvf -cpu host -smp "$vcpus" -m "$ram" \
     "${display[@]}" -monitor none \
     -global virtio-mmio.force-legacy=false \
     -fw_cfg "name=opt/lixinos/clock-offset,string=$clock_offset" \
@@ -294,7 +289,7 @@ vm_args=(
     -device virtio-blk-device,drive=fs,bus=virtio-mmio-bus.0 \
     -object rng-random,id=entropy,filename=/dev/urandom \
     -device virtio-rng-device,rng=entropy,bus=virtio-mmio-bus.5 \
-    -netdev user,id=outbound,net=10.0.2.0/24,host=10.0.2.2,guestfwd=tcp:10.0.2.100:22-cmd:../scripts/gpu20-tunnel.sh,guestfwd=tcp:10.0.2.101:8080-cmd:../scripts/map-tile.py \
+    -netdev "$outbound" \
     -device virtio-net-device,netdev=outbound,bus=virtio-mmio-bus.4 \
     -kernel "$kernel_image"
 )
@@ -312,8 +307,12 @@ fi
 if [[ -n ${DEEPSEEK_API_KEY:-} ]]; then
     if [[ $mode == --terminal ]]; then
         exec python3 ../scripts/agent-bridge.py --terminal "${launcher[@]}" "${vm_args[@]}"
+    elif "$need_clipboard"; then
+        exec python3 ../scripts/agent-bridge.py --clipboard "${launcher[@]}" "${vm_args[@]}"
     fi
     launcher=(python3 ../scripts/agent-bridge.py "${launcher[@]}")
+elif "$need_clipboard"; then
+    launcher=(python3 ../scripts/clipboard-bridge.py "${launcher[@]}")
 fi
 if [[ $mode == --ssh ]]; then
     exec python3 ../scripts/start-ssh.py "${launcher[@]}" "${vm_args[@]}"

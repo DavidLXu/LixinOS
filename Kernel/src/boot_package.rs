@@ -75,8 +75,7 @@ fn cpython() -> Result<Files, &'static str> {
 }
 
 // Only replace files whose contents match an earlier shipped copy.
-fn previous_release(path: &str, bytes: &[u8]) -> bool {
-    let signature = (bytes.len(), disk::checksum(bytes));
+fn previous_release(path: &str, signature: (usize, u32)) -> bool {
     match path {
         "/bin/python3" => matches!(signature,
             (6056, 0xfc56f810) | (6312, 0x7d2ee280) | (6312, 0x3956f4ff) | (6968, 0x547b_29fb)),
@@ -89,7 +88,7 @@ fn previous_release(path: &str, bytes: &[u8]) -> bool {
 
 pub fn install_cpython(volume: &mut crate::process::Volume) -> Result<(), &'static str> {
     if let Some(existing) = volume.files.get("/bin/python3") {
-        if !existing.as_deref().is_some_and(|b| previous_release("/bin/python3", b)) {
+        if !existing.as_ref().is_some_and(|b| previous_release("/bin/python3", b.sig())) {
             return Ok(());
         }
     }
@@ -97,7 +96,7 @@ pub fn install_cpython(volume: &mut crate::process::Volume) -> Result<(), &'stat
     package.retain(|path, contents| volume.files.get(path) != Some(contents));
     for path in package.keys() {
         if let Some(existing) = volume.files.get(path) {
-            if !existing.as_deref().is_some_and(|b| previous_release(path, b)) {
+            if !existing.as_ref().is_some_and(|b| previous_release(path, b.sig())) {
                 return Err("an existing file conflicts with the CPython package");
             }
         }

@@ -1,4 +1,5 @@
 """Open the guest-built Agent window and exercise its live workbench through QMP."""
+from launcher_grid import select_icon
 import argparse
 import gzip
 import json
@@ -149,8 +150,8 @@ def exercise(guest, control, folder, disk):
     guest.send(b"desktop\r")
     wait_for(lambda: pixel(2,2) == "281e2b", "desktop dock")
     click(36,8+7*min(82,(682-48)//8)+19)
-    wait_for(lambda: picture()[2].count(bytes.fromhex("233c3d")) > 10000, "Apps menu")
-    click(128,60)
+    wait_for(lambda: pixel(82,6) == "203f51", "Apps menu")
+    select_icon(click,qmp,1177,682,6,7)
     time.sleep(.45)
     picture()
     app = PurePosixPath("/bin/agent.win3")
@@ -202,7 +203,7 @@ def test(kernel, release):
         wrapper.write_text("#!/bin/sh\nexec " + shlex.join(
             [sys.executable, str(Path(__file__).resolve()), "--fixture", qemu, str(endpoint)]) + ' "$@"\n')
         wrapper.chmod(0o700)
-        launch = ["env", f"PATH={folder}:{os.environ['PATH']}", HERE / "run-kernel.sh",
+        launch = ["env", "LIXINOS_GPU=ramfb", f"PATH={folder}:{os.environ['PATH']}", HERE / "run-kernel.sh",
                   "--kernel", kernel, "--window", *(["--release", release] if release else ["--source"])]
         with SERIAL["boot"](disk, launch) as guest, socket.socket(socket.AF_UNIX) as sock:
             sock.settimeout(10)

@@ -1,0 +1,126 @@
+--- a/codex-rs/core/src/unified_exec/process.rs
++++ b/codex-rs/core/src/unified_exec/process.rs
+@@ -91,6 +91,8 @@
+ 
+ /// Transport-specific process handle used by unified exec.
+ enum ProcessHandle {
++    #[cfg(lixinos)]
++    GuestBuiltin,
+     Local(Box<ExecCommandSession>),
+     ExecServer(Arc<dyn ExecProcess>),
+ }
+@@ -125,6 +127,19 @@
+ }
+ 
+ impl UnifiedExecProcess {
++    #[cfg(lixinos)]
++    pub(crate) async fn guest_builtin(result: std::io::Result<Vec<u8>>) -> Self {
++        let process = Self::new(ProcessHandle::GuestBuiltin, None, OutputDrainPolicy::BoundedAfterExit);
++        let (status, stream, bytes) = match result {
++            Ok(bytes) => (0, ExecOutputStream::Stdout, bytes),
++            Err(error) => (1, ExecOutputStream::Stderr, format!("{error}\n").into_bytes()),
++        };
++        process.output.output_buffer.lock().await.push_chunk(stream, &bytes);
++        process.output.output_closed.store(true, Ordering::Release);
++        process.signal_exit(Some(status));
++        process
++    }
++
+     fn new(
+         process_handle: ProcessHandle,
+         sandbox_type: Option<SandboxType>,
+@@ -161,6 +176,8 @@
+ 
+     pub(super) async fn write(&self, data: &[u8]) -> Result<(), UnifiedExecError> {
+         match &self.process_handle {
++            #[cfg(lixinos)]
++            ProcessHandle::GuestBuiltin => Err(UnifiedExecError::WriteToStdin),
+             ProcessHandle::Local(process_handle) => process_handle
+                 .writer_sender()
+                 .send(data.to_vec())
+@@ -207,6 +224,8 @@
+     pub(super) fn has_exited(&self) -> bool {
+         let state = self.state_rx.borrow().clone();
+         match &self.process_handle {
++            #[cfg(lixinos)]
++            ProcessHandle::GuestBuiltin => true,
+             ProcessHandle::Local(process_handle) => state.has_exited || process_handle.has_exited(),
+             ProcessHandle::ExecServer(_) => state.has_exited,
+         }
+@@ -218,6 +237,8 @@
+         }
+         let state = self.state_rx.borrow().clone();
+         match &self.process_handle {
++            #[cfg(lixinos)]
++            ProcessHandle::GuestBuiltin => state.exit_code,
+             ProcessHandle::Local(process_handle) => {
+                 state.exit_code.or_else(|| process_handle.exit_code())
+             }
+@@ -243,6 +264,8 @@
+ 
+     pub(super) fn terminate(&self) {
+         match &self.process_handle {
++            #[cfg(lixinos)]
++            ProcessHandle::GuestBuiltin => (),
+             ProcessHandle::Local(process_handle) => process_handle.terminate(),
+             ProcessHandle::ExecServer(process_handle) => {
+                 let process_handle = Arc::clone(process_handle);
+@@ -256,6 +279,8 @@
+ 
+     pub(super) async fn terminate_confirmed(&self) -> Result<(), UnifiedExecError> {
+         match &self.process_handle {
++            #[cfg(lixinos)]
++            ProcessHandle::GuestBuiltin => (),
+             ProcessHandle::Local(process_handle) => process_handle.terminate(),
+             ProcessHandle::ExecServer(process_handle) => {
+                 process_handle
+@@ -271,6 +296,8 @@
+ 
+     pub(super) async fn interrupt(&self) -> Result<(), UnifiedExecError> {
+         match &self.process_handle {
++            #[cfg(lixinos)]
++            ProcessHandle::GuestBuiltin => Ok(()),
+             ProcessHandle::Local(process_handle) => process_handle
+                 .signal(PtyProcessSignal::Interrupt)
+                 .map_err(|err| UnifiedExecError::process_failed(err.to_string())),
+--- a/codex-rs/core/src/tools/runtimes/unified_exec.rs
++++ b/codex-rs/core/src/tools/runtimes/unified_exec.rs
+@@ -61,6 +61,8 @@
+ use std::time::Duration;
+ use tokio_util::sync::CancellationToken;
+ 
++#[cfg(lixinos)]
++mod lixinos_readonly;
+ mod launch;
+ mod snapshot_metrics;
+ 
+@@ -604,6 +606,16 @@
+             permissions
+         };
+ 
++        #[cfg(lixinos)]
++        if !environment_is_remote {
++            let output = lixinos_readonly::execute(req, attempt);
++            return Ok(UnifiedExecAttempt {
++                process: UnifiedExecProcess::guest_builtin(output).await,
++                metrics_sidecar,
++                permissions,
++            });
++        }
++
+         let Some((program, args)) = command.split_first() else {
+             return Err(ToolError::Rejected(
+                 "missing command line for PTY".to_string(),
+--- a/codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs
++++ b/codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs
+@@ -102,6 +102,10 @@
+             ExecCommandLifetime::Interactive => spec,
+             ExecCommandLifetime::OneShot => one_shot_exec_command_spec(spec),
+         };
++        #[cfg(lixinos)]
++        if let ToolSpec::Function(spec) = &mut spec {
++            spec.description.push_str(" On the local LixinOS guest use literal pwd, ls [directory], or cat file within the current workspace. Pipes, options, shell syntax, and PTYs are unavailable.");
++        }
+         if !self.options.allow_tty
+             && let ToolSpec::Function(spec) = &mut spec
+         {

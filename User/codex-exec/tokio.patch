@@ -1,0 +1,152 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -970,6 +970,7 @@
+ level = "warn"
+ priority = 0
+ check-cfg = [
++    "cfg(lixinos)",
+     "cfg(fuzzing)",
+     "cfg(loom)",
+     "cfg(mio_unsupported_force_poll_poll)",
+--- a/src/runtime/io/driver/signal.rs
++++ b/src/runtime/io/driver/signal.rs
+@@ -5,7 +5,7 @@
+ impl Handle {
+     pub(crate) fn register_signal_receiver(
+         &self,
+-        receiver: &mut mio::net::UnixStream,
++        receiver: &mut impl mio::event::Source,
+     ) -> io::Result<()> {
+         self.registry
+             .register(receiver, TOKEN_SIGNAL, mio::Interest::READABLE)?;
+--- a/src/runtime/signal/mod.rs
++++ b/src/runtime/signal/mod.rs
+@@ -5,6 +5,7 @@
+ use crate::runtime::{driver, io};
+ use crate::signal::registry::globals;
+ 
++#[cfg(not(lixinos))]
+ use mio::net::UnixStream;
+ use std::io::{self as std_io, Read};
+ use std::sync::{Arc, Weak};
+@@ -21,7 +22,10 @@
+     io: io::Driver,
+ 
+     /// A pipe for receiving wake events from the signal handler
++    #[cfg(not(lixinos))]
+     receiver: UnixStream,
++    #[cfg(lixinos)]
++    receiver: &'static mio::unix::pipe::Receiver,
+ 
+     /// Shared state. The driver keeps a strong ref and the handle keeps a weak
+     /// ref. The weak ref is used to check if the driver is still active before
+@@ -41,8 +45,9 @@
+ impl Driver {
+     /// Creates a new signal `Driver` instance that delegates wakeups to `park`.
+     pub(crate) fn new(io: io::Driver, io_handle: &io::Handle) -> std_io::Result<Self> {
+-        use std::mem::ManuallyDrop;
+-        use std::os::unix::io::{AsRawFd, FromRawFd};
++        use std::os::fd::AsRawFd;
++        #[cfg(not(lixinos))]
++        use std::{mem::ManuallyDrop, os::fd::FromRawFd};
+ 
+         // NB: We give each driver a "fresh" receiver file descriptor to avoid
+         // the issues described in alexcrichton/tokio-process#42.
+@@ -64,14 +69,25 @@
+         // only expect at least one dup to receive the notification.
+ 
+         // Manually drop as we don't actually own this instance of UnixStream.
++        #[cfg(not(lixinos))]
+         let receiver_fd = globals().receiver.as_raw_fd();
+ 
+         // safety: there is nothing unsafe about this, but the `from_raw_fd` fn is marked as unsafe.
++        #[cfg(not(lixinos))]
+         let original =
+             ManuallyDrop::new(unsafe { std::os::unix::net::UnixStream::from_raw_fd(receiver_fd) });
++        #[cfg(not(lixinos))]
+         let mut receiver = UnixStream::from_std(original.try_clone()?);
+ 
++        #[cfg(not(lixinos))]
+         io_handle.register_signal_receiver(&mut receiver)?;
++
++        // Mio's poll backend keeps a separate pollfd list for each reactor,
++        // so each can watch the same nonblocking read end without dup(2).
++        #[cfg(lixinos)]
++        let receiver = &globals().receiver;
++        #[cfg(lixinos)]
++        io_handle.register_signal_receiver(&mut mio::unix::SourceFd(&receiver.as_raw_fd()))?;
+ 
+         Ok(Self {
+             io,
+--- a/src/signal/unix.rs
++++ b/src/signal/unix.rs
+@@ -12,6 +12,7 @@
+ use crate::signal::RxFuture;
+ use crate::sync::watch;
+ 
++#[cfg(not(lixinos))]
+ use mio::net::UnixStream;
+ use std::io::{self, Error, ErrorKind, Write};
+ use std::sync::OnceLock;
+@@ -62,12 +63,21 @@
+ 
+ #[derive(Debug)]
+ pub(crate) struct OsExtraData {
++    #[cfg(not(lixinos))]
+     sender: UnixStream,
++    #[cfg(lixinos)]
++    sender: mio::unix::pipe::Sender,
++    #[cfg(not(lixinos))]
+     pub(crate) receiver: UnixStream,
++    #[cfg(lixinos)]
++    pub(crate) receiver: mio::unix::pipe::Receiver,
+ }
+ 
+ impl Default for OsExtraData {
+     fn default() -> Self {
++        #[cfg(lixinos)]
++        let (sender, receiver) = mio::unix::pipe::new().expect("failed to create signal pipe");
++        #[cfg(not(lixinos))]
+         let (receiver, sender) = UnixStream::pair().expect("failed to create UnixStream");
+ 
+         Self { sender, receiver }
+--- a/src/process/unix/reap.rs
++++ b/src/process/unix/reap.rs
+@@ -21,6 +21,8 @@
+     inner: Option<W>,
+     orphan_queue: Q,
+     signal: S,
++    #[cfg(lixinos)]
++    wait_timer: Option<Pin<Box<crate::time::Sleep>>>,
+ }
+ 
+ impl<W, Q, S> Deref for Reaper<W, Q, S>
+@@ -45,6 +47,8 @@
+             inner: Some(inner),
+             orphan_queue,
+             signal,
++            #[cfg(lixinos)]
++            wait_timer: None,
+         }
+     }
+ 
+@@ -93,6 +97,19 @@
+             // If our attempt to poll for the next signal was not ready, then
+             // we've arranged for our task to get notified and we can bail out.
+             if registered_interest {
++                // The guest exposes waitpid(WNOHANG) but does not deliver SIGCHLD
++                // to this process. Recheck after a bounded delay, also when the
++                // child exits without writing to a pipe.
++                #[cfg(lixinos)]
++                {
++                    let timer = self.wait_timer.get_or_insert_with(|| {
++                        Box::pin(crate::time::sleep(std::time::Duration::from_millis(20)))
++                    });
++                    if timer.as_mut().poll(cx).is_ready() {
++                        self.wait_timer = None;
++                        continue;
++                    }
++                }
+                 return Poll::Pending;
+             } else {
+                 // Otherwise, if the signal stream delivered a signal to us, we

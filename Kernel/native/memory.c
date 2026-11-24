@@ -43,6 +43,15 @@ void *memmove(void *out, const void *in, u64 n) {
     const u8 *src = in;
     if ((u64)out <= (u64)in)
         return memcpy(out, in, n);
+    if (normal_ram || !(((u64)(dst + n) | (u64)(src + n)) & 7)) {
+        while (n >= 32) {
+            n -= 32;
+            ((unaligned_word *)(dst + n))[3] = ((const unaligned_word *)(src + n))[3];
+            ((unaligned_word *)(dst + n))[2] = ((const unaligned_word *)(src + n))[2];
+            ((unaligned_word *)(dst + n))[1] = ((const unaligned_word *)(src + n))[1];
+            ((unaligned_word *)(dst + n))[0] = ((const unaligned_word *)(src + n))[0];
+        }
+    }
     while (n) {
         --n;
         dst[n] = src[n];

@@ -1,0 +1,14 @@
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -1673,6 +1673,11 @@
+ 		const bytes = await fs.readFile(path, signal);
+ 		signal?.throwIfAborted();
+ 		const after = await fs.stat(path);
++		// Never treat a short file read as evidence of a torn session frame.
++		if (identity(before) === identity(after) || attempt === 1) {
++			const required = identity(before) === identity(after) ? after.size : before.size;
++			if (BigInt(bytes.length) < required) throw new Error("Incomplete session read; refusing tail recovery");
++		}
+ 		if (identity(before) === identity(after)) {
+ 			signal?.throwIfAborted();
+ 			return {

@@ -1,0 +1,116 @@
+--- a/thunar/main.c
++++ b/thunar/main.c
+@@ -48,7 +48,11 @@
+ main (int argc, char **argv)
+ {
+   ThunarApplication   *application;
+-  GError              *error = NULL;
++  if (argc == 2 && !strcmp (argv[1], "--lixin-session"))
++    {
++      g_setenv ("LIXINOS_XFCE_SESSION", "1", TRUE);
++      argv[--argc] = NULL;
++    }
+ 
+   /* setup translation domain */
+   xfce_textdomain (GETTEXT_PACKAGE, PACKAGE_LOCALE_DIR, "UTF-8");
+@@ -63,15 +67,13 @@
+   g_log_set_always_fatal (G_LOG_LEVEL_CRITICAL | G_LOG_LEVEL_WARNING);
+ #endif
+ 
+-  /* initialize xfconf */
+-  if (!xfconf_init (&error))
+-    {
+-      g_printerr (PACKAGE_NAME ": Failed to initialize Xfconf: %s\n\n", error->message);
+-      g_clear_error (&error);
+-
+-      /* disable get/set properties */
+-      thunar_preferences_xfconf_init_failed ();
+-    }
++  thunar_preferences_xfconf_init_failed ();
++  g_setenv ("GDK_BACKEND", "broadway", TRUE);
++  g_setenv ("GIO_USE_VFS", "local", TRUE);
++  g_setenv ("GSETTINGS_BACKEND", "memory", TRUE);
++  g_setenv ("FONTCONFIG_FILE", "/lib/gtk3/fonts.conf", TRUE);
++  g_setenv ("GSETTINGS_SCHEMA_DIR", "/lib/xfce/schemas", TRUE);
++  g_setenv ("NO_AT_BRIDGE", "1", TRUE);
+ 
+   /* register additional transformation functions */
+   thunar_g_initialize_transformations ();
+--- a/thunar/thunar-action-manager.c
++++ b/thunar/thunar-action-manager.c
+@@ -756,6 +756,8 @@
+ 
+ 
+ 
++#include "session-open.h"
++
+ /**
+  * thunar_action_manager_activate_selected_files:
+  * @action_mgr : a #ThunarActionManager instance
+@@ -771,6 +773,9 @@
+ {
+   _thunar_return_if_fail (THUNAR_IS_ACTION_MANAGER (action_mgr));
+ 
++  if (!app_info && action_mgr->files_to_process && !action_mgr->files_to_process->next &&
++      lixin_open_text (action_mgr->files_to_process->data))
++    return;
+   thunar_action_manager_poke (action_mgr, app_info, action);
+ }
+ 
+@@ -809,6 +814,7 @@
+ {
+   return 0;
+ }
++
+ 
+ 
+ 
+@@ -844,6 +850,8 @@
+         }
+       else
+         {
++          if (lixin_open_text (lp->data))
++            continue;
+           /* determine the default application for the MIME type */
+           app_info = thunar_file_get_default_handler (lp->data);
+         }
+--- a/thunar/thunar-application.c
++++ b/thunar/thunar-application.c
+@@ -289,7 +289,7 @@
+   application->progress_dialog = NULL;
+   application->preferences     = NULL;
+ 
+-  g_application_set_flags (G_APPLICATION (application), G_APPLICATION_HANDLES_COMMAND_LINE);
++  g_application_set_flags (G_APPLICATION (application), G_APPLICATION_HANDLES_COMMAND_LINE | G_APPLICATION_NON_UNIQUE);
+   g_application_add_main_option_entries (G_APPLICATION (application), option_entries);
+ }
+ 
+@@ -372,7 +372,7 @@
+                     G_CALLBACK (thunar_application_uevent), application);
+ #endif
+ 
+-  thunar_application_dbus_init (application);
++
+ 
+   G_APPLICATION_CLASS (thunar_application_parent_class)->startup (gapp);
+ 
+@@ -1452,6 +1452,7 @@
+   /* allocate the window */
+   window = g_object_new (THUNAR_TYPE_WINDOW,
+                          "role", role,
++                         "decorated", FALSE,
+                          "screen", screen,
+                          NULL);
+ 
+--- a/thunar/thunar-session-client.c
++++ b/thunar/thunar-session-client.c
+@@ -37,7 +37,9 @@
+ #endif
+ 
+ #include <glib/gstdio.h>
++#ifdef HAVE_LIBSM
+ #include <gdk/gdkx.h>
++#endif
+ 
+ #include <thunar/thunar-application.h>
+ #include <thunar/thunar-ice.h>

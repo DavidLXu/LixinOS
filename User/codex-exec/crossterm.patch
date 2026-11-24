@@ -1,0 +1,176 @@
+--- a/src/event/source/unix/mio.rs
++++ b/src/event/source/unix/mio.rs
+@@ -4,7 +4,10 @@
+     time::{Duration, Instant},
+ };
+ 
+-use mio::{Events, Interest, Poll, Token, unix::SourceFd};
++use mio::Token;
++#[cfg(not(lixinos))]
++use mio::{Events, Interest, Poll, unix::SourceFd};
++#[cfg(not(lixinos))]
+ use signal_hook_mio::v1_0::Signals;
+ 
+ #[cfg(feature = "event-stream")]
+@@ -13,6 +16,7 @@
+     Event, InputDiscardStatus, internal::InternalEvent, source::EventSource,
+     sys::unix::parse::parse_event, timeout::PollTimeout,
+ };
++#[cfg(not(lixinos))]
+ use crate::terminal::sys::file_descriptor::{FileDesc, tty_fd};
+ 
+ // Tokens to identify file descriptor
+@@ -29,6 +33,7 @@
+ const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+ const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+ 
++#[cfg(not(lixinos))]
+ pub(crate) struct UnixInternalEventSource {
+     poll: Poll,
+     events: Events,
+@@ -41,6 +46,7 @@
+     waker: Waker,
+ }
+ 
++#[cfg(not(lixinos))]
+ impl UnixInternalEventSource {
+     pub fn new() -> io::Result<Self> {
+         UnixInternalEventSource::from_file_descriptor(tty_fd()?)
+@@ -74,6 +80,7 @@
+     }
+ }
+ 
++#[cfg(not(lixinos))]
+ impl EventSource for UnixInternalEventSource {
+     fn try_read(&mut self, timeout: Option<Duration>) -> io::Result<Option<InternalEvent>> {
+         if let Some(event) = self.parser.next() {
+@@ -194,6 +201,9 @@
+ }
+ 
+ //
++#[cfg(lixinos)]
++include!("lixinos.rs");
++
+ // Following `Parser` structure exists for two reasons:
+ //
+ //  * mimic anes Parser interface
+@@ -446,7 +456,8 @@
+ mod tests {
+     use super::{Duration, Instant, Parser, UnixInternalEventSource};
+     use crate::event::{Event, InputDiscardStatus, InternalEvent, KeyCode, source::EventSource};
+-    use crate::terminal::sys::file_descriptor::FileDesc;
++    #[cfg(not(lixinos))]
++use crate::terminal::sys::file_descriptor::FileDesc;
+     use std::{io::Write, os::unix::net::UnixStream};
+ 
+     fn source_with_input() -> (UnixInternalEventSource, UnixStream) {
+--- a/src/event/sys/unix/waker.rs
++++ b/src/event/sys/unix/waker.rs
+@@ -1,11 +1,26 @@
+ #[cfg(feature = "use-dev-tty")]
+ pub(crate) mod tty;
+ 
+-#[cfg(not(feature = "use-dev-tty"))]
++#[cfg(all(not(feature = "use-dev-tty"), not(lixinos)))]
+ pub(crate) mod mio;
+ 
+ #[cfg(feature = "use-dev-tty")]
+ pub(crate) use self::tty::Waker;
+ 
+-#[cfg(not(feature = "use-dev-tty"))]
++#[cfg(all(not(feature = "use-dev-tty"), not(lixinos)))]
+ pub(crate) use self::mio::Waker;
++
++#[cfg(lixinos)]
++#[derive(Clone, Default, Debug)]
++pub(crate) struct Waker(std::sync::Arc<std::sync::atomic::AtomicBool>);
++
++#[cfg(lixinos)]
++impl Waker {
++    pub(crate) fn wake(&self) -> std::io::Result<()> {
++        self.0.store(true, std::sync::atomic::Ordering::Release);
++        Ok(())
++    }
++    pub(crate) fn take(&self) -> bool {
++        self.0.swap(false, std::sync::atomic::Ordering::AcqRel)
++    }
++}
+--- a/src/terminal/sys/unix.rs
++++ b/src/terminal/sys/unix.rs
+@@ -2,10 +2,9 @@
+ 
+ #[cfg(feature = "events")]
+ use crate::event::KeyboardEnhancementFlags;
+-use crate::terminal::{
+-    WindowSize,
+-    sys::file_descriptor::{FileDesc, tty_fd},
+-};
++use crate::terminal::WindowSize;
++#[cfg(not(lixinos))]
++use crate::terminal::sys::file_descriptor::{FileDesc, tty_fd};
+ #[cfg(feature = "libc")]
+ use libc::{
+     STDOUT_FILENO, TCSANOW, TIOCGWINSZ, cfmakeraw, ioctl, tcgetattr, tcsetattr, termios as Termios,
+@@ -25,10 +24,14 @@
+     os::unix::io::{IntoRawFd, RawFd},
+ };
+ 
++#[cfg(lixinos)]
++include!("lixinos.rs");
++
+ // Some(Termios) -> we're in the raw mode and this is the previous mode
+ // None -> we're not in the raw mode
+ static TERMINAL_MODE_PRIOR_RAW_MODE: Mutex<Option<Termios>> = parking_lot::const_mutex(None);
+ 
++#[cfg(not(lixinos))]
+ pub(crate) fn is_raw_mode_enabled() -> bool {
+     TERMINAL_MODE_PRIOR_RAW_MODE.lock().is_some()
+ }
+@@ -58,6 +61,7 @@
+ 
+ #[allow(clippy::useless_conversion)]
+ #[cfg(feature = "libc")]
++#[cfg(not(lixinos))]
+ pub(crate) fn window_size() -> io::Result<WindowSize> {
+     // http://rosettacode.org/wiki/Terminal_control/Dimensions#Library:_BSD_libc
+     let mut size = winsize {
+@@ -83,6 +87,7 @@
+ }
+ 
+ #[cfg(not(feature = "libc"))]
++#[cfg(not(lixinos))]
+ pub(crate) fn window_size() -> io::Result<WindowSize> {
+     let file = File::open("/dev/tty").map(|file| FileDesc::Owned(file.into()));
+     let fd = if let Ok(file) = &file {
+@@ -105,6 +110,7 @@
+ }
+ 
+ #[cfg(feature = "libc")]
++#[cfg(not(lixinos))]
+ pub(crate) fn enable_raw_mode() -> io::Result<()> {
+     let mut original_mode = TERMINAL_MODE_PRIOR_RAW_MODE.lock();
+     if original_mode.is_some() {
+@@ -123,6 +129,7 @@
+ }
+ 
+ #[cfg(not(feature = "libc"))]
++#[cfg(not(lixinos))]
+ pub(crate) fn enable_raw_mode() -> io::Result<()> {
+     let mut original_mode = TERMINAL_MODE_PRIOR_RAW_MODE.lock();
+     if original_mode.is_some() {
+@@ -145,6 +152,7 @@
+ /// to [enable_raw_mode]. If you don't mess with termios outside of crossterm, it's
+ /// effectively disabling the raw mode and doing nothing else.
+ #[cfg(feature = "libc")]
++#[cfg(not(lixinos))]
+ pub(crate) fn disable_raw_mode() -> io::Result<()> {
+     let mut original_mode = TERMINAL_MODE_PRIOR_RAW_MODE.lock();
+     if let Some(original_mode_ios) = original_mode.as_ref() {
+@@ -157,6 +165,7 @@
+ }
+ 
+ #[cfg(not(feature = "libc"))]
++#[cfg(not(lixinos))]
+ pub(crate) fn disable_raw_mode() -> io::Result<()> {
+     let mut original_mode = TERMINAL_MODE_PRIOR_RAW_MODE.lock();
+     if let Some(original_mode_ios) = original_mode.as_ref() {

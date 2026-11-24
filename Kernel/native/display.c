@@ -17,7 +17,10 @@ static u32 fb[MAX_HEIGHT * MAX_WIDTH] __attribute__((aligned(4096)));
 static u32 *frame[MAX_HEIGHT];
 static unsigned width = 2354, height = 1408, pane_width = 2354, columns = 107, rows = 31, origin,
                 selector;
-static int split, online, ssh;
+static int split, online, ssh, virtio_gpu;
+static void damage(unsigned x, unsigned y, unsigned w, unsigned h) {
+    if (virtio_gpu) gpu_damage(x, y, w, h);
+}
 static int clock_offset;
 static void paint_status(void);
 static int hide_edit_menu(void);
@@ -92,6 +95,7 @@ static unsigned cursor_x, cursor_y;
 static int cursor_drawn, text_cursor;
 static u32 cursor_underlay[CUR_H][CUR_W][4];
 static void toggle_text_pointer(void) {
+    damage(cursor_x, cursor_y, 2 * CUR_W, 2 * CUR_H);
     unsigned stride = pane_width + CW;
     unsigned right = cursor_x / stride * stride + pane_width;
     for (unsigned y = 0; y < CUR_H && cursor_y + 2 * y + 1 < height; y++)
@@ -169,6 +173,7 @@ static void pixel(unsigned x, unsigned y, u32 color) {
     d[0] = d[1] = d[width] = d[width + 1] = color;
 }
 static void paint_window(void) {
+    damage(pane_origin + 2 * win->x, BAR + 2 * win->y, 2 * win->w, 2 * win->h);
     for (unsigned j = 0; j < win->h; j++)
         for (unsigned i = 0; i < win->w; i++) {
             u32 color = j < 44                                        ? win->title[j * win->w + i]
@@ -248,6 +253,7 @@ void popup_hide(int slot, int keep) {
     if (!w->grid)
         return;
     if (w->backdrop) {
+        damage(pane_origin + 2 * w->x, BAR + 2 * w->y, 2 * w->w, 2 * w->h);
         hide_text_pointer();
         close_edit_menu();
         for (unsigned j = 2*w->y; j < 2*(w->y + w->h); j++)
@@ -272,6 +278,8 @@ static void move_window(unsigned x, unsigned y) {
     unsigned ox = win->x, oy = win->y, w = win->w, h = win->h;
     if (x == ox && y == oy)
         return;
+    damage(pane_origin + 2 * ox, BAR + 2 * oy, 2 * w, 2 * h);
+    damage(pane_origin + 2 * x, BAR + 2 * y, 2 * w, 2 * h);
     for (unsigned k = 0; k < 2 * h; k++) {
         unsigned j = y > oy ? 2 * h - 1 - k : k;
         memmove(frame[BAR + 2 * y + j] + pane_origin + 2 * x,
@@ -372,6 +380,7 @@ static u32 be32(u32 x) {
 static u64 be64(u64 x) { return ((u64)be32(x) << 32) | be32(x >> 32); }
 
 static void glyph(unsigned x, unsigned y, u8 c, u32 ink, u32 paper) {
+    damage(x, y, CW, CH);
     if (c < 32 || c >= 127)
         c = '?';
     const u8 *src = font + (c - 32) * CW * CH;
@@ -401,6 +410,7 @@ void popup_tab_bar(unsigned active, unsigned count) {
     int redraw_menu = hide_edit_menu();
     for (unsigned index = 0; index <= TERMINAL_TABS; index++) {
         unsigned x = win->x + TAB_LEFT + index * TAB_WIDTH, y = win->y + 8;
+        damage(pane_origin + 2 * x, BAR + 2 * y, 2 * TAB_WIDTH, 56);
         int exists = index < count || (index == count && count < TERMINAL_TABS);
         u32 color = index == active ? 0x395772 : 0x202e38;
         for (unsigned row = 0; row < 28; row++)
@@ -437,6 +447,7 @@ static int edit_menu_active(void) { return menu.open; }
 
 static int hide_edit_menu(void) {
     if (!menu.drawn) return 0;
+    damage(menu.x, menu.y, MENU_W, MENU_H);
     for (unsigned row = 0; row < MENU_H; row++)
         memcpy(frame[menu.y + row] + menu.x, menu.underlay[row], MENU_W * 4);
     menu.drawn = 0;
@@ -445,6 +456,7 @@ static int hide_edit_menu(void) {
 
 static void show_edit_menu(void) {
     if (menu.drawn || !menu.open) return;
+    damage(menu.x, menu.y, MENU_W, MENU_H);
     for (unsigned row = 0; row < MENU_H; row++) {
         u32 *pixels = frame[menu.y + row] + menu.x;
         memcpy(menu.underlay[row], pixels, MENU_W * 4);
@@ -547,6 +559,7 @@ static void agent_header(void) {
 }
 static void draw_caret(void) {
     if (!term->cursor || term->scroll || term->col >= columns || term->escape) return;
+    damage(origin + term->col * CW, top + term->row * CH + CH - 4, CW - 2, 2);
     for (unsigned j = CH - 4; j < CH - 2; j++)
         for (unsigned i = 0; i < CW - 2; i++)
             frame[top + term->row * CH + j][origin + term->col * CW + i] = FG;
@@ -634,8 +647,8 @@ void display_init(void) {
         if (valid && hours < 24 && minutes < 60)
             clock_offset = (hours * 3600 + minutes * 60) * (sign == '-' ? -1 : 1);
     }
-    if (!selector)
-        return;
+    virtio_gpu = !selector && gpu_init();
+    if (!selector && !virtio_gpu) return;
     if (split) {
         width = 3014;
         pane_width = (width - CW) / 2;
@@ -651,7 +664,7 @@ void display_init(void) {
     if (!lookup("/src/gui/console-menlo.gray", &f) || f.size != sizeof(font))
         return;
     memcpy(font, f.data, sizeof(font));
-    if (!configure())
+    if (!(virtio_gpu ? gpu_set_mode(fb, width, width, height) : configure()))
         return;
     online = 1;
     for (unsigned y = 0; y < height; y++)
@@ -745,6 +758,7 @@ static void apply_resize(void) {
         h = MAX_HEIGHT;
     if (w == width && h == height)
         return;
+    if (virtio_gpu && !gpu_set_mode(fb, w, w, h)) return;
     hide_text_pointer();
     close_edit_menu();
     unsigned oldcols = pane_width / CW, previous_rows = height / CH - 1;
@@ -769,9 +783,10 @@ static void apply_resize(void) {
     }
     display_select(process_pane());
     paint_status();
-    configure();
+    if (!virtio_gpu) configure();
 }
 static void paint_status(void) {
+    damage(0, 0, width, BAR);
     for (unsigned y = 0; y < BAR; y++)
         for (unsigned x = 0; x < width; x++)
             frame[y][x] = BAR_BG;
@@ -805,6 +820,7 @@ void display_status(void) {
     static u64 last;
     if (!online)
         return;
+    if (virtio_gpu) gpu_refresh();
     apply_resize();
     if (!win || !win->editor)
         display_idle_pointer();
@@ -945,6 +961,7 @@ static void next_row(int soft) {
     memmove(term->cells, term->cells[1], (rows - 1) * sizeof(term->cells[0]));
     memset(term->cells[rows - 1], 0, sizeof(term->cells[0]));
     if (!hidden_tab()) {
+        damage(origin, top, columns * CW, rows * CH);
         for (unsigned y = top; y < top + (rows - 1) * CH; y++)
             memcpy(frame[y] + origin, frame[y + CH] + origin, columns * CW * 4);
     }
@@ -1153,6 +1170,9 @@ void display_byte(u8 c) {
         return;
     }
     if (!display_output_visible()) return;
+    /* serial_put has already sent this byte to the UART. A terminal scroll
+       must not move the unchanged pixels of a foreground graphical canvas. */
+    if (!popup_terminal() && graphical_shortcuts()) return;
     int redraw_pointer = hide_text_pointer();
     int redraw_menu = hide_edit_menu();
     if (term->selected) {
@@ -1207,6 +1227,7 @@ int present(const u64 *args, u64 arena, u64 bytes, u64 generation) {
         return -1;
     int redraw_pointer = hide_text_pointer();
     int redraw_menu = hide_edit_menu();
+    damage(origin + 2 * x, BAR + 2 * y, 2 * w, 2 * h);
     for (unsigned j = 0; j < h; j++) {
         const u32 *src = (const u32 *)p + j * stride;
         u32 *dst = &frame[BAR + 2 * (y + j)][origin + 2 * x];

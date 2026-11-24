@@ -107,10 +107,18 @@ def exercise(guest, control, directory):
     assert guest.vm.wait(timeout=5) == 0
 
 
-def test(exercise=exercise, mode="--split", disk=None):
+def test(exercise=exercise, mode="--split", disk=None, launcher_args=(), prompt=None):
     with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
         directory = Path(tmp)
-        if not (qemu := shutil.which("qemu-system-aarch64")):
+        gpu_mode = os.environ.get("LIXINOS_GPU") or "auto"
+        if gpu_mode == "auto":
+            gpu_mode = "ramfb"  # The default test display is headless.
+        if gpu_mode == "virgl":
+            bundled = here.parent / "Kernel/target/user-build/virtio-gpu-host/qemu-11.1.0-vee2/bin/qemu-system-aarch64"
+            qemu = os.environ.get("LIXINOS_QEMU", str(bundled))
+        else:
+            qemu = shutil.which("qemu-system-aarch64")
+        if not qemu:
             raise RuntimeError("QEMU is required")
         # Use the normal split launcher, replacing only the display and UART
         # endpoints so the test can send input and observe guest output.
@@ -118,7 +126,16 @@ def test(exercise=exercise, mode="--split", disk=None):
         wrapper.write_text("""#!/usr/bin/env python3
 import os, sys
 args = sys.argv[1:]
-args[args.index('-display') + 1] = 'none'
+qemu = os.environ['PANE_TEST_QEMU']
+if '-serial' not in args:
+    os.execv(qemu, [qemu, *args])
+if os.environ.get('LIXINOS_GPU') != 'virgl':
+    args[args.index('-display') + 1] = 'none'
+else:
+    from pathlib import Path
+    endpoint = Path(os.environ['PANE_TEST_SOCKET'])
+    endpoint.with_suffix('.pid').write_text(str(os.getpid()))
+    args += ['-trace', 'file=' + str(endpoint.with_suffix('.trace'))]
 args[args.index('-serial') + 1] = 'stdio'
 os.execv(os.environ['PANE_TEST_QEMU'], [os.environ['PANE_TEST_QEMU'], *args,
          '-qmp', 'unix:' + os.environ['PANE_TEST_SOCKET'] + ',server=on,wait=off'])
@@ -126,8 +143,11 @@ os.execv(os.environ['PANE_TEST_QEMU'], [os.environ['PANE_TEST_QEMU'], *args,
         wrapper.chmod(0o700)
         endpoint = directory / "qmp"
         launch = ["env", f"PATH={directory}:{os.environ['PATH']}", f"PANE_TEST_QEMU={qemu}",
-                  f"PANE_TEST_SOCKET={endpoint}", here / "run-kernel.sh", mode]
-        with serial["boot"](disk if disk is not None else directory / "disk.img", launch) as guest, socket.socket(socket.AF_UNIX) as sock:
+                  f"PANE_TEST_SOCKET={endpoint}", f"LIXINOS_QEMU={wrapper}",
+                  f"LIXINOS_GPU={gpu_mode}",
+                  here / "run-kernel.sh", mode, *launcher_args]
+        with serial["boot"](disk if disk is not None else directory / "disk.img", launch,
+                            prompt=prompt or serial["SHELL"]) as guest, socket.socket(socket.AF_UNIX) as sock:
             sock.settimeout(10)
             sock.connect(str(endpoint))
             with sock.makefile("rwb") as control:

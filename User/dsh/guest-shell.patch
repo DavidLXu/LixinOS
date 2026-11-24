@@ -1,0 +1,15 @@
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -1,3 +1,4 @@
++import { runWorkspace } from "../../../../workspace.mjs";
+ import z from "@deepseek-ai/schemastery";
+ import { isAbsolute, sep } from "node:path";
+ import { TOOL_ABORTED, defineTool } from "@deepseek-ai/dsh-tools";
+@@ -662,6 +663,7 @@
+ 				};
+ 				const cwd = exec.agent === void 0 ? void 0 : await ctx.workingDirectory.ensure(exec.agent, exec.signal);
+ 				const workdir = resolveWorkdir(args.workdir, cwd);
++				if (process.platform === "lixinos") return runWorkspace(args, policy, workdir, exec.signal);
+ 				const dshEnv = ctx.shellEnv.collect(exec);
+ 				const request = {
+ 					command: args.command,

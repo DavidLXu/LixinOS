@@ -120,6 +120,7 @@ int console_read(unsigned timeout_ms) {
 void kernel_main(void) {
     UART[0x2c / 4] = 3 << 5;
     UART[0x30 / 4] = (1 << 8) | (1 << 9) | 1;
+    early_mmu_init(build_memory_present());
     serial_text(KERNEL_BANNER "\n");
     if (!mount_disk())
         serial_text("Cannot mount system or build volume\n");

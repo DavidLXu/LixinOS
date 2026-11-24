@@ -1,5 +1,5 @@
-const WIDTH: usize = 16;
-const HEIGHT: usize = 21;
+pub(super) const WIDTH: usize = 16;
+pub(super) const HEIGHT: usize = 21;
 
 pub(super) struct Overlay {
     underlay: [[[u32; 4]; WIDTH]; HEIGHT],

@@ -41,7 +41,7 @@ struct Clipboard {
 }
 
 struct Slot(UnsafeCell<Clipboard>);
-// Accessed only from the graphical input path on the single vCPU.
+// Accessed only from the graphical input path on the primary CPU.
 unsafe impl Sync for Slot {}
 static SLOT: Slot = Slot(UnsafeCell::new(Clipboard {
     host: None,

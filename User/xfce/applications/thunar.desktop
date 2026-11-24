@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Thunar File Manager
+Exec=/bin/thunar.win3
+TryExec=/bin/thunar.win3

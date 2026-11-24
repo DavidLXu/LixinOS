@@ -31,6 +31,11 @@ in user space. The core directory builds the individual
 EL0 text utilities installed in /bin. Run `python3 scripts/test-foreground.py`
 and `python3 scripts/test-panes.py` on the host to exercise these interfaces.
 
+The interactive `htop` monitor samples CPU time per core and per process. Its
+memory column reports process-private KiB. Use the arrow keys to select a PID,
+`/` or F4 to filter command names, F5 for the process tree, and F6 to sort.
+P, M and T sort by CPU usage, memory or accumulated CPU time. Press q to exit.
+
 The optional [Node.js package](node/README.md) runs JavaScript with V8 and libuv.
 
 The optional [dte package](dte/README.md) adds a terminal code editor with
@@ -39,9 +44,13 @@ The optional [Lite XL package](lite-xl/README.md) adds a desktop code
 editor with a project tree, mouse editing, and Chinese font fallback.
 The optional [GTK 3 package](gtk3/README.md) adds a native window backend,
 a C demo, and a host-side static library sysroot for porting GTK applications.
+The [Wayland port](wayland/README.md) provides native client and server
+libraries and a shared-memory display demo for both kernels.
 
 The [ClassiCube port](classicube/README.md) runs classic creative worlds in the
 graphical shell. Launch it with `classicube` after installing the package.
+The [Doom engine port](doom/README.md) runs Freedoom Phase 2 in the graphical
+shell. Launch it with `doom` after installing the package.
 
 ### LixinOS Bash
 

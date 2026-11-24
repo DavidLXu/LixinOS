@@ -5,7 +5,7 @@ use alloc::{format, string::String, vec::Vec};
 type Result<T> = core::result::Result<T, &'static str>;
 use alloc::collections::{BTreeMap, BTreeSet};
 
-type Changes = BTreeMap<String, Option<Option<Vec<u8>>>>;
+type Changes = BTreeMap<String, Option<Option<disk::FileData>>>;
 
 impl Volume {
     fn apply_changes(&mut self, changes: Changes, moved_versions: Versions, moved_times: disk::Times, touched: BTreeSet<String>) -> Result<()> {
@@ -44,7 +44,7 @@ impl Volume {
 }
 
 fn subtree<'a>(files: &'a disk::Files, root: &str)
-    -> impl Iterator<Item = (&'a String, &'a Option<Vec<u8>>)> {
+    -> impl Iterator<Item = (&'a String, &'a Option<disk::FileData>)> {
     let prefix = format!("{root}/");
     files.get_key_value(root).into_iter().chain(
         files.range(prefix.clone()..).take_while(move |(path, _)| path.starts_with(&prefix)),
@@ -108,7 +108,7 @@ impl Batch {
             1 if kind.is_some() => return Err(if flags == 1 { "not a directory" } else { "already exists" }),
             1 => { self.changes.insert(path.into(), Some(None)); }
             // Create an empty regular file if absent.
-            2 if kind.is_none() => { self.changes.insert(path.into(), Some(Some(Vec::new()))); }
+            2 if kind.is_none() => { self.changes.insert(path.into(), Some(Some(disk::FileData::from_vec(Vec::new())))); }
             2 => { self.touched.insert(path.into()); }
             // Unlink a single entry, with directory and emptiness checks.
             3 if kind.is_none() => return Err("file not found"),
@@ -135,7 +135,7 @@ impl Batch {
                 if flags == 1 && self.kind(volume, other).is_some() { return Ok(()); }
                 if self.kind(volume, other) == Some(true) { return Err("is a directory"); }
                 if self.changes.contains_key(other) { return Err("operands overlap"); }
-                self.changes.insert(other.into(), Some(Some(volume.read_file(path)?)));
+                self.changes.insert(other.into(), Some(Some(disk::FileData::from_vec(volume.read_file(path)?))));
             }
             // Rename a subtree and its path-keyed version metadata.
             5 => {
@@ -167,7 +167,7 @@ impl Batch {
                 }
             }
             // Create a small path record alongside a move in the same transaction.
-            9 if kind.is_none() => { self.changes.insert(path.into(), Some(Some(other.as_bytes().to_vec()))); }
+            9 if kind.is_none() => { self.changes.insert(path.into(), Some(Some(disk::FileData::from_vec(other.as_bytes().to_vec())))); }
             9 => return Err("destination exists"),
             _ => return Err("unknown filesystem operation"),
         }

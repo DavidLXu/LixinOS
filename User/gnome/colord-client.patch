@@ -1,0 +1,102 @@
+--- a/meson.build
++++ b/meson.build
+@@ -116,11 +116,16 @@
+ gmodule = dependency('gmodule-2.0')
+ giounix = dependency('gio-unix-2.0', version : '>= 2.45.8')
+ lcms = dependency('lcms2', version : '>= 2.6')
+-sqlite = dependency('sqlite3')
+-gusb = dependency('gusb', version : '>= 0.2.7')
+-gudev = dependency('gudev-1.0')
+ libm = cc.find_library('m', required: false)
+-libudev = dependency('libudev')
++if get_option('daemon')
++  sqlite = dependency('sqlite3')
++  gusb = dependency('gusb', version : '>= 0.2.7')
++  gudev = dependency('gudev-1.0')
++  libudev = dependency('libudev')
++else
++  gudev = declare_dependency()
++  libudev = declare_dependency()
++endif
+ 
+ if get_option('udev_rules')
+   udev = dependency('udev')
+@@ -254,17 +259,15 @@
+ root_incdir = include_directories('.')
+ 
+ subdir('lib')
+-subdir('po')
+-
+-# this needs libcolord
+-subdir('client')
+-subdir('contrib')
++if get_option('daemon')
++  subdir('po')
++  subdir('client')
++  subdir('contrib')
++  subdir('data')
++endif
+ if get_option('docs')
+   subdir('doc')
+ endif
+-
+-# this needs client/cd-create-profile
+-subdir('data')
+ 
+ # this needs data/profiles/*.icc
+ if get_option('man')
+@@ -278,5 +281,7 @@
+   subdir('src')
+ endif
+ 
+-meson.add_install_script('meson_post_install.sh',
+-                         localstatedir, get_option('daemon_user'))
++if get_option('daemon')
++  meson.add_install_script('meson_post_install.sh',
++                           localstatedir, get_option('daemon_user'))
++endif
+--- a/lib/meson.build
++++ b/lib/meson.build
+@@ -1,7 +1,9 @@
+ lib_incdir = include_directories('.')
+ 
+ subdir('colord')
+-subdir('colorhug')
++if get_option('daemon')
++  subdir('colorhug')
++endif
+ 
+ if get_option('libcolordcompat')
+   subdir('compat')
+--- a/lib/colord/meson.build
++++ b/lib/colord/meson.build
+@@ -75,7 +75,7 @@
+ 
+ mapfile = 'colord.map'
+ vflag = '-Wl,--version-script,@0@/@1@'.format(meson.current_source_dir(), mapfile)
+-colordprivate = shared_library(
++colordprivate = library(
+   'colordprivate',
+   sources : shared_src,
+   soversion : lt_current,
+@@ -99,7 +99,7 @@
+   link_depends : mapfile,
+   install : true
+ )
+-colord = shared_library(
++colord = library(
+   'colord',
+   sources : [
+     'cd-client.c',
+--- a/lib/colord/cd-edid.c
++++ b/lib/colord/cd-edid.c
+@@ -25,7 +25,9 @@
+ #include <string.h>
+ #include <glib-object.h>
+ #include <math.h>
++#ifndef PNP_IDS
+ #include <libudev.h>
++#endif
+ 
+ #include "cd-edid.h"
+ #include "cd-quirk.h"

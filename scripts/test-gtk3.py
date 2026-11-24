@@ -1,4 +1,5 @@
 """Exercise GTK 3's native window on a disposable LixinOS disk."""
+from launcher_grid import installed_apps, select_icon
 import argparse
 import json
 import os
@@ -87,6 +88,10 @@ def exercise(guest, control, directory, screenshot=None, app="gtk3-demo"):
     qmp("qmp_capabilities")
     Path(os.environ["LIXINOS_TEST_WINDOW_SIZE"]).write_text(f"{WIDTH}\t{HEIGHT}\n")
     wait(lambda _: True, "resized console")
+    if app == "stalled-client":
+        guest.until(b"$ ")
+        guest.expect(b"echo 'int main(void) { for (;;) {} }' > stalled.c\r", b"$ ")
+        guest.expect(b"tcc stalled.c -o /bin/stalled-client.win3\r", b"$ ")
     if app == "mousepad":
         guest.expect(b"cd /gtk3-test\r", b"lixin:/gtk3-test$ ")
     guest.send(b"ls -1 /bin\r")
@@ -94,21 +99,35 @@ def exercise(guest, control, directory, screenshot=None, app="gtk3-demo"):
     binary = f"{app}.win3".encode()
     if binary not in out:
         out += re.sub(rb"\x1b\[[0-9;]*m", b"", guest.until(b"$ "))
-    apps = sorted(name for name in out.splitlines()
-                  if name == b"nxeyes" or name.endswith((b".win", b".win2", b".win3")))
-    if app not in ("gtk3-demo", "mousepad"):
-        # Desktop puts the built-in Agent launcher first, even before its app is compiled.
-        apps = [b"agent.win3"] + [name for name in apps if name != b"agent.win3"]
+    apps = installed_apps(out)
     index = apps.index(binary)
     guest.send(b"desktop\r")
     desktop = wait(lambda p: sample(p, 2, 2) == "281e2b", "desktop")
     title = LEFT+382, TOP+22
     wallpaper = sample(desktop, *title)
     click(36, 8 + 7*min(82, (((HEIGHT-44)//2)-48)//8) + 20)
-    wait(lambda p: sample(p, 82, 6) == "233c3d", "Apps")
-    for _ in range(index // 7):
-        click(375, 288)
-    click(128, 60 + 32*(index % 7))
+    wait(lambda p: sample(p, 82, 6) == "203f51", "Apps")
+    select_icon(click,qmp,WIDTH//2,(HEIGHT-44)//2,index+6,len(apps)+6)
+    if app == "stalled-client":
+        wait(lambda p: sample(p, *title) != wallpaper, "stalled client window")
+        close = LEFT + 720 - 19, TOP + 22
+        click(*close)
+        # The client never reads CONFIGURE or replies to CLOSE. The menu must
+        # still open and dismiss, and the unacknowledged close must be recoverable.
+        click(36, 8 + 7*min(82, (((HEIGHT-44)//2)-48)//8) + 20)
+        wait(lambda p: sample(p, 82, 6) == "203f51", "menu while client is stalled")
+        click(WIDTH//2-48,30)
+        wait(lambda p: sample(p, 82, 6) != "203f51", "dismissed Apps menu")
+        time.sleep(2)
+        click(*close)
+        wait(lambda p: sample(p, *title) != wallpaper and
+             sample(p, 10, (HEIGHT-44)//2-20) == "233c3d", "force-close confirmation")
+        click(*close)
+        wait(lambda p: sample(p, *title) == wallpaper, "stalled window removed")
+        key("esc")
+        guest.until(b"$ ")
+        SHUTDOWN(guest)
+        return
     def content(p):
         return tuple(sample(p, x, y) for x in range(LEFT+8, LEFT+485, 3)
                      for y in range(TOP+46, TOP+155, 2))
@@ -247,17 +266,10 @@ def main():
     parser.add_argument("--screenshot", type=Path)
     parser.add_argument("--desktop", type=Path, help="desktop executable to install on the test copy")
     extra = ("tetravex", "mahjongg", "mines", "ristretto")
-    parser.add_argument("--app", choices=("gtk3-demo", "mousepad", "nautilus", *extra), default="gtk3-demo")
+    parser.add_argument("--app", choices=("gtk3-demo", "mousepad", "nautilus", "stalled-client", *extra), default="gtk3-demo")
     args = parser.parse_args()
     source = args.disk.resolve(strict=True)
     require_local(source, source.stat())
-    kind = "retina" if args.kernel == "rust" else "tcc"
-    boot_files = subprocess.check_output(["python3", HERE/"kernel-release.py", "boot-files",
-                                         args.release, kind], text=True).strip()
-    kernel = Path(boot_files) / ("rust-retina.elf" if kind == "retina" else "tcc-kernel.elf")
-    original_boot = HARNESS["serial"]["boot"]
-    def boot(disk, command):
-        return original_boot(disk, command, prompt=b"LixinOS Bash (C shell)")
     with tempfile.TemporaryDirectory(prefix="gtk3-") as tmp:
         disk = Path(tmp) / "test.img"
         subprocess.run(["cp", "-c", source, disk], check=True)
@@ -293,10 +305,10 @@ def main():
                 b"/gtk3-test/red.png": (bytes(8), color_fixture((255, 0, 0))),
                 b"/gtk3-test/second.jpg": (bytes(8), jpeg.read_bytes()),
             }))
-        with patch.dict(os.environ, {"LIXINOS_KERNEL": str(kernel)}), RESIZE():
-            with patch.dict(HARNESS["serial"], {"boot": boot}):
-                HARNESS["test"](lambda g, c, d: exercise(g, c, d, args.screenshot, args.app),
-                                mode="--window", disk=disk)
+        with patch.dict(os.environ, {"LIXINOS_TCC_DISK": str(disk)}), RESIZE():
+            HARNESS["test"](lambda g, c, d: exercise(g, c, d, args.screenshot, args.app),
+                            mode="--window", disk=disk, prompt=b"LixinOS Bash (C shell)",
+                            launcher_args=("--release", args.release, "--kernel", args.kernel))
         if args.app == "mousepad":
             rows, _ = disk_entries(disk)
             assert bytes(rows["/gtk3-test/main.c"][1]).rstrip(b"\n") == b"updated"

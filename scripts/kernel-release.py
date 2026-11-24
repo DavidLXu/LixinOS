@@ -88,8 +88,18 @@ def build(tree, output, disk, tag):
     user_cache = target / "user-build"
     target.mkdir(exist_ok=True)
     cache = ROOT / "Kernel/target/user-build"
-    if cache.is_dir():  # Local APFS clone of the downloaded build dependencies.
-        subprocess.run(["cp", "-cRp", str(cache), str(user_cache)], check=True)
+    if cache.is_dir():
+        # Only seed the projects used by build-user.sh. Independent desktop
+        # ports can be compiling here and renaming temporary objects at any time.
+        user_cache.mkdir()
+        dependencies = {"cpython-port", "git-objects", "libgit2", "links-port", "links-web",
+                        "lust-port", "lust-src", "micropython", "python-objects", "ssh-build",
+                        "tinycc"}
+        seeds = [entry for entry in cache.iterdir() if entry.is_file() or
+                 entry.name in dependencies or entry.name.startswith(("arm-gnu-toolchain-",
+                                                                       "bearssl-", "links-2."))]
+        if seeds:
+            subprocess.run(["cp", "-cRp", *seeds, user_cache], check=True)
     rustup = shutil.which("rustup") or str(Path.home() / ".cargo/bin/rustup")
     env = dict(os.environ, PATH=str(Path(rustup).parent) + os.pathsep + os.environ["PATH"])
     for variant, (profile, feature) in PROFILES.items():
@@ -170,29 +180,101 @@ def publish(temp, guest_disk):
     print(f"Published {tag} at {commit}", flush=True)
 
 
+def _git_dir():
+    dot = ROOT / ".git"
+    if dot.is_dir():
+        return dot
+    if dot.is_file():
+        line = dot.read_text().strip()
+        if line.startswith("gitdir:"):
+            target = Path(line.split(":", 1)[1].strip())
+            return target if target.is_absolute() else (ROOT / target).resolve()
+    return None
+
+
+def _tag_key(tag):
+    m = re.fullmatch(r"kernel-(\d{4})-(\d{2})-(\d{2})\.([1-9]\d*)", tag)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))) if m else None
+
+
 def latest_tag():
-    if not (ROOT / ".git").exists():
+    gdir = _git_dir()
+    if gdir is None:
         return ""
-    tags = git("tag", "-l", "--sort=-version:refname", "kernel-*").splitlines()
-    return next((tag for tag in tags if re.fullmatch(TAG_PATTERN, tag)), "")
+    common = gdir
+    commondir = gdir / "commondir"
+    if commondir.is_file():
+        rel = Path(commondir.read_text().strip())
+        common = rel if rel.is_absolute() else (gdir / rel).resolve()
+    tags = []
+    tags_dir = common / "refs/tags"
+    if tags_dir.is_dir():
+        for entry in tags_dir.iterdir():
+            key = _tag_key(entry.name)
+            if key is not None:
+                tags.append((key, entry.name))
+    packed = common / "packed-refs"
+    if packed.is_file():
+        for line in packed.read_text(errors="ignore").splitlines():
+            if not line or line[0] in "#^":
+                continue
+            parts = line.split(" ", 1)
+            if len(parts) == 2 and parts[1].startswith("refs/tags/"):
+                name = parts[1][len("refs/tags/"):]
+                key = _tag_key(name)
+                if key is not None:
+                    tags.append((key, name))
+    if tags:
+        return max(tags)[1]
+    git_tags = git("tag", "-l", "--sort=-version:refname", "kernel-*").splitlines()
+    return next((tag for tag in git_tags if re.fullmatch(TAG_PATTERN, tag)), "")
 
 
-def boot_files(tag, variant):
-    """Cache only the selected boot binaries from a local paired release."""
+def _file_stamp(path):
+    st = path.stat()
+    return [st.st_ino, st.st_size, st.st_mtime_ns]
+
+
+def boot_files_info(tag, variant):
+    """Cache and stat-verify only the selected boot binaries from a local paired release."""
     tag = latest_tag() if tag == "latest" else tag
     if not re.fullmatch(TAG_PATTERN, tag):
         raise ValueError("no matching local kernel release")
+    files = ("tcc-kernel.elf",) if variant == "tcc" else (f"rust-{variant}.elf", "cpython.pkg")
+    directory = ROOT / "data/kernel-cache" / tag
+    stamp_path = directory / ".verified.json"
+    if stamp_path.is_file():
+        try:
+            cached = json.loads(stamp_path.read_text())
+            if cached.get("tag") == tag and "has_gpu_abi" in cached:
+                stamps = cached.get("stamps", {})
+                if all((directory / name).is_file() and stamps.get(name) == _file_stamp(directory / name)
+                       for name in files):
+                    return directory, bool(cached["has_gpu_abi"])
+        except (OSError, ValueError, KeyError):
+            pass
     ref = "refs/tags/" + tag
     manifest = json.loads(git("show", f"{ref}:{ART}/manifest.json"))
     if manifest["tag"] != tag:
         raise ValueError("kernel release manifest tag mismatch")
-    files = ("tcc-kernel.elf",) if variant == "tcc" else (f"rust-{variant}.elf", "cpython.pkg")
-    directory = ROOT / "data/kernel-cache" / tag
+    has_gpu_abi = subprocess.run(
+        ["git", "cat-file", "-e", f"{ref}:Kernel/native/gpu-abi.h"],
+        cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode == 0
     directory.mkdir(parents=True, exist_ok=True)
+    stamps = {}
+    if stamp_path.is_file():
+        try:
+            old = json.loads(stamp_path.read_text())
+            if old.get("tag") == tag:
+                stamps = dict(old.get("stamps", {}))
+        except (OSError, ValueError):
+            pass
     for name in files:
         expected = manifest["sha256"][name]
         path = directory / name
         if path.is_file() and digest(path) == expected:
+            stamps[name] = _file_stamp(path)
             continue
         with tempfile.NamedTemporaryFile(dir=directory, prefix="boot-", delete=False) as stream:
             staging = Path(stream.name)
@@ -203,8 +285,22 @@ def boot_files(tag, variant):
                 if digest(staging) != expected:
                     raise ValueError(f"kernel release checksum mismatch: {name}")
                 os.replace(staging, path)
+                stamps[name] = _file_stamp(path)
             finally:
                 staging.unlink(missing_ok=True)
+    tmp_stamp = directory / f".verified.{os.getpid()}.tmp"
+    try:
+        tmp_stamp.write_text(json.dumps({
+            "tag": tag, "has_gpu_abi": has_gpu_abi, "stamps": stamps,
+        }))
+        os.replace(tmp_stamp, stamp_path)
+    finally:
+        tmp_stamp.unlink(missing_ok=True)
+    return directory, has_gpu_abi
+
+
+def boot_files(tag, variant):
+    directory, _ = boot_files_info(tag, variant)
     print(directory)
 
 

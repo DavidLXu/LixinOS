@@ -13,7 +13,11 @@ python3 demo.py
 
 两个内核运行同一套静态链接的 AArch64 用户态程序。普通文件可以在写模式和读写模式下定位、覆盖、截短或扩展，扩展的字节读为零。
 
-普通 Python 脚本可以用 `socket.create_connection()` 解析域名并建立出站 IPv4 TCP 连接。`ssl` 使用静态链接的 OpenSSL 和随系统安装的根证书，`urllib.request.urlopen()` 可以验证服务端证书和主机名。UDP、IPv6 和服务端监听仍待适配。
+普通 Python 脚本可以用 `socket.create_connection()` 解析域名并建立出站 IPv4 TCP 连接。`ssl` 使用静态链接的 OpenSSL 和随系统安装的根证书，`urllib.request.urlopen()` 可以验证服务端证书和主机名。UDP、IPv6 和 TCP 服务端监听仍待适配。
+
+配对发布中的新版运行时也支持本机 `AF_UNIX` 流套接字。应用可以使用
+`socketpair()`，或绑定地址后由另一进程连接。
+[原生桌面会话](../../docs/native-desktop-sessions.md#unix-域流套接字)
 
 `threading.Thread` 在同一进程内共享 Python 对象。每个线程有独立的栈和线程局部存储，在解释器检查点和已适配的阻塞调用处协作调度。长时间占用 CPU 的 C 扩展可能推迟线程切换。`subprocess.run()` 和 `Popen` 使用内核的进程、等待和管道接口，支持参数、工作目录、标准输入以及分别捕获标准输出和标准错误。可用 `Popen.kill()` 终止直接子进程。自定义子进程环境和任意描述符继承仍待支持。
 

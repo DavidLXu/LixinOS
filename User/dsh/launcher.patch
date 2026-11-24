@@ -1,0 +1,34 @@
+--- a/lib/bin.js
++++ b/lib/bin.js
+@@ -1,8 +1,7 @@
+ #!/usr/bin/env node
+-import { StartupError, getDshRuntimeVersion, loadLayeredEnv } from "@deepseek-ai/dsh-app-boot";
++import manifest from "../package.json" with { type: "json" };
+ import { resolveDshHome } from "@deepseek-ai/dsh-home-paths";
+ import { Command, CommanderError, InvalidArgumentError } from "commander";
+-import { randomUUID } from "node:crypto";
+ import { mkdir, writeFile } from "node:fs/promises";
+ import { join } from "node:path";
+ import { inspect } from "node:util";
+@@ -156,6 +155,7 @@
+ * @returns after saving or printing the report and completing terminal writes.
+ */
+ async function reportStartupFailure(error, context, write = writeStderr) {
++	const { randomUUID } = await import("node:crypto");
+ 	const now = (/* @__PURE__ */ new Date()).toISOString();
+ 	const report = "WARNING: Raw diagnostics may contain configuration or credential values from plugin errors. Review before sharing.\n\n" + inspect({
+ 		timestamp: now,
+@@ -205,11 +205,12 @@
+ * @returns a promise that settles when the selected command mode finishes.
+ */
+ async function runCli(options = {}) {
+-	const version = getDshRuntimeVersion();
++	const version = manifest.version;
+ 	const { manageDesktopProfile, ...profileOptions } = options;
+ 	const invocation = parseDshArgs(process.argv.slice(2), version, manageDesktopProfile);
+ 	switch (invocation.mode) {
+ 		case "profile": {
++			const { StartupError, loadLayeredEnv } = await import("@deepseek-ai/dsh-app-boot");
+ 			const { runProfile } = await import("./profile-boot.js");
+ 			try {
+ 				await runProfile({

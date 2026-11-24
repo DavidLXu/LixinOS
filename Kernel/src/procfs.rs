@@ -42,10 +42,10 @@ fn cpu_times() -> (u64, u64) {
 impl File {
     pub(crate) fn read(self) -> String {
         match self {
-            Self::CpuInfo => format!(
-                "processor\t: 0\nmodel name\t: {} {} vCPU\n",
+            Self::CpuInfo => (0..unsafe { scheduler::smp_cpus() }).map(|cpu| format!(
+                "processor\t: {cpu}\nmodel name\t: {} {} vCPU\n",
                 inspect::SYSTEM_NAME, inspect::ARCHITECTURE,
-            ),
+            )).collect(),
             Self::MemInfo => {
                 let (_, free) = monitor::heap_usage();
                 let total = inspect::ram_size().map_or_else(String::new, |bytes| {
@@ -62,7 +62,13 @@ impl File {
                 // Accounting separates scheduler busy time from idle waits.
                 // Report total busy time in the system column for delta readers.
                 let busy = uptime - idle;
-                format!("cpu  0 0 {busy} {idle} 0 0 0 0 0 0\ncpu0 0 0 {busy} {idle} 0 0 0 0 0 0\n")
+                let count = unsafe { scheduler::smp_cpus() } as u64;
+                let remote = (u128::from(unsafe { scheduler::smp_busy_ticks() }) * 100
+                    / u128::from(monitor::seconds_to_ticks(1))) as u64;
+                let other_idle = uptime.saturating_mul(count - 1).saturating_sub(remote);
+                let mut stat = format!("cpu  0 0 {} {} 0 0 0 0 0 0\ncpu0 0 0 {busy} {idle} 0 0 0 0 0 0\n", busy + remote, idle + other_idle);
+                if count == 2 { stat += &format!("cpu1 0 0 {remote} {other_idle} 0 0 0 0 0 0\n"); }
+                stat
             }
             Self::Uptime => {
                 let (uptime, idle) = cpu_times();

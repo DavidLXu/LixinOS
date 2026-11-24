@@ -13,7 +13,7 @@ enter_user:
     msr sp_el0, x9
     mov x9, #0x340
     msr spsr_el1, x9
-    eret
+    b smp_leave_user
 
 .balign 2048
 .global user_vectors
@@ -24,7 +24,7 @@ user_vectors:
 .endr
     b user_sync
     .balign 128
-    b user_timer_irq
+    b smp_irq_vector
     .balign 128
 .rept 6
     b kernel_vector_fault
@@ -32,6 +32,9 @@ user_vectors:
 .endr
 
 user_sync:
+    stp x30,xzr,[sp,#-16]!
+    bl smp_enter_preserved
+    ldp x30,xzr,[sp],#16
     mrs x9, esr_el1
     lsr x10, x9, #26
     cmp x10, #0x15
@@ -40,7 +43,7 @@ user_sync:
     b.eq resume_shell
     cmp x8, #32
     b.eq suspend_for_child
-    cmp x8, #57
+    cmp x8, #60
     b.hi unknown_call
     // The kernel uses the soft-float target (no SIMD registers). Preserve
     // the user integer context across the shared Rust console implementation.
@@ -86,13 +89,13 @@ user_sync:
     cmn x0, #2
     b.eq resume_shell
 return_to_user:
-    eret
+    b smp_leave_user
 suspend_for_child:
     mov x0, #256
     b resume_shell
 unknown_call:
     mov x0, #-1
-    eret
+    b smp_leave_user
 user_fault:
     mov x0, x9
     mrs x1, elr_el1

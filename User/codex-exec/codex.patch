@@ -1,0 +1,163 @@
+--- a/codex-rs/Cargo.toml
++++ b/codex-rs/Cargo.toml
+@@ -680,6 +680,7 @@
+ opt-level = 0
+ 
+ [patch.crates-io]
++tokio = { path = "../../tokio-port" }
+ # Uncomment to debug local changes.
+ # ratatui = { path = "../../ratatui" }
+ crossterm = { git = "https://github.com/openai-oss-forks/crossterm", rev = "37ca4a27a9424ec5dbe6451f48c339d7b45f8d63" }
+@@ -689,7 +690,7 @@
+ sqlx-sqlite = { git = "https://github.com/transact-rs/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+ tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "7447c427513cfe685f236e1ac0513c4ea3dd9c0b" }
+ tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "bc589d684755a8c02da0fc7e58d0861cbfc306f1" }
+-v8 = { git = "https://github.com/openai-oss-forks/rusty_v8.git", rev = "90a65f887a0c0f048f3784afbcb320b373c8a2e0" }
++v8 = { path = "../../v8-source" }
+ 
+ # Uncomment to debug local changes.
+ # rmcp = { path = "../../rust-sdk/crates/rmcp" }
+--- a/codex-rs/app-server/Cargo.toml
++++ b/codex-rs/app-server/Cargo.toml
+@@ -125,7 +125,7 @@
+ uuid = { workspace = true, features = ["serde", "v7"] }
+ 
+ [target.'cfg(all(target_os = "linux", target_env = "musl", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+-tikv-jemallocator = { workspace = true }
++tikv-jemallocator = { workspace = true, optional = true }
+ 
+ [target.'cfg(unix)'.dependencies]
+ libc = { workspace = true }
+--- a/codex-rs/app-server/src/main.rs
++++ b/codex-rs/app-server/src/main.rs
+@@ -16,6 +16,7 @@
+ use std::path::PathBuf;
+ 
+ #[cfg(all(
++    feature = "tikv-jemallocator",
+     target_os = "linux",
+     target_env = "musl",
+     any(target_arch = "x86_64", target_arch = "aarch64")
+--- a/codex-rs/app-server/src/in_process.rs
++++ b/codex-rs/app-server/src/in_process.rs
+@@ -479,9 +479,12 @@
+         &mut args.config,
+         args.enable_codex_api_key_env,
+     )
+-    .await?;
++    .await
++    .map_err(|err| IoError::new(err.kind(), format!("loading embedded configuration: {err}")))?;
+     let channel_capacity = args.channel_capacity.max(1);
+-    let installation_id = resolve_installation_id(&args.config.codex_home).await?;
++    let installation_id = resolve_installation_id(&args.config.codex_home)
++        .await
++        .map_err(|err| IoError::new(err.kind(), format!("opening installation ID: {err}")))?;
+     let (client_tx, mut client_rx) = mpsc::channel::<InProcessClientMessage>(channel_capacity);
+     let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
+ 
+--- a/codex-rs/exec/src/main.rs
++++ b/codex-rs/exec/src/main.rs
+@@ -20,20 +20,27 @@
+ use codex_exec::run_main;
+ use codex_utils_cli::CliConfigOverrides;
+ 
++#[derive(clap::Subcommand, Debug)]
++enum Command {
++    /// Run Codex non-interactively.
++    Exec(Cli),
++}
++
+ #[derive(Parser, Debug)]
++#[command(name = "codex", version)]
+ struct TopCli {
+     #[clap(flatten)]
+     config_overrides: CliConfigOverrides,
+ 
+-    #[clap(flatten)]
+-    inner: Cli,
++    #[command(subcommand)]
++    command: Command,
+ }
+ 
+ fn main() -> anyhow::Result<()> {
+     arg0_dispatch_or_else(|arg0_paths: Arg0DispatchPaths| async move {
+         let top_cli = TopCli::parse();
+         // Merge root-level overrides into inner CLI struct so downstream logic remains unchanged.
+-        let mut inner = top_cli.inner;
++        let Command::Exec(mut inner) = top_cli.command;
+         inner
+             .config_overrides
+             .prepend_root_overrides(top_cli.config_overrides);
+--- a/codex-rs/exec/src/main_tests.rs
++++ b/codex-rs/exec/src/main_tests.rs
+@@ -5,7 +5,8 @@
+ fn top_cli_parses_resume_prompt_after_config_flag() {
+     const PROMPT: &str = "echo resume-with-global-flags-after-subcommand";
+     let cli = TopCli::parse_from([
+-        "codex-exec",
++        "codex",
++        "exec",
+         "resume",
+         "--strict-config",
+         "--last",
+@@ -18,7 +19,7 @@
+         "--skip-git-repo-check",
+         PROMPT,
+     ]);
+-    let mut inner = cli.inner;
++    let Command::Exec(mut inner) = cli.command;
+     inner
+         .config_overrides
+         .prepend_root_overrides(cli.config_overrides);
+--- a/codex-rs/runtime-agent-instance/src/installation_id.rs
++++ b/codex-rs/runtime-agent-instance/src/installation_id.rs
+@@ -16,6 +16,38 @@
+ 
+ const INSTALLATION_ID_FILENAME: &str = "installation_id";
+ 
++#[cfg(lixinos)]
++pub async fn resolve_installation_id(codex_home: &AbsolutePathBuf) -> Result<String> {
++    // Import a pre-existing upstream installation ID. On new guest volumes publish
++    // a complete, nonempty directory by atomic rename. Racing initializers cannot
++    // overwrite its ID, and a crash cannot expose a partially written ID.
++    let legacy = codex_home.join(INSTALLATION_ID_FILENAME);
++    let read_id = |path: &std::path::Path| -> Result<Option<String>> {
++        match std::fs::read_to_string(path) {
++            Ok(text) => Ok(Uuid::parse_str(text.trim()).ok().map(|id| id.to_string())),
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
++            Err(error) => Err(error),
++        }
++    };
++    if let Some(id) = read_id(&legacy)? { return Ok(id); }
++    std::fs::create_dir_all(codex_home)?;
++    let target = codex_home.join("installation_id.lixin");
++    let record = target.join("id");
++    if let Some(id) = read_id(&record)? { return Ok(id); }
++    let id = Uuid::new_v4().to_string();
++    let pending = codex_home.join(format!(".installation-{id}"));
++    std::fs::create_dir(&pending)?;
++    let staged = pending.join("id");
++    let result = std::fs::write(&staged, &id).and_then(|()| std::fs::rename(&pending, &target));
++    if let Err(error) = result {
++        let _ = std::fs::remove_file(&staged);
++        let _ = std::fs::remove_dir(&pending);
++        return read_id(&record)?.ok_or(error);
++    }
++    Ok(id)
++}
++
++#[cfg(not(lixinos))]
+ pub async fn resolve_installation_id(codex_home: &AbsolutePathBuf) -> Result<String> {
+     let path = codex_home.join(INSTALLATION_ID_FILENAME);
+     fs::create_dir_all(codex_home).await?;
+--- a/codex-rs/linux-sandbox/src/daemon_mounts.rs
++++ b/codex-rs/linux-sandbox/src/daemon_mounts.rs
+@@ -28,7 +28,7 @@
+     let directory_file = fs::File::open(directory)?;
+     let device = directory_file.metadata()?.dev();
+     let filesystem =
+-        if fstatfs(&directory_file).is_ok_and(|stat| stat.f_type == libc::BTRFS_SUPER_MAGIC) {
++        if fstatfs(&directory_file).is_ok_and(|stat| stat.f_type as u64 == libc::BTRFS_SUPER_MAGIC as u64) {
+             SocketFilesystem::Btrfs
+         } else {
+             SocketFilesystem::Other

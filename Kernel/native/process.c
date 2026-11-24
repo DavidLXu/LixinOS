@@ -1,4 +1,5 @@
 #include "native.h"
+#include "smp.h"
 #include "version.h"
 #include "build-memory.h"
 
@@ -40,14 +41,14 @@ static int magic(struct file f, const char *s, u32 n) {
     return 1;
 }
 
-static u64 root[512] __attribute__((aligned(4096)));
-static u64 ram[512] __attribute__((aligned(4096)));
-static u64 extended[512] __attribute__((aligned(4096)));
-static u64 ram_high[512] __attribute__((aligned(4096)));
+struct cpu_tables {
+    u64 root[512], ram[512], extended[512], ram_high[512], wide_tables[4][512];
+};
+static struct cpu_tables cpu_tables[2] __attribute__((aligned(4096)));
 extern void enable_mmu(u64 *table, void (*vectors)(void), u64 high), native_vectors(void),
     sync_image(void);
 extern long enter_el0(u64 a, u64 b, u64 c, u64 d);
-static unsigned bank;
+#define bank (task_active())
 static u8 *physical(void) {
     return bank < 8 ? (u8 *)(0x45000000UL + bank * (2 * BLOCK))
                     : (u8 *)(0x48000000UL + (bank - 8) * (2 * BLOCK));
@@ -68,18 +69,19 @@ enum { CANVAS_FIXED = 1, CANVAS_RESIZABLE = 2 };
 enum { GRAPHICS_ARENA, LIBC_ARENA, EXTENDED_ARENA, PROGRAM_ARENA, WIDE_ARENA, ARENAS };
 static const u64 arena_base[ARENAS] = {ARENA, 0x78000000UL, 0xc0000000UL, 0xa0000000UL, 64 * GIB};
 static const unsigned build_blocks[ARENAS] = {64, 320, 512, 256, 2048};
-static u64 wide_tables[4][512] __attribute__((aligned(4096)));
+
 static struct frame_map {
     u16 frames[2048];
     unsigned count, sealed;
 } heaps[BANKS][ARENAS];
-static unsigned mapped[ARENAS];
+static unsigned mapped[2][ARENAS];
 static void map_frame(unsigned kind, unsigned i, u64 value) {
+    struct cpu_tables *t = &cpu_tables[smp_cpu()];
     u64 addr = arena_base[kind] + i * BLOCK;
-    u64 *entries = addr >= 64 * GIB  ? wide_tables[(addr - 64 * GIB) / GIB]
-                   : addr >= 3 * GIB ? extended
-                   : addr >= 2 * GIB ? ram_high
-                                     : ram;
+    u64 *entries = addr >= 64 * GIB  ? t->wide_tables[(addr - 64 * GIB) / GIB]
+                   : addr >= 3 * GIB ? t->extended
+                   : addr >= 2 * GIB ? t->ram_high
+                                     : t->ram;
     entries[(addr % GIB) / BLOCK] = value;
 }
 static void map_heap(unsigned id) {
@@ -89,9 +91,9 @@ static void map_heap(unsigned id) {
             map_frame(kind, i,
                       frame_address(h->frames[i]) | NORMAL | EL0 | PXN |
                           (i < h->sealed ? RO : UXN));
-        for (unsigned i = h->count; i < mapped[kind]; i++)
+        for (unsigned i = h->count; i < mapped[smp_cpu()][kind]; i++)
             map_frame(kind, i, 0);
-        mapped[kind] = h->count;
+        mapped[smp_cpu()][kind] = h->count;
     }
 }
 static long grow_heap(unsigned kind, u64 size) {
@@ -122,14 +124,21 @@ static long grow_heap(unsigned kind, u64 size) {
     sync_image();
     return arena_base[kind];
 }
+void smp_bind_kernel(void) {
+    unsigned id = task_active();
+    if (id < NATIVE_TASKS) {
+        disk_select_task(id);
+        display_select(process_pane());
+    }
+}
 void select_bank(unsigned id) {
-    bank = id;
-    disk_select_task(id);
-    display_select(process_pane());
+    if (id >= NATIVE_TASKS) return;
+    smp_bind_kernel();
     map_heap(id);
+    shared_switch(id);
     u64 pa = (u64)physical();
-    ram[32] = pa | NORMAL | EL0 | RO | PXN;
-    ram[33] = (pa + BLOCK) | NORMAL | EL0 | PXN | UXN;
+    cpu_tables[smp_cpu()].ram[32] = pa | NORMAL | EL0 | RO | PXN;
+    cpu_tables[smp_cpu()].ram[33] = (pa + BLOCK) | NORMAL | EL0 | PXN | UXN;
     sync_image();
 }
 
@@ -140,9 +149,10 @@ struct redirected_file {
     char path[513];
 };
 static struct redirected_file redirected[2 * BANKS];
-#define HANDLE_COUNT (build_volume ? 32 : 16)
+#define HANDLE_COUNT 32
 #define FD_LIMIT (3 + HANDLE_COUNT)
 struct process {
+    u32 gpu_context;
     char cwd[513], path[513], args[32768];
     char executable[513], start_args[32768], git_meta[513];
     unsigned start_used, start_argc, pane, start_flags;
@@ -177,11 +187,17 @@ struct process {
         unsigned pos;
         int socket, append;
         struct pipe *pipe;
+        struct local_socket *local;
+        struct shared_file *shared;
         int writer;
         char path[513];
-    } handles[32];
+    } handles[HANDLE_COUNT];
 };
 static struct process processes[BANKS];
+int smp_clock_allowed(void) {
+    const struct process *p = &processes[bank];
+    return !p->test.deadline && !p->command_deadline && !p->scope[0] && !p->agent_child && !task_stopped();
+}
 static int under(const char *path, const char *root) {
     unsigned n=length(root,513);
     return length(path,513)>=n && !memcmp(path,root,n) && (!path[n] || path[n]=='/');
@@ -411,6 +427,12 @@ void release_buffer(const u8 *ptr, unsigned bytes) {
     unsigned count = (bytes + CHUNK - 1) / CHUNK;
     memset(chunks_used + first, 0, count ? count : 1);
 }
+void *gpu_allocate(u32 n) {
+    u8 *p = file_buffer(n);
+    if (p) memset(p, 0, n);
+    return p;
+}
+void gpu_free(void *p, u32 n) { release_buffer(p, n); }
 static u8 *grow_file_buffer(u8 *data, unsigned old, unsigned used, unsigned capacity) {
     unsigned first = ((u64)data - FILE_POOL_BASE) / CHUNK;
     unsigned allocated = old ? (old + CHUNK - 1) / CHUNK : 1;
@@ -456,16 +478,19 @@ static long system_info(char *out, unsigned op) {
     if (op == 6)
         return task_list(out);
     if (op == 8) {
-        char *p = add_text(out, "architecture=aarch64\nvcpus=1\nuptime_seconds=");
+        char *p = add_number(add_text(out, "architecture=aarch64\nvcpus="), smp_cpus());
+        p = add_text(p, "\nuptime_seconds=");
         p = add_number(p, clock_ticks() / clock_hz());
         p = add_text(p, "\narchitectural_timer_hz=");
         p = add_number(p, clock_hz());
         p = add_text(p, "\nguest_busy_percent=");
-        u64 start = clock_ticks(), idle = idle_ticks(), hz = clock_hz();
+        u64 start = clock_ticks(), idle = idle_ticks(), hz = clock_hz(), before = smp_busy_ticks();
         while (clock_ticks() - start < hz / 4)
             idle_slice();
         u64 duration = clock_ticks() - start, wait = idle_ticks() - idle;
-        p = add_number(p, wait >= duration ? 0 : 100 - wait * 100 / duration);
+        u64 remote = smp_busy_ticks() - before;
+        if (remote > duration) remote = duration;
+        p = add_number(p, ((duration > wait ? duration - wait : 0) + remote) * 100 / (duration * smp_cpus()));
         p = add_text(p, "\nsample_ms=");
         p = add_number(p, duration * 1000 / hz);
         return add_text(p, "\nscope=guest_scheduler") - out;
@@ -547,6 +572,11 @@ static long editor_save(struct process *p, u64 size) {
     p->original = (struct file){next, size};
     return 0;
 }
+static int handle_used(struct process *p, unsigned i) {
+    return p->handles[i].file.data || p->handles[i].pipe || p->handles[i].local ||
+           p->handles[i].path[0] || p->handles[i].socket || p->handles[i].shared;
+}
+
 static void close_handle(struct process *p, unsigned i) {
     struct file *f = &p->handles[i].file;
     if (p->handles[i].socket) {
@@ -556,6 +586,14 @@ static void close_handle(struct process *p, unsigned i) {
     if (p->handles[i].pipe) {
         pipe_ref(p->handles[i].pipe, p->handles[i].writer, -1);
         p->handles[i].pipe = 0;
+    }
+    if (p->handles[i].local) {
+        local_close(p->handles[i].local);
+        p->handles[i].local = 0;
+    }
+    if (p->handles[i].shared) {
+        shared_release(p->handles[i].shared);
+        p->handles[i].shared = 0;
     }
     p->handles[i].path[0] = 0;
     if (!f->data)
@@ -776,13 +814,110 @@ static long exchange_agent_runner(struct process *p, u64 value) {
     return size;
 }
 
+static long local_call(struct process *p, u64 value, u8 *mail) {
+    unsigned command = value >> 56, fd = (value >> 32) & 255, argument = (u32)value;
+    if (!command || command == 12) return 1;
+    if (command <= 2 || command == 4 || command == 5) {
+        unsigned left = 0;
+        while (left < HANDLE_COUNT && handle_used(p, left)) left++;
+        if (left == HANDLE_COUNT) return -24;
+        struct local_socket *socket;
+        int result;
+        if (command == 1) {
+            unsigned right = left + 1;
+            while (right < HANDLE_COUNT && handle_used(p, right)) right++;
+            if (right == HANDLE_COUNT) return -24;
+            struct local_socket *other;
+            result = local_pair(task_pid(), task_pid(), &socket, &other);
+            if (result) return result;
+            p->handles[left].local = socket;
+            p->handles[right].local = other;
+            return ((u64)(left + 3) << 32) | (right + 3);
+        }
+        if (command == 5) {
+            if (fd < 3 || fd >= FD_LIMIT || !p->handles[fd-3].local) return -22;
+            result = local_accept(p->handles[fd-3].local, &socket);
+        } else {
+            if (!argument || argument > 108) return -22;
+            if (command == 2) result = local_bind(mail, argument, task_pid(), &socket);
+            else result = local_connect(mail, argument, task_pid(), &socket);
+        }
+        if (result) return result;
+        p->handles[left].local = socket;
+        return left + 3;
+    }
+    if (fd < 3 || fd >= FD_LIMIT || !p->handles[fd-3].local)
+        return command == 3 ? -22 : -107;
+    if (command == 3) return local_listen(p->handles[fd-3].local, argument);
+    if (command >= 6 && command <= 9) return local_io(p->handles[fd-3].local, command, mail, argument);
+    if (command == 10 || command == 11) {
+        u32 *control = (void *)(mail + LX_IPC_CONTROL);
+        unsigned limit = control[0];
+        if (argument > LX_IPC_CONTROL || limit > LX_IPC_RIGHTS) return -22;
+        struct shared_file *files[LX_IPC_RIGHTS] = {0};
+        if (command == 10) {
+            for (unsigned i = 0; i < limit; i++) {
+                unsigned source = control[i + 2];
+                if (source < 3 || source >= FD_LIMIT || !handle_used(p, source - 3)) return -9;
+                files[i] = p->handles[source - 3].shared;
+                if (!files[i]) return -95;
+            }
+            return local_write_rights(p->handles[fd-3].local, mail, argument, files);
+        }
+        long size = local_read_rights(p->handles[fd-3].local, mail, argument, files);
+        if (size < 0) return size;
+        unsigned count = 0, truncated = 0, slot = 0;
+        for (unsigned i = 0; i < LX_IPC_RIGHTS && files[i]; i++) {
+            while (slot < HANDLE_COUNT && handle_used(p, slot)) slot++;
+            if (count < limit && slot < HANDLE_COUNT) {
+                p->handles[slot].shared = files[i];
+                control[2 + count++] = slot++ + 3;
+            } else {
+                truncated = 1;
+                shared_release(files[i]);
+            }
+        }
+        control[0] = count;
+        control[1] = truncated;
+        return size;
+    }
+    return -38;
+}
+
+static long shared_call(struct process *p, u64 value, u8 *mail) {
+    unsigned command = value >> 56, fd = (value >> 32) & 255, argument = (u32)value;
+    const u64 *words = (const u64 *)mail;
+    if (command == 5) return shared_unmap(bank, words[0], words[1]);
+    struct shared_file *file = fd >= 3 && fd < FD_LIMIT ? p->handles[fd - 3].shared : 0;
+    if (command == 0 || command == 1) {
+        if (command == 1 && !file) return -9;
+        unsigned slot = 0;
+        while (slot < HANDLE_COUNT && handle_used(p, slot)) slot++;
+        if (slot == HANDLE_COUNT) return -24;
+        if (file && command == 1) shared_ref(file);
+        else file = shared_create();
+        if (!file) return -23;
+        p->handles[slot].shared = file;
+        return slot + 3;
+    }
+    if (!file) return -9;
+    switch (command) {
+    case 2: return shared_resize(file, argument);
+    case 3: return shared_size(file);
+    case 4: return shared_map(bank, file, words[0], words[1], words[2]);
+    case 6: case 7: return argument <= 4096 ? shared_transfer(file, mail, argument, command == 7) : -22;
+    case 8: return shared_seek(file, (long)words[0], argument);
+    default: return -22;
+    }
+}
+
 static long syscall_service(u64 value, u64 op) {
     struct process *p = &processes[bank];
     char *mail = (char *)UTILITY, path[513];
     unsigned fd = value >> 32, n = (u32)value;
     struct file f;
     if (p->agent_child && equal(p->executable,"/bin/agent-run") && op != 12) return -1;
-    if (p->scope[0] && ((op>=19 && op<=21) || (op>=25 && op<=28) || op==48 ||
+    if (p->scope[0] && ((op>=19 && op<=21) || (op>=25 && op<=28) || op==48 || op==58 || op==59 || op==60 ||
         op==33 || op==34 || op==35 || (op==18 && ((u32)value==3 || (u32)value==16 ||
         (u32)value==17 || ((u32)value==18 && ((value>>32)&4)))))) return -1;
     if (p->test.deadline) {
@@ -802,6 +937,9 @@ static long syscall_service(u64 value, u64 op) {
         }
     }
     switch (op) {
+    case 58: return local_call(p, value, (u8 *)mail);
+    case 60: return gpu_call(&p->gpu_context, value, (u8 *)0x443d8000UL);
+    case 59: return shared_call(p, value, (u8 *)mail);
     case 0: {
         u8 c;
         if (stream_read(p, &c, 1) != 1)
@@ -823,6 +961,16 @@ static long syscall_service(u64 value, u64 op) {
     case 16:
         if (!p->foreground)
             return -1;
+        if (value == 1) {
+            u64 *words = (u64 *)MAIL;
+            words[0] = clock_ticks();
+            words[1] = clock_hz();
+            words[2] = heap_capacity_bytes() - heap_bytes();
+            words[3] = smp_cpus();
+            words[4] = smp_idle_ticks(0);
+            words[5] = words[3] > 1 ? smp_idle_ticks(1) : 0;
+            return 48 + task_resources(words + 6);
+        }
         metrics((u64 *)MAIL);
         return 0;
     case 17:
@@ -888,8 +1036,7 @@ static long syscall_service(u64 value, u64 op) {
         if (length(mail, 254) >= 254 || value > 65535 || !value)
             return -1;
         unsigned i = 0;
-        while (i < HANDLE_COUNT && (p->handles[i].file.data || p->handles[i].pipe ||
-                                    p->handles[i].path[0] || p->handles[i].socket))
+        while (i < HANDLE_COUNT && handle_used(p, i))
             i++;
         if (i == HANDLE_COUNT)
             return -1;
@@ -912,6 +1059,7 @@ static long syscall_service(u64 value, u64 op) {
     case 30:
         return value <= 4096 ? entropy_read((u8 *)mail, value) : -1;
     case 29:
+        if (value == 10) return smp_cpu();
         if (value == 9) return task_resources((u64 *)mail);
         if (value == 0)
             return net_info(mail);
@@ -926,16 +1074,12 @@ static long syscall_service(u64 value, u64 op) {
         if (value == 4)
             return reply(mail, KERNEL_SUMMARY);
         return -1;
-    case 38: {
-        u64 ticks = clock_ticks(), hz = clock_hz(), scale = value == 0 ? 1000 : 1000000;
-        return value == 2 ? ticks : value > 2 ? -1 : (ticks / hz) * scale + ticks % hz * scale / hz;
-    }
+    case 38: return smp_clock_read(value);
     case 40: {
         if (length(mail, 513) > 512 || !resolve(p->cwd, mail, path) || proc_path(path))
             return -1;
         unsigned i = 0;
-        while (i < HANDLE_COUNT && (p->handles[i].file.data || p->handles[i].pipe ||
-                                    p->handles[i].path[0] || p->handles[i].socket))
+        while (i < HANDLE_COUNT && handle_used(p, i))
             i++;
         if (i == HANDLE_COUNT || (vfs_lookup(path, &f) && f.size == 0xffffffff))
             return -1;
@@ -961,6 +1105,10 @@ static long syscall_service(u64 value, u64 op) {
                 ready = index == 1 && p->out ? pipe_ready(p->out, 1) : 2;
             else if (p->handles[index-3].pipe)
                 ready = pipe_ready(p->handles[index-3].pipe, p->handles[index-3].writer);
+            else if (p->handles[index - 3].local)
+                ready = local_ready(p->handles[index - 3].local);
+            else if (p->handles[index - 3].shared)
+                ready = 3;
             else if (p->handles[index - 3].socket)
                 ready = socket_ready(p->handles[index - 3].socket - 1);
             else if (p->handles[index - 3].file.data)
@@ -1038,7 +1186,7 @@ static long syscall_service(u64 value, u64 op) {
         if (f.size == 0xffffffff)
             return -1;
         for (unsigned i = 0; i < HANDLE_COUNT; i++)
-            if (!p->handles[i].file.data && !p->handles[i].pipe && !p->handles[i].socket && !p->handles[i].path[0]) {
+            if (!handle_used(p, i)) {
                 u8 *bytes = file_buffer(f.size);
                 if (!bytes)
                     return -1;
@@ -1087,9 +1235,7 @@ static long syscall_service(u64 value, u64 op) {
             close_stream(p, value);
             return 0;
         }
-        if (value < 3 || value >= FD_LIMIT ||
-            (!p->handles[value - 3].file.data && !p->handles[value - 3].pipe &&
-             !p->handles[value - 3].socket && !p->handles[value - 3].path[0]))
+        if (value < 3 || value >= FD_LIMIT || !handle_used(p, value - 3))
             return -1;
         close_handle(p, value - 3);
         return 0;
@@ -1167,7 +1313,7 @@ static long syscall_service(u64 value, u64 op) {
     case 49: {
         int r = -1, w = -1;
         for (int i = 0; i < HANDLE_COUNT; ++i) {
-            if (p->handles[i].file.data || p->handles[i].path[0] || p->handles[i].socket || p->handles[i].pipe) continue;
+            if (handle_used(p, i)) continue;
             if (r < 0) r=i; else { w=i; break; }
         }
         if (w < 0) return -1;
@@ -1823,6 +1969,8 @@ long run_task(unsigned slot) {
     redirect_close(p->input, 0);
     for (unsigned i = 0; i < HANDLE_COUNT; i++)
         close_handle(p, i);
+    gpu_close(&p->gpu_context);
+    shared_clear(slot);
     for (unsigned kind = 0; kind < ARENAS; kind++) {
         struct frame_map *heap = &heaps[slot][kind];
         heap->sealed = 0;
@@ -1844,28 +1992,45 @@ void fatal_vector(void) {
     }
 }
 
-int run_login(void) {
-    root[0] = 1 | (1 << 10) | 4 | PXN | UXN;
-    root[1] = (u64)ram | 3;
-    root[2] = (u64)ram_high | 3;
-    root[3] = (u64)extended | 3;
-    for (unsigned i = 0; i < 512; i++)
-        ram[i] = (0x40000000UL + i * BLOCK) | NORMAL | UXN;
-    for (unsigned i = 0; i < (NATIVE_RAM_BYTES - (1024UL << 20)) / BLOCK; i++)
-        ram_high[i] = (0x80000000UL + i * BLOCK) | NORMAL | UXN;
-    if (build_volume) {
-        for (unsigned i = 4; i < (BUILD_RAM + GIB) / GIB; i++)
-            root[i] = i * GIB | NORMAL | PXN | UXN;
-        for (unsigned i = 0; i < 4; i++)
-            root[64 + i] = (u64)wide_tables[i] | 3;
+void smp_native_root(void) {
+    extern void smp_root(unsigned long table);
+    smp_root((u64)cpu_tables[1].root);
+}
+static int mmu_ready;
+void early_mmu_init(int high) {
+    if (mmu_ready)
+        return;
+    for (unsigned c=0; c<2; c++) {
+        struct cpu_tables *t=&cpu_tables[c];
+        t->root[0] = 1 | (1 << 10) | 4 | PXN | UXN;
+        t->root[1] = (u64)t->ram | 3;
+        t->root[2] = (u64)t->ram_high | 3;
+        t->root[3] = (u64)t->extended | 3;
+        t->root[LX_SHARED_BASE / GIB] = shared_root(c);
+        for (unsigned i = 0; i < 512; i++)
+            t->ram[i] = (0x40000000UL + i * BLOCK) | NORMAL | UXN;
+        for (unsigned i = 0; i < (NATIVE_RAM_BYTES - (1024UL << 20)) / BLOCK; i++)
+            t->ram_high[i] = (0x80000000UL + i * BLOCK) | NORMAL | UXN;
+        if (high) {
+            for (unsigned i = 4; i < (BUILD_RAM + GIB) / GIB; i++)
+                t->root[i] = i * GIB | NORMAL | PXN | UXN;
+            for (unsigned i = 0; i < 4; i++)
+                t->root[64 + i] = (u64)t->wide_tables[i] | 3;
+        }
     }
-    enable_mmu(root, native_vectors, build_volume);
+    enable_mmu(cpu_tables[0].root, native_vectors, high);
     extern int normal_ram;
     normal_ram = 1;
+    mmu_ready = 1;
+}
+
+int run_login(void) {
+    early_mmu_init(build_volume);
     select_bank(0);
     tasks_init();
     proc_init();
     processes[0].cwd[0] = '/';
+    add_text(processes[0].executable, split_mode() ? "init" : "/bin/sh");
     if (!split_mode())
         return launch("/bin/sh", "sh", 3, 1, ssh_mode() ? 6 : 2);
     struct process *parent = &processes[0];

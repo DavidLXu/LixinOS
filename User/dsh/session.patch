@@ -1,0 +1,57 @@
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -1,7 +1,7 @@
+ import z from "@deepseek-ai/schemastery";
+ import { SessionFormatUnsupportedMigrationError, createSessionFormatCatalogWithChildren, historicalSessionFormatCatalog, sessionFormatCatalog } from "@deepseek-ai/dsh-session-format-catalog";
+ import { readdirSync } from "node:fs";
+-import { link, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, truncate } from "node:fs/promises";
++import { link, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, truncate } from "node:fs/promises";
+ import { basename, dirname, isAbsolute, join, parse, resolve, toNamespacedPath } from "node:path";
+ import { performance } from "node:perf_hooks";
+ import { scheduler } from "node:timers/promises";
+@@ -674,6 +674,19 @@
+ 			recursive: true,
+ 			mode: 448
+ 		});
++		if (process.platform === "lixinos") {
++			// Exclusive file creation is atomic in the guest filesystem.
++			// Keep a crashed writer's claim until it is explicitly recovered.
++			const claim = path + ".exclusive";
++			try {
++				const handle = await open(claim, "wx", 384);
++				await handle.close();
++			} catch (error) {
++				if (error.code === "EEXIST") throw new SessionAlreadyOwnedError(id);
++				throw error;
++			}
++			return new SessionWriteLease({ kind: "lixinos", claim });
++		}
+ 		/* v8 ignore start -- native Windows coverage exercises this platform branch; Linux covers the POSIX peer */
+ 		if (process.platform === "win32") {
+ 			let handle;
+@@ -724,6 +737,10 @@
+ 	async release() {
+ 		if (this.released) return;
+ 		this.released = true;
++		if (this.held.kind === "lixinos") {
++			await rm(this.held.claim);
++			return;
++		}
+ 		/* v8 ignore start -- native Windows coverage exercises this platform branch; Linux covers the POSIX peer */
+ 		if (this.held.kind === "win32") {
+ 			await releaseLockHandleWin32(this.held.handle);
+@@ -3223,7 +3240,13 @@
+ 		const tmp = await this.writeSyncedTempFile(finalPath, content);
+ 		let linked = false;
+ 		try {
+-			await link(tmp, finalPath);
++			if (process.platform === "lixinos") {
++				// The session lease serializes writers. Publish the complete temp
++				// file in one guest filesystem snapshot.
++				await rename(tmp, finalPath);
++			} else {
++				await link(tmp, finalPath);
++			}
+ 			linked = true;
+ 		} finally {
+ 			/* v8 ignore next -- link failure is the TOCTOU/IO race guarded above; not reachable in test */

@@ -20,12 +20,14 @@ typedef struct {
     char clipboard[WINDOW_CLIENT_CLIPBOARD_MAX];
     char paste[WINDOW_CLIENT_CLIPBOARD_MAX];
     unsigned short *pixels, *scratch, *encoded;
-    int busy, ready, head, count, overflow, paste_queued;
+    int busy, ready, head, count, sent, overflow, paste_queued;
+    long close_requested_at;
+    int awaiting_close_reply, confirm_force_close;
     int pointer_x, pointer_y;
     WindowEvent events[CLIENT_EVENTS];
 } WindowClient;
 
-static int client_open(WindowClient *client, const char *cwd, const char *path) {
+static int client_open_streams(WindowClient *client, const char *cwd, const char *path, const char *argument, int error_fd) {
     if (client->pid) return 0;
     long input = console_call(49, 0);
     if (input < 0) return 0;
@@ -37,7 +39,13 @@ static int client_open(WindowClient *client, const char *cwd, const char *path) 
         memcpy(mail, cwd, a);
         memcpy(mail + a, path, b);
         memcpy(mail + a + b, path, b);
-        pid = console_call(50, ((long)(a + 2*b) << 32) | (255L << 16) |
+        unsigned used = a + 2*b;
+        if (argument) {
+            unsigned n = strlen(argument) + 1;
+            memcpy(mail + used, argument, n);
+            used += n;
+        }
+        pid = console_call(50, ((long)used << 32) | ((long)error_fd << 16) |
                            ((output & 255) << 8) | (input >> 32));
         lx_close(output & 255);
         if (pid <= 0) lx_close(output >> 32);
@@ -59,20 +67,29 @@ static int client_open(WindowClient *client, const char *cwd, const char *path) 
     return 1;
 }
 
+static inline int client_open_argument(WindowClient *client, const char *cwd, const char *path, const char *argument) {
+    return client_open_streams(client, cwd, path, argument, 255);
+}
+
+static inline int client_open(WindowClient *client, const char *cwd, const char *path) {
+    return client_open_argument(client,cwd,path,0);
+}
+
 static void client_event(WindowClient *client, WindowEvent event) {
     if (!client->pid || client->stopping) return;
     int tail = (client->head + client->count) % CLIENT_EVENTS;
     WindowEvent *previous = &client->events[(tail + CLIENT_EVENTS - 1) % CLIENT_EVENTS];
+    int can_replace = client->count > (client->sent != 0);
     if (event.type == WINDOW_CLIENT_CLOSE && client->count && previous->type == event.type)
         return;
-    if (event.type == WINDOW_CLIENT_CONFIGURE && client->count && previous->type == event.type) {
+    if (event.type == WINDOW_CLIENT_CONFIGURE && can_replace && previous->type == event.type) {
         *previous = event;
         return;
     }
     if (event.type == WINDOW_CLIENT_POINTER) {
         client->pointer_x = event.x;
         client->pointer_y = event.y;
-        if (client->count && previous->type == WINDOW_CLIENT_POINTER && previous->value == event.value) {
+        if (can_replace && previous->type == WINDOW_CLIENT_POINTER && previous->value == event.value) {
             *previous = event;
             return;
         }
@@ -177,6 +194,11 @@ static int commit_patch(WindowClient *c) {
         c->next_tick = console_call(38, 0) + interval;
     }
     c->busy = 0;
+    if (c->awaiting_close_reply) {
+        c->awaiting_close_reply = 0;
+        c->close_requested_at = 0;
+        c->confirm_force_close = 0;
+    }
     if (c->reply.clipboard_size)
         lx_copy_text(c->clipboard, c->reply.clipboard_size);
     if (!u.w) return 0;
@@ -253,15 +275,21 @@ static int client_tick(WindowClient *client, int visible) {
     }
     if (!client->count) return 0;
     WindowEvent *event = &client->events[client->head];
-    if (lx_write(client->input, event, sizeof *event) != sizeof *event) return -1;
-    if (event->type == WINDOW_CLIENT_PASTE) {
-        for (int sent = 0; sent < event->value;) {
-            int n = lx_write(client->input, client->paste + sent, event->value - sent);
-            if (n <= 0) return -1;
-            sent += n;
-        }
-        client->paste_queued = 0;
+    int length = sizeof *event + (event->type == WINDOW_CLIENT_PASTE ? event->value : 0);
+    /* Both guest kernels guarantee one writable byte after poll on this
+     * single-writer pipe. TCC's blocking write waits for the entire count. */
+    for (int budget = 128; client->sent < length && budget; --budget) {
+        int ready = lx_poll(client->input, LX_WRITABLE, 0);
+        if (ready <= 0) return ready;
+        const char *byte = client->sent < (int)sizeof *event ? (const char *)event + client->sent :
+                           client->paste + (client->sent - sizeof *event);
+        if (lx_write(client->input, byte, 1) != 1) return -1;
+        ++client->sent;
     }
+    if (client->sent < length) return 0;
+    client->sent = 0;
+    if (event->type == WINDOW_CLIENT_PASTE) client->paste_queued = 0;
+    client->awaiting_close_reply = event->type == WINDOW_CLIENT_CLOSE;
     client->configuring = event->type == WINDOW_CLIENT_CONFIGURE;
     if (client->configuring) {
         client->target_w = event->x;

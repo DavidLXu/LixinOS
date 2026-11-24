@@ -22,9 +22,11 @@ def link(source, sdk, output, objects=None):
         return subprocess.check_output(["c++", "-print-file-name=" + name], text=True).strip()
     platform = output.with_suffix(".platform.o")
     subprocess.run(["cc", "-D__lixinos__", "-Os", "-ffunction-sections", "-I", source/"deps/uv/include", "-c", port/"platform.c", "-o", platform], check=True)
+    volume = output.with_suffix(".volume.o")
+    subprocess.run(["cc", "-Os", "-I", source / "src", "-c", port / "volume.c", "-o", volume], check=True)
     subprocess.run(["c++", "-static", "-no-pie", "-nostdlib", "-Wl,--gc-sections,--build-id=none,-z,max-page-size=4096",
-                    "-Wl,-T," + str(port/"program.ld"), "-Wl,--wrap=pthread_getattr_np,--wrap=getrlimit,--wrap=uv_guess_handle",
-                    "-o", output, sdk/"crt1.o", sdk/"crti.o", compiler_file("crtbeginT.o"), platform, *objects,
+                    "-Wl,-T," + str(port/"program.ld"), "-Wl,--wrap=pthread_getattr_np,--wrap=getrlimit,--wrap=uv_guess_handle,--wrap=getaddrinfo,--wrap=read",
+                    "-o", output, sdk/"crt1.o", sdk/"crti.o", compiler_file("crtbeginT.o"), platform, volume, *objects,
                     "-Wl,--start-group", "-lstdc++", sdk/"liblx.a", sdk/"libc.a", "-lgcc", "-lgcc_eh", "-latomic",
                     "-Wl,--end-group", compiler_file("crtend.o"), sdk/"crtn.o"], cwd=release, check=True)
 

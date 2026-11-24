@@ -1,0 +1,5 @@
+<Menu>
+  <Name>Applications</Name>
+  <AppDir>/lib/xfce/applications</AppDir>
+  <Include><All/></Include>
+</Menu>

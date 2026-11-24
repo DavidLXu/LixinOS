@@ -116,6 +116,18 @@ fn main() {
         .status()
         .expect("start ARM64 user program build");
     assert!(status.success(), "failed to build ARM64 user programs");
+    // Build the same CPU rendezvous and exception-frame ABI as the guest TCC kernel.
+    let cc = fs::read_dir("target/user-build").unwrap().filter_map(Result::ok)
+        .map(|entry| entry.path().join("bin/aarch64-none-elf-gcc"))
+        .find(|cc| cc.is_file()).unwrap_or_else(|| "aarch64-none-elf-gcc".into());
+    for source in ["smp.c", "smp-arch.S", "gpu.c"] {
+        if source == "gpu.c" && std::env::var_os("CARGO_FEATURE_RETINA").is_none() { continue; }
+        let object = Path::new(&std::env::var_os("OUT_DIR").unwrap()).join(format!("{source}.o"));
+        assert!(Command::new(&cc).args(["-c", "-O2", "-mgeneral-regs-only", "-ffreestanding",
+            "-fno-stack-protector", "-fno-builtin", "-o"]).arg(&object)
+            .arg(Path::new("native").join(source)).status().unwrap().success());
+        println!("cargo:rustc-link-arg={}", object.display());
+    }
     kernel_sources(Path::new("native"), "/src/kernel", &mut entries);
     // A release imported from a guest carries its exact lwIP sources in native/lwip.
     if !Path::new("native/lwip").is_dir() {

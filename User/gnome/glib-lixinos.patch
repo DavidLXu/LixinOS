@@ -1,0 +1,49 @@
+--- a/gio/gcredentialsprivate.h
++++ b/gio/gcredentialsprivate.h
+@@ -109,9 +109,11 @@
+ #define G_CREDENTIALS_USE_LINUX_UCRED 1
+ #define G_CREDENTIALS_NATIVE_TYPE G_CREDENTIALS_TYPE_LINUX_UCRED
+ #define G_CREDENTIALS_NATIVE_SIZE (sizeof (struct ucred))
++#ifndef __lixinos__
+ #define G_CREDENTIALS_UNIX_CREDENTIALS_MESSAGE_SUPPORTED 1
++#define G_CREDENTIALS_SPOOFING_SUPPORTED 1
++#endif
+ #define G_CREDENTIALS_SOCKET_GET_CREDENTIALS_SUPPORTED 1
+-#define G_CREDENTIALS_SPOOFING_SUPPORTED 1
+ #define G_CREDENTIALS_HAS_PID 1
+ 
+ #elif defined(__FreeBSD__)                                  || \
+--- a/gio/gunixconnection.c
++++ b/gio/gunixconnection.c
+@@ -512,7 +512,7 @@
+    * already. We also need to turn it off when we're done.  See
+    * #617483 for more discussion.
+    */
+-#ifdef __linux__
++#if defined(__linux__) && !defined(__lixinos__)
+   {
+     gint opt_val;
+ 
+@@ -626,7 +626,7 @@
+ 
+  out:
+ 
+-#ifdef __linux__
++#if defined(__linux__) && !defined(__lixinos__)
+   if (turn_off_so_passcreds)
+     {
+       if (!g_socket_set_option (socket,
+--- a/gmodule/gmodule.c
++++ b/gmodule/gmodule.c
+@@ -238,7 +238,11 @@
+ /* --- include platform specific code --- */
+ #define	SUPPORT_OR_RETURN(rv)	{ g_module_set_error (NULL); }
+ #if	(G_MODULE_IMPL == G_MODULE_IMPL_DL)
++#ifdef __lixinos__
++#include "gmodule-lixinos.c"
++#else
+ #include "gmodule-dl.c"
++#endif
+ #elif	(G_MODULE_IMPL == G_MODULE_IMPL_WIN32)
+ #include "gmodule-win32.c"
+ #elif	(G_MODULE_IMPL == G_MODULE_IMPL_AR)

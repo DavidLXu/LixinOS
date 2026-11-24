@@ -1,0 +1,35 @@
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -1,3 +1,4 @@
++import guestVolume from "../../../../volume.cjs";
+ import { constants } from "node:buffer";
+ import { once } from "node:events";
+ import { watch } from "chokidar";
+@@ -531,9 +532,9 @@
+ 	try {
+ 		await mkdir(stagingDir, { mode: 448 });
+ 		stagingCreated = true;
+-		await chmod(stagingDir, 448);
++		if (platform !== "lixinos") await chmod(stagingDir, 448);
+ 		handle = await open(tempPath, "wx", 384);
+-		await handle.chmod(384);
++		if (platform !== "lixinos") await handle.chmod(384);
+ 		if (platform === "win32" && mode !== void 0) await copyFileDacl(absolutePath, tempPath);
+ 		await handle.writeFile(content, {
+ 			encoding: "utf8",
+@@ -544,12 +545,13 @@
+ 			stagingDir,
+ 			tempPath
+ 		});
+-		if (mode !== void 0) await handle.chmod(mode);
++		if (mode !== void 0 && platform !== "lixinos") await handle.chmod(mode);
+ 		await handle.close();
+ 		handle = void 0;
+ 		throwIfAborted(signal, "write");
+ 		if (createIfAbsent !== void 0) try {
+-			await linkFile(tempPath, absolutePath);
++			if (platform === "lixinos") guestVolume.createFromStage(tempPath, absolutePath);
++			else await linkFile(tempPath, absolutePath);
+ 		} catch (error) {
+ 			await throwGuardedCreateFailure(error, absolutePath, createIfAbsent.displayPath, inspectPublicationTarget);
+ 		}

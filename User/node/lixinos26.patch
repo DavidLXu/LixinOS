@@ -1,0 +1,279 @@
+--- a/common.gypi
++++ b/common.gypi
+@@ -196,7 +196,7 @@
+             }],
+           ],
+         },
+-        'cflags': [ '-O3' ],
++        'cflags': [ '-Os' ],
+         'conditions': [
+           ['enable_lto=="true"', {
+             'cflags': ['<(lto)'],
+--- a/deps/uv/include/uv/linux.h
++++ b/deps/uv/include/uv/linux.h
+@@ -22,7 +22,18 @@
+ #ifndef UV_LINUX_H
+ #define UV_LINUX_H
+ 
++#ifdef __lixinos__
++#define UV_LIXINOS_POLL_FIELDS                                               \
++  struct pollfd* poll_fds;                                                    \
++  size_t poll_fds_used;                                                       \
++  size_t poll_fds_size;                                                       \
++  unsigned char poll_fds_iterating;
++#else
++#define UV_LIXINOS_POLL_FIELDS
++#endif
++
+ #define UV_PLATFORM_LOOP_FIELDS                                               \
++  UV_LIXINOS_POLL_FIELDS \
+   uv__io_t inotify_read_watcher;                                              \
+   void* inotify_watchers;                                                     \
+   int inotify_fd;                                                             \
+--- a/deps/uv/src/unix/async.c
++++ b/deps/uv/src/unix/async.c
+@@ -265,7 +265,7 @@
+   if (loop->async_io_watcher.fd != -1)
+     return 0;
+ 
+-#ifdef __linux__
++#if defined(__linux__) && !defined(__lixinos__)
+   err = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+   if (err < 0)
+     return UV__ERR(errno);
+--- a/deps/uv/src/unix/linux.c
++++ b/deps/uv/src/unix/linux.c
+@@ -634,6 +634,7 @@
+ }
+ 
+ 
++#ifndef __lixinos__
+ int uv__platform_loop_init(uv_loop_t* loop) {
+   uv__loop_internal_fields_t* lfields;
+ 
+@@ -652,8 +653,10 @@
+ 
+   return 0;
+ }
+-
+-
++#endif
++
++
++#ifndef __lixinos__
+ int uv__io_fork(uv_loop_t* loop) {
+   int err;
+   struct watcher_list* root;
+@@ -672,8 +675,10 @@
+ 
+   return uv__inotify_fork(loop, root);
+ }
+-
+-
++#endif
++
++
++#ifndef __lixinos__
+ void uv__platform_loop_delete(uv_loop_t* loop) {
+   uv__loop_internal_fields_t* lfields;
+ 
+@@ -687,6 +692,7 @@
+     loop->inotify_fd = -1;
+   }
+ }
++#endif
+ 
+ 
+ struct uv__invalidate {
+@@ -696,6 +702,7 @@
+ };
+ 
+ 
++#ifndef __lixinos__
+ void uv__platform_invalidate_fd(uv_loop_t* loop, int fd) {
+   uv__loop_internal_fields_t* lfields;
+   struct uv__invalidate* inv;
+@@ -727,8 +734,10 @@
+   memset(&dummy, 0, sizeof(dummy));
+   epoll_ctl(loop->backend_fd, EPOLL_CTL_DEL, fd, &dummy);
+ }
+-
+-
++#endif
++
++
++#ifndef __lixinos__
+ int uv__io_check_fd(uv_loop_t* loop, int fd) {
+   struct epoll_event e;
+   int rc;
+@@ -748,6 +757,7 @@
+ 
+   return rc;
+ }
++#endif
+ 
+ 
+ /* Caller must initialize SQE and call uv__iou_submit(). */
+@@ -1344,6 +1354,7 @@
+ }
+ 
+ 
++#ifndef __lixinos__
+ void uv__io_poll(uv_loop_t* loop, int timeout) {
+   uv__loop_internal_fields_t* lfields;
+   struct epoll_event events[1024];
+@@ -1599,6 +1610,7 @@
+     while (*ctl->sqhead != *ctl->sqtail)
+       uv__epoll_ctl_flush(epollfd, ctl, &prep);
+ }
++#endif
+ 
+ uint64_t uv__hrtime(uv_clocktype_t type) {
+   static _Atomic clock_t fast_clock_id = -1;
+@@ -2742,3 +2754,7 @@
+ void uv__fs_event_close(uv_fs_event_t* handle) {
+   uv_fs_event_stop(handle);
+ }
++
++#ifdef __lixinos__
++#include "posix-poll.c"
++#endif
+--- a/deps/uv/src/unix/posix-poll.c
++++ b/deps/uv/src/unix/posix-poll.c
+@@ -34,6 +34,13 @@
+ #include <unistd.h>
+ 
+ int uv__platform_loop_init(uv_loop_t* loop) {
++#ifdef __lixinos__
++  uv__loop_internal_fields_t* fields = uv__get_internal_fields(loop);
++  fields->ctl.ringfd = -1;
++  fields->iou.ringfd = -1;
++  loop->inotify_fd = -1;
++  loop->inotify_watchers = NULL;
++#endif
+   loop->poll_fds = NULL;
+   loop->poll_fds_used = 0;
+   loop->poll_fds_size = 0;
+--- a/deps/v8/src/base/platform/platform-posix.cc
++++ b/deps/v8/src/base/platform/platform-posix.cc
+@@ -110,6 +110,10 @@
+ extern "C" void* __libc_stack_end;
+ #endif
+ 
++#ifdef __lixinos__
++extern "C" const char lx_node_eager_heap __attribute__((weak));
++#endif
++
+ namespace v8 {
+ namespace base {
+ 
+@@ -137,6 +141,12 @@
+ #endif
+ 
+ const int kMmapFdOffset = 0;
++#ifdef __lixinos__
++static bool EagerHeap() { return &::lx_node_eager_heap != nullptr; }
++#else
++static bool EagerHeap() { return false; }
++#endif
++
+ 
+ enum class PageType { kShared, kPrivate };
+ 
+@@ -178,6 +188,11 @@
+                std::optional<SharedMemoryHandle> handle = std::nullopt,
+                bool fixed = false) {
+   int prot = GetProtectionFromMemoryPermission(access);
++  if (EagerHeap()) {
++    if ((prot & PROT_EXEC) || page_type != PageType::kPrivate || handle.has_value())
++      return nullptr;
++    prot = PROT_READ | PROT_WRITE;
++  }
+   int flags = GetFlagsForMemoryPermission(access, page_type, handle, fixed);
+ #if V8_OS_DARWIN
+   // fd is used to pass vm_alloc flags to tag the region with the user
+@@ -567,6 +582,8 @@
+   DCHECK_EQ(0, size % CommitPageSize());
+ 
+   int prot = GetProtectionFromMemoryPermission(access);
++  // The guest reserves already-backed NX data. Only the loader can seal code.
++  if (EagerHeap()) return !(prot & PROT_EXEC);
+   int ret = mprotect(address, size, prot);
+ 
+   // Setting permissions can fail if the limit of VMAs is exceeded.
+@@ -606,6 +623,7 @@
+ 
+ // static
+ void OS::SetDataReadOnly(void* address, size_t size) {
++  if (EagerHeap()) return;
+   CHECK_EQ(0, reinterpret_cast<uintptr_t>(address) % CommitPageSize());
+   CHECK_EQ(0, size % CommitPageSize());
+ 
+@@ -643,6 +661,10 @@
+ 
+ // static
+ bool OS::DiscardSystemPages(void* address, size_t size) {
++  if (EagerHeap()) {
++    memset(address, 0, size);
++    return true;
++  }
+   // Roughly based on PartitionAlloc's DiscardSystemPagesInternal
+   // (base/allocator/partition_allocator/page_allocator_internals_posix.h)
+   DCHECK_EQ(0, reinterpret_cast<uintptr_t>(address) % CommitPageSize());
+@@ -680,6 +702,10 @@
+ // See AIX version for details.
+ // static
+ bool OS::DecommitPages(void* address, size_t size) {
++  if (EagerHeap()) {
++    memset(address, 0, size);
++    return true;
++  }
+   DCHECK_EQ(0, reinterpret_cast<uintptr_t>(address) % CommitPageSize());
+   DCHECK_EQ(0, size % CommitPageSize());
+   // From https://pubs.opengroup.org/onlinepubs/9699919799/functions/mmap.html:
+--- a/src/node.cc
++++ b/src/node.cc
+@@ -406,7 +406,12 @@
+     return StartExecution(env, "internal/main/run_main_module");
+   }
+ 
++#ifdef __lixinos__
++  // A cooked guest console can host readline without a libuv raw TTY handle.
++  if (env->options()->force_repl || isatty(STDIN_FILENO)) {
++#else
+   if (env->options()->force_repl || uv_guess_handle(STDIN_FILENO) == UV_TTY) {
++#endif
+     return StartExecution(env, "internal/main/repl");
+   }
+ 
+--- a/src/node_metadata.cc
++++ b/src/node_metadata.cc
+@@ -219,6 +219,10 @@
+ #endif  // NODE_HAS_RELEASE_URLS
+ }
+ 
++#ifdef __lixinos__
++Metadata::Metadata() : arch(NODE_ARCH), platform("lixinos") {}
++#else
+ Metadata::Metadata() : arch(NODE_ARCH), platform(NODE_PLATFORM) {}
++#endif
+ 
+ }  // namespace node
+--- a/tools/v8_gypfiles/v8.gyp
++++ b/tools/v8_gypfiles/v8.gyp
+@@ -307,6 +307,7 @@
+     },  # v8_init
+     {
+       'target_name': 'v8_initializers',
++      'cflags_cc': ['-Os'],
+       'type': 'static_library',
+       'toolsets': ['host', 'target'],
+       'dependencies': [
+@@ -1103,6 +1104,7 @@
+     },  # v8_inspector_headers
+     {
+       'target_name': 'v8_base_without_compiler',
++      'cflags_cc': ['-Os'],
+       'type': 'static_library',
+       'toolsets': ['host', 'target'],
+       'dependencies': [

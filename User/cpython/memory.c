@@ -6,21 +6,23 @@
 
 #define BASE 0x78000000UL
 #define LIMIT 0xa0000000UL /* SVC 37 enforces the capacity of the running kernel. */
+#define STANDARD_HEAP (128UL << 20)
 /* musl mallocng uses brk for its small-object allocation metadata. */
 static size_t heap_capacity(void) {
     static size_t capacity;
     if (!capacity) {
         long reported = console_call(37, ~0UL);
-        capacity = reported == (long)(LIMIT - BASE) ? LIMIT - BASE : 128UL << 20;
+        capacity = reported == (long)(LIMIT - BASE) ? LIMIT - BASE : STANDARD_HEAP;
     }
     return capacity;
 }
 static size_t brk_capacity(void) {
-    return heap_capacity() > (128UL << 20) ? 16UL << 20 : 1UL << 20;
+    return heap_capacity() > STANDARD_HEAP ? 16UL << 20 : 1UL << 20;
 }
 #define PAGE 4096
 /* The low 128 MiB at SVC 52's base is reserved for compiler metadata. */
-#define EXTRA_BASE 0xc8000000UL
+#define EXTENDED_BASE 0xc0000000UL
+#define EXTRA_BASE (EXTENDED_BASE + STANDARD_HEAP)
 #define EXTRA_SIZE (0x100000000UL - EXTRA_BASE)
 #define WIDE_BASE (64UL << 30)
 #define WIDE_SIZE (4UL << 30)
@@ -46,8 +48,18 @@ struct pool {
     int svc;
 };
 static struct pool primary = { pages, sizeof(pages) * 8, 0, 0, BASE, 0, 37 };
-static struct pool secondary = { extra_pages, sizeof(extra_pages) * 8, 0, 0, EXTRA_BASE, EXTRA_BASE - 0xc0000000UL, 52 };
+static struct pool secondary = { extra_pages, sizeof(extra_pages) * 8, 0, 0, EXTRA_BASE, STANDARD_HEAP, 52 };
 static struct pool wide = { wide_pages, sizeof(wide_pages) * 8, 0, 0, WIDE_BASE, 1UL << 40, 37 };
+
+/* A program that owns the extended arena may use it for anonymous mappings.
+ * Call before creating threads. The build-volume allocator reserves its base. */
+void lx_allow_extended_heap(void) {
+    if (heap_capacity() != STANDARD_HEAP)
+        return;
+    secondary.base = EXTENDED_BASE;
+    secondary.request_offset = 0;
+    secondary.pages = STANDARD_HEAP / PAGE;
+}
 
 static unsigned find_run(struct pool *p, unsigned first, unsigned end, unsigned count) {
     unsigned run = 0;
@@ -90,14 +102,15 @@ long lx_mmap(long addr, unsigned long bytes, long prot, long flags, long fd) {
     unsigned first = (heap_start() + brk_capacity() - BASE) / PAGE;
     primary.pages = heap_capacity() / PAGE;
     long address = allocate(&primary, first, count);
-    if (address >= 0 || heap_capacity() == (128UL << 20)) return address;
+    if (address >= 0 || (heap_capacity() == STANDARD_HEAP && secondary.base != EXTENDED_BASE))
+        return address;
     address = allocate(&secondary, 0, count);
-    if (address >= 0) return address;
+    if (address >= 0 || heap_capacity() == STANDARD_HEAP) return address;
     return allocate(&wide, 0, count);
 }
 long lx_munmap(uintptr_t addr, unsigned long size) {
     if (addr % PAGE || !size) return -EINVAL;
-    struct pool *p = addr >= WIDE_BASE ? &wide : addr >= EXTRA_BASE ? &secondary : &primary;
+    struct pool *p = addr >= WIDE_BASE ? &wide : addr >= secondary.base ? &secondary : &primary;
     uintptr_t limit = p->base + (uintptr_t)p->pages * PAGE;
     if (addr < p->base || addr >= limit || size > limit - addr ||
         (p == &primary && addr < heap_start() + brk_capacity())) return -EINVAL;

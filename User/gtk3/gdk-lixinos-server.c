@@ -365,7 +365,9 @@ static gboolean read_event(gint fd, GIOCondition condition, gpointer data)
         break;
     }
     }
-    server->reply_source = g_timeout_add_full(G_PRIORITY_LOW, 20, reply, server, NULL);
+    /* Desktop sends the next input only after this reply. Ordinary GTK idle
+     * work can stay ready indefinitely, so a protocol reply must outrank it. */
+    server->reply_source = g_timeout_add(20, reply, server);
     return G_SOURCE_CONTINUE;
 }
 
@@ -380,7 +382,7 @@ GdkBroadwayServer *_gdk_broadway_server_new(const char *name, GError **error)
         return NULL;
     }
     server->read_source = g_unix_fd_add(STDIN_FILENO, G_IO_IN | G_IO_HUP, read_event, server);
-    server->reply_source = g_timeout_add_full(G_PRIORITY_LOW, 20, reply, server, NULL);
+    server->reply_source = g_timeout_add(20, reply, server);
     return server;
 }
 

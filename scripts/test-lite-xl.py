@@ -1,4 +1,5 @@
 """Boot the desktop and exercise the Lite XL window on disposable guest disks."""
+from launcher_grid import installed_apps, select_icon
 import argparse
 import json
 import os
@@ -98,16 +99,13 @@ def exercise(guest, control, directory, screenshot, clipboard):
     guest.expect(b"cd " + PROJECT + b"\r", PROMPT)
     guest.send(b"ls -1 /bin\r")
     output = re.sub(rb"\x1b\[[0-9;]*m", b"", guest.until(PROMPT))
-    apps = sorted(name for name in output.splitlines()
-                  if name == b"nxeyes" or name.endswith((b".win", b".win2", b".win3")))
+    apps = installed_apps(output)
     index = apps.index(b"lite-xl.win3")
     guest.send(b"desktop\r")
     wait(lambda p: color(p, 2, 2) == "281e2b", "desktop dock")
     click(36, 8 + 7*min(82, (WORK_H-48)//8) + 20)
-    wait(lambda p: color(p, 82, 6) == INK, "application menu")
-    for _ in range(index // 7):
-        click(375, 288)
-    click(128, 60 + 32*(index % 7))
+    wait(lambda p: color(p, 82, 6) == "203f51", "application menu")
+    select_icon(click,qmp,WORK_W,WORK_H,index+6,len(apps)+6)
     wait(lambda p: color(p, L+25, T+84) == TREE and color(p, L+500, T+300) == DOC,
          "Lite XL project window")
 

@@ -334,10 +334,13 @@ def serve(connection, complete):
             connection.sendall(response)
 
 
-def launch(command, complete, terminal=False):
+def launch(command, complete, terminal=False, clipboard=False):
     # Keep the socket in a private directory with a short path for macOS AF_UNIX.
     with tempfile.TemporaryDirectory(prefix="lixinos-agent-", dir="/tmp") as directory:
         path = str(Path(directory) / "model.sock")
+        clip_path = str(Path(directory) / "clipboard.sock") if clipboard else None
+        clip_listener = None
+        clip_thread = None
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
             server.bind(path)
             server.listen(1)
@@ -347,9 +350,48 @@ def launch(command, complete, terminal=False):
                 "-device", "virtio-serial-device,id=agent-serial,bus=virtio-mmio-bus.2,max_ports=1",
                 "-device", "virtconsole,bus=agent-serial.0,chardev=agent-model",
             ]
+            if clip_path is not None:
+                clip_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                clip_listener.bind(clip_path)
+                clip_listener.listen(1)
+                clip_listener.settimeout(0.25)
+                args.extend([
+                    "-chardev", f"socket,id=clip-host,path={clip_path}",
+                    "-device", "virtio-serial-device,id=clip-serial,bus=virtio-mmio-bus.6,max_ports=1",
+                    "-device", "virtconsole,bus=clip-serial.0,chardev=clip-host",
+                ])
             env = dict(os.environ)
             env.pop("DEEPSEEK_API_KEY", None)
             vm = subprocess.Popen([*command, *args], env=env)
+            if clip_listener is not None:
+                from threading import Thread
+
+                def run_clipboard():
+                    import importlib.util
+                    try:
+                        spec = importlib.util.spec_from_file_location(
+                            "clipboard_bridge", Path(__file__).with_name("clipboard-bridge.py"))
+                        mod = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(mod)
+                        while True:
+                            try:
+                                conn, _ = clip_listener.accept()
+                                break
+                            except socket.timeout:
+                                if vm.poll() is not None:
+                                    return
+                        with conn:
+                            try:
+                                mod.console(conn, vm, command)
+                            except (BrokenPipeError, ConnectionResetError):
+                                pass
+                    except OSError:
+                        pass
+                    finally:
+                        clip_listener.close()
+
+                clip_thread = Thread(target=run_clipboard, daemon=True)
+                clip_thread.start()
             try:
                 deadline = time.monotonic() + 120
                 while True:
@@ -376,11 +418,23 @@ def launch(command, complete, terminal=False):
                     except subprocess.TimeoutExpired:
                         vm.kill()
                         vm.wait()
+                if clip_thread is not None:
+                    clip_thread.join(timeout=1)
+                elif clip_listener is not None:
+                    clip_listener.close()
 
 
 def main():
-    terminal = sys.argv[1] == "--terminal"
-    command = sys.argv[2:] if terminal else sys.argv[1:]
+    args = sys.argv[1:]
+    terminal = False
+    clipboard = False
+    while args and args[0] in ("--terminal", "--clipboard"):
+        if args[0] == "--terminal":
+            terminal = True
+        elif args[0] == "--clipboard":
+            clipboard = True
+        args = args[1:]
+    command = args
     key = os.environ.pop("DEEPSEEK_API_KEY", "").strip()
     if not key:
         print("LixinOS agent: DEEPSEEK_API_KEY is empty", file=sys.stderr)
@@ -388,7 +442,7 @@ def main():
     complete = DeepSeek(key, os.environ.get("DEEPSEEK_MODEL") or DEFAULT_MODEL)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     try:
-        return launch(command, complete, terminal)
+        return launch(command, complete, terminal, clipboard)
     except BridgeError as error:
         print(f"LixinOS agent: {error}", file=sys.stderr)
         return 1

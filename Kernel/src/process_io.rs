@@ -616,7 +616,7 @@ impl Context {
                 let path = services.path(arg)?;
                 let mut contents = match services.volume.borrow().files.get(&path) {
                     Some(None) => return Err("is a directory"),
-                    Some(Some(bytes)) if index == 1 => bytes.clone(),
+                    Some(Some(bytes)) if index == 1 => bytes.to_vec(),
                     _ => Vec::new(),
                 };
                 if contents.len() + self.stream.len() > FILE_LIMIT {
@@ -691,6 +691,7 @@ pub(super) fn run(
     image: Vec<u8>,
     handshake: bool,
 ) -> Result<u8> {
+    crate::scheduler::set_task_name("/bin/sh");
     let mut ctx = Context::new(services, history, handshake);
     ctx.login = true;
     drive(ctx, image, false, None)
@@ -712,6 +713,7 @@ fn run_child(
     let mut ctx = Context::new(services, history, false);
     let mut io = utility::Context::new(&ctx.services.cwd, ctx.services.volume.clone(), streams);
     io.executable = ctx.services.path(&req.path)?;
+    crate::scheduler::set_task_name(&io.executable);
     #[cfg(feature = "retina")]
     let io = {
         let mut io = io;

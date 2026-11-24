@@ -1,0 +1,95 @@
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -605,6 +605,7 @@
+     'wayland/meta-wayland-buffer.c',
+     'wayland/meta-wayland-buffer.h',
+     'wayland/meta-wayland.c',
++    'wayland/wayland-source.c',
+     'wayland/meta-wayland-client.c',
+     'wayland/meta-wayland-client-private.h',
+     'wayland/meta-wayland-color-management.c',
+--- a/src/wayland/meta-wayland.c
++++ b/src/wayland/meta-wayland.c
+@@ -126,6 +126,16 @@
+ static void meta_wayland_compositor_update_focus (MetaWaylandCompositor *compositor,
+                                                   MetaWindow            *window);
+ 
++#ifdef __lixinos__
++#include "wayland-source.h"
++
++static GSource *
++wayland_event_source_new (struct wl_display *display)
++{
++  return lx_wayland_source_new (display);
++}
++
++#else
+ static gboolean
+ wayland_event_source_prepare (GSource *base,
+                               int     *timeout)
+@@ -178,6 +188,8 @@
+ 
+   return &wayland_source->source;
+ }
++
++#endif
+ 
+ static void
+ emit_frame_callbacks_for_stage_view (MetaWaylandCompositor *compositor,
+--- a/cogl/cogl/cogl-renderer.c
++++ b/cogl/cogl/cogl-renderer.c
+@@ -374,6 +374,10 @@
+       break;
+     }
+ 
++  /* The LixinOS EGL renderer supplies GL entry points from its static build. */
++#ifdef __lixinos__
++  (void) libgl_name;
++#else
+   if (libgl_name)
+     {
+       renderer->libgl_module = g_module_open (libgl_name,
+@@ -388,6 +392,7 @@
+           return FALSE;
+         }
+     }
++#endif
+ 
+   return TRUE;
+ }
+--- a/cogl/cogl/winsys/cogl-winsys-egl.c
++++ b/cogl/cogl/winsys/cogl-winsys-egl.c
+@@ -112,8 +112,9 @@
+ {
+   GCallback result = eglGetProcAddress (name);
+ 
+-  if (result == NULL)
+-    g_module_symbol (cogl_renderer_get_gl_module (renderer), name, (gpointer *)&result);
++  GModule *module = cogl_renderer_get_gl_module (renderer);
++  if (result == NULL && module != NULL)
++    g_module_symbol (module, name, (gpointer *)&result);
+ 
+   return result;
+ }
+--- a/src/backends/meta-barrier.c
++++ b/src/backends/meta-barrier.c
+@@ -13,6 +13,7 @@
+ 
+ #include <glib-object.h>
+ 
++#include "backends/meta-backend-private.h"
+ #include "meta/meta-enum-types.h"
+ #include "meta/util.h"
+ 
+--- a/src/core/meta-context-main.c
++++ b/src/core/meta-context-main.c
+@@ -26,7 +26,9 @@
+ #include <gio/gio.h>
+ 
+ #ifdef HAVE_WAYLAND
++#ifdef HAVE_LOGIND
+ #include <systemd/sd-login.h>
++#endif
+ #endif
+ 
+ #include "backends/meta-monitor-private.h"

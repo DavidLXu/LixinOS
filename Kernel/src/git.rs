@@ -9,11 +9,10 @@ use alloc::{
     format,
     rc::Rc,
     string::String,
-    vec::Vec,
 };
 use core::cell::{RefCell, UnsafeCell};
 
-type Entry = Option<Vec<u8>>;
+type Entry = Option<crate::disk::FileData>;
 type Changes = BTreeMap<String, Option<Entry>>;
 struct Session {
     volume: Rc<RefCell<Volume>>,
@@ -201,7 +200,8 @@ fn operation(s: &mut Session, m: &mut Message, op: u64) -> Result<i64, i64> {
                 changes.insert(p.into(), Some(Some(data.clone())));
             }
             let target = changes.get_mut(p).and_then(Option::as_mut)
-                .and_then(Option::as_mut).ok_or(21i64)?;
+                .and_then(Option::as_mut).ok_or(21i64)?
+                .as_mut_vec().map_err(|_| 5i64)?;
             if end > target.len() {
                 target.try_reserve(end-target.len()).map_err(|_| 12i64)?;
                 target.resize(end, 0);
@@ -222,7 +222,7 @@ fn operation(s: &mut Session, m: &mut Message, op: u64) -> Result<i64, i64> {
             let value = if op == 4 {
                 None
             } else {
-                Some(m.bytes.get(..m.length as usize).ok_or(27i64)?.to_vec())
+                Some(crate::disk::FileData::from_vec(m.bytes.get(..m.length as usize).ok_or(27i64)?.to_vec()))
             };
             changes.insert(p.into(), Some(value));
             Ok(0)

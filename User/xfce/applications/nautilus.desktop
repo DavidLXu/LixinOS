@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Files (Nautilus)
+Exec=/bin/nautilus.win3
+TryExec=/bin/nautilus.win3

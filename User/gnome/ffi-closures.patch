@@ -1,0 +1,49 @@
+--- a/src/closures.c
++++ b/src/closures.c
+@@ -42,7 +42,9 @@
+ #include <sys/param.h>
+ #endif
+ 
+-#if __NetBSD_Version__ - 0 >= 799007200
++#ifdef __lixinos__
++#include "lixin-ffi-closures.c"
++#elif __NetBSD_Version__ - 0 >= 799007200
+ /* NetBSD with PROT_MPROTECT */
+ #include <sys/mman.h>
+ 
+--- a/src/aarch64/sysv.S
++++ b/src/aarch64/sysv.S
+@@ -697,3 +697,7 @@
+ 	.popsection;
+ #endif
+ 
++
++#ifdef __lixinos__
++#include "lixin-ffi-trampolines.S"
++#endif
+--- a/src/aarch64/ffi.c
++++ b/src/aarch64/ffi.c
+@@ -31,6 +31,9 @@
+ #include <windows.h> /* FlushInstructionCache */
+ #endif
+ #include <tramp.h>
++#ifdef __lixinos__
++#include "../lixin-ffi.h"
++#endif
+ 
+ /* Force FFI_TYPE_LONGDOUBLE to be different than FFI_TYPE_DOUBLE;
+    all further uses in this file will refer to the 128-bit type.  */
+@@ -878,7 +881,12 @@
+   else
+     start = ffi_closure_SYSV;
+ 
+-#if FFI_EXEC_TRAMPOLINE_TABLE
++#if defined(__lixinos__)
++  closure->cif = cif;
++  closure->fun = fun;
++  closure->user_data = user_data;
++  return lx_ffi_attach(closure, codeloc, start) ? FFI_OK : FFI_BAD_ARGTYPE;
++#elif FFI_EXEC_TRAMPOLINE_TABLE
+ # ifdef __MACH__
+ #  ifdef HAVE_ARM64E_PTRAUTH
+   codeloc = ptrauth_auth_data(codeloc, ptrauth_key_function_pointer, 0);

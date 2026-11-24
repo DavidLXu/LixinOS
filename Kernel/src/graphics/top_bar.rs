@@ -30,6 +30,7 @@ fn with_terminal<T>(f: impl FnOnce(&mut Terminal, &mut [u32], usize) -> T) -> T 
         let pane = ACTIVE;
         let size = display::size();
         let left = pane * (size.cols + 1) * CW;
+        display::damage(0, CH, W, H);
         let fb = &mut (*FB).0;
         f(&mut TERMS[pane], &mut fb[BAR_PIXELS + left..], size.terminal_width(pane))
     }

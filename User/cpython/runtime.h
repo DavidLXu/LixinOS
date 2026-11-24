@@ -9,6 +9,7 @@ long lx_clear_tid(int *);
 void lx_schedule(void);
 void lx_delay(unsigned);
 long lx_sigmask(int, const uint64_t *, uint64_t *);
+long lx_prctl(int, uintptr_t);
 long lx_futex(int *, int, int, const struct timespec *, int *, int);
 _Noreturn void lx_thread_exit(void *, size_t);
 int lx_check_interrupt(void);

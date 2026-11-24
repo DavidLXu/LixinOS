@@ -9,6 +9,9 @@ ssh-mux = []
 retina = ["window-console"]
 split = ["retina"]
 
+[profile.release]
+lto = "thin"
+
 [profile.window]
 inherits = "release"
 

@@ -1,7 +1,8 @@
 # Desktop window applications
 
 Run `desktop` in a graphical shell. **Apps** in the dock (or Ctrl+G) opens
-the application list. Pick a category on the right, then a program on the left.
+a full-screen application grid. Scroll with the wheel or drag vertically, filter
+by category at the top, and click an icon to open it. Click **完成** or press Esc to return.
 See the [应用清单](../../docs/applications.md) for launcher names and shell commands. In the
 **窗口** tab, click a row to raise the window or restore it from the dock.
 Ctrl+] cycles through the visible windows. The number identifies the external client slot. The Eyes dock shortcut
@@ -123,6 +124,9 @@ carries the signed vertical wheel steps in value and the pointer's local
 coordinates in x and y. CLOSE lets the application prompt to save and
 exit when ready. Esc and Ctrl+G go to the focused .win3 app, and the
 desktop Apps menu remains available from the dock.
+If a client has not acknowledged a close request after two seconds, click its
+close button again to show a warning. One more click forces that window to
+exit and discards unsaved changes in it.
 For PASTE, value is the length of the UTF-8 text that follows the event.
 The desktop sends one event for the entire clipboard, up to 4096 bytes.
 
@@ -209,10 +213,18 @@ Map data © OpenStreetMap contributors, https://www.openstreetmap.org/copyright.
 
 Guest build: `tcc -I/src/tinycc/sdk /src/desktop/map.c -o /bin/map.win2`.
 
-Right-click empty desktop space to open **切换壁纸**. Click a swatch to
-apply 暮色, 青山 or 海岸. The desktop saves the selection in
-`/home/lixin/.wallpaper` on the guest disk and restores it on the next launch.
-Press Esc or click outside the menu to dismiss it.
+## 桌面壁纸
+
+右键桌面空白处，选择 **指定图片 PNG / JPG**，输入客机里的图片路径（如 `/home/lixin/Pictures/海岸.jpg`），回车或点击「确定」。绝对路径可以包含空格，直接输入即可。图片按比例铺满桌面，超出部分居中裁剪。菜单中也可随时切换回「暮色」「青山」「海岸」。
+
+Desktop 将成功选中的路径保存在 `/home/lixin/.wallpaper`，下次启动时重新加载原图。请把原图留在这个位置。单图上限为 32 MiB、16,777,216 像素。选中损坏或不存在的文件时可重新输入路径，或按 Esc 取消。
+
+Desktop 和 Links 共用 [stb_image](../gui/stb_image.h)，版本固定在上游提交 `f58f558c120e9b32c217290b80bad1a0729fbb2c`。日常盘使用带 NetSurf 的 Desktop。在 Mac 上为另一块已关机的盘构建并安装这个版本：
+
+```sh
+bash User/netsurf/build.sh
+python3 User/gcc/install.py --toolchain netsurf Kernel/target/user-build/netsurf-port/package /path/to/disk.img
+```
 
 ## Agent window
 

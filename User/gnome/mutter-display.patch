@@ -1,0 +1,102 @@
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -1264,6 +1264,10 @@
+ 
+ subdir('third_party')
+ 
++if lixinos
++  mutter_sources += ['backends/lixin-display.c']
++endif
++
+ libmutter = library(libmutter_name,
+   mutter_sources,
+   mutter_built_sources,
+--- a/src/core/meta-context-main.c
++++ b/src/core/meta-context-main.c
+@@ -31,6 +31,10 @@
+ #endif
+ #endif
+ 
++#ifdef __lixinos__
++#include "backends/lixin-display.h"
++#endif
++
+ #include "backends/meta-monitor-private.h"
+ #include "backends/meta-monitor-manager-private.h"
+ #include "backends/meta-virtual-monitor.h"
+@@ -81,6 +85,9 @@
+   char *trace_file;
+   gboolean debug_control;
+   gboolean unsafe_mode;
++#ifdef __lixinos__
++  gboolean lixinos_display;
++#endif
+ } MetaContextMainOptions;
+ 
+ struct _MetaContextMain
+@@ -92,6 +99,9 @@
+   MetaSessionManager *session_manager;
+ 
+   MetaCompositorType compositor_type;
++#ifdef __lixinos__
++  struct lx_canvas lixinos_canvas;
++#endif
+ 
+ #ifdef HAVE_NATIVE_BACKEND
+   GList *persistent_virtual_monitors;
+@@ -290,6 +300,30 @@
+ 
+   if (!context_class->configure (context, argc, argv, error))
+     return FALSE;
++
++#ifdef __lixinos__
++  if (context_main->options.lixinos_display)
++    {
++      struct lx_canvas *canvas = &context_main->lixinos_canvas;
++      MetaVirtualMonitorInfo *monitor;
++
++      if (context_main->options.virtual_monitor_infos)
++        {
++          g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
++                               "The LixinOS display already defines a virtual monitor");
++          return FALSE;
++        }
++      if (lx_gui_open (canvas) < 0)
++        {
++          g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
++                               "A foreground graphical terminal is needed for the LixinOS display");
++          return FALSE;
++        }
++      monitor = meta_virtual_monitor_info_new (canvas->width, canvas->height, 60.f,
++                                               "LixinOS", "Graphical terminal", "1");
++      context_main->options.virtual_monitor_infos = g_list_append (NULL, monitor);
++    }
++#endif
+ 
+   if (!check_configuration (context_main, error))
+     return FALSE;
+@@ -446,6 +480,10 @@
+ #ifdef HAVE_NATIVE_BACKEND
+   if (!add_persistent_virtual_monitors (context_main, error))
+     return FALSE;
++#endif
++#ifdef __lixinos__
++  if (context_main->options.lixinos_display)
++    lx_mutter_attach_display (meta_context_get_backend (context), &context_main->lixinos_canvas);
+ #endif
+ 
+ #ifdef HAVE_DEVKIT
+@@ -695,6 +733,13 @@
+       add_virtual_monitor_cb,
+       N_("Add persistent virtual monitor (WxH or WxH@R)")
+     },
++#ifdef __lixinos__
++    {
++      "lixinos-display", 0, 0, G_OPTION_ARG_NONE,
++      &context_main->options.lixinos_display,
++      N_("Present the virtual monitor on the LixinOS graphical terminal")
++    },
++#endif
+ #endif
+ #ifdef HAVE_DEVKIT
+     {
