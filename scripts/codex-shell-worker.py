@@ -3,9 +3,11 @@
 import base64
 from contextlib import contextmanager
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
+import runpy
 import secrets
 import select
 import shutil
@@ -19,11 +21,13 @@ import time
 import disk_image as disk
 
 ROOT = Path(__file__).resolve().parents[1]
+CACHE_DIR = Path.home() / 'Library/Caches/LixinOS/shell-workers'
 FRAME = 12 << 20
 DATA = 8 << 20
 FILES = 1024
 OUTPUT = 64 << 10
 PROMPT = b"lixin:/home/lixin$ "
+DEFAULT_STAMP = struct.pack('<II', 1, 1)
 
 
 def relative(name):
@@ -31,19 +35,17 @@ def relative(name):
             and all(s not in ('', '.', '..', '.codex', '.git', '.agents') for s in name.split('/')))
 
 
-def make_disk(path, files, cwd, cmd, marker):
-    rows = {'/': None, '/home': None, '/home/lixin': None, '/workspace': None,
-            '/job.c': (ROOT / 'User/codex-exec/worker.c').read_bytes(),
-            '/job.cwd': ('/workspace' + ('/' + cwd if cwd else '')).encode(),
-            '/job.cmd': cmd.encode(), '/job.marker': marker}
-    rows.update(('/workspace/' + k, v) for k, v in files.items())
+def write_volume(path, rows, trailer=b''):
     body = bytearray(struct.pack('<I', len(rows)))
-    for name, value in sorted(rows.items()):
+    for name, (stamp, value) in sorted(rows.items()):
         encoded = name.encode()
-        body += struct.pack('<4I', len(encoded), 0xffffffff if value is None else len(value), 1, 1)
+        body += struct.pack('<II', len(encoded), 0xffffffff if value is None else len(value))
+        body += stamp
         body += encoded
         if value is not None:
             body += value
+    if trailer:
+        body += trailer
     header = b'LIXINFS3' + struct.pack('<QII', 0, len(body), disk.checksum(body))
     with path.open('xb') as out:
         out.truncate(disk.IMAGE_SIZE)
@@ -52,7 +54,22 @@ def make_disk(path, files, cwd, cmd, marker):
         out.write(body)
 
 
-def run_vm(image, kernel, package, run, compile_shell, marker, timeout, peer):
+def make_disk(path, files, cwd, cmd, marker):
+    rows = {
+        '/': (DEFAULT_STAMP, None),
+        '/home': (DEFAULT_STAMP, None),
+        '/home/lixin': (DEFAULT_STAMP, None),
+        '/workspace': (DEFAULT_STAMP, None),
+        '/job.c': (DEFAULT_STAMP, (ROOT / 'User/codex-exec/worker.c').read_bytes()),
+        '/job.cwd': (DEFAULT_STAMP, ('/workspace' + ('/' + cwd if cwd else '')).encode()),
+        '/job.cmd': (DEFAULT_STAMP, cmd.encode()),
+        '/job.marker': (DEFAULT_STAMP, marker),
+    }
+    rows.update(('/workspace/' + k, (DEFAULT_STAMP, v)) for k, v in files.items())
+    write_volume(path, rows)
+
+
+def run_vm(image, kernel, package, run, compile_shell, marker, timeout, peer, bootstrap_tcc=False):
     args = [shutil.which('qemu-system-aarch64'), '-nodefaults', '-no-user-config',
             '-machine', 'virt', '-accel', 'hvf', '-cpu', 'host', '-m', '1536M', '-smp', '1',
             '-display', 'none', '-monitor', 'none', '-nic', 'none', '-no-reboot',
@@ -97,7 +114,7 @@ def run_vm(image, kernel, package, run, compile_shell, marker, timeout, peer):
 
     try:
         until(PROMPT, time.monotonic() + 20)
-        if compile_shell and not run:
+        if bootstrap_tcc:
             send(b'tcc /src/tinycc/bootstrap.c -o /bin/tcc')
             until(PROMPT, time.monotonic() + 40)
             send(b'echo $?')
@@ -130,6 +147,74 @@ def run_vm(image, kernel, package, run, compile_shell, marker, timeout, peer):
         vm.wait()
 
 
+def resolve_boot_files(release, variant):
+    kr = runpy.run_path(str(ROOT / 'scripts/kernel-release.py'))
+    directory, _ = kr['boot_files_info'](release, variant)
+    return Path(directory)
+
+
+def prune_base_rows(rows):
+    """Drop unrelated OS source trees and GUI-only binaries not usable in a headless worker VM."""
+    skip_bins = {
+        '/bin/desktop', '/bin/links', '/bin/lust', '/bin/text-editor',
+        '/bin/paint', '/bin/kilo', '/bin/dte', '/bin/doom', '/bin/classicube',
+        '/lib/agent-test.bin', '/lib/foreground.elf',
+    }
+    keep_src = ('/src/tcc', '/src/tinycc/builtin', '/src/tinycc/include')
+    def keep(k):
+        if k.startswith('/workspace/') or k in skip_bins:
+            return False
+        if k in ('/job.c', '/job.cwd', '/job.cmd', '/job.marker', '/job.status'):
+            return False
+        if k.startswith('/src/'):
+            return k in ('/src/tinycc',) or any(k == p or k.startswith(p + '/') for p in keep_src)
+        return True
+    return {k: v for k, v in rows.items() if keep(k)}
+
+
+def cached_base_disk(rust_dir, flavor, peer):
+    """Build once and cache a compact prepared worker volume with /bin/codex-job precompiled."""
+    worker_src = (ROOT / 'User/codex-exec/worker.c').read_bytes()
+    rust_elf = rust_dir / 'rust-release.elf'
+    pkg_file = rust_dir / 'cpython.pkg'
+    key_material = f"v3|{rust_dir.name}|{flavor}|{rust_elf.stat().st_mtime_ns}|{pkg_file.stat().st_mtime_ns}|".encode() + worker_src
+    key = hashlib.sha256(key_material).hexdigest()[:16]
+    CACHE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    base_path = CACHE_DIR / f'base-{flavor}-{key}.img'
+    if base_path.is_file():
+        return base_path
+    lock_path = CACHE_DIR / f'base-{flavor}-{key}.lock'
+    with lock_path.open('ab') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if base_path.is_file():
+            return base_path
+        with tempfile.TemporaryDirectory(prefix='lixinos-base-', dir=CACHE_DIR) as temp:
+            raw_stage = Path(temp) / 'raw.img'
+            compact_stage = Path(temp) / 'base.img'
+            make_disk(raw_stage, {}, '', '', b'base-init')
+            run_vm(raw_stage, rust_elf, pkg_file, run=False, compile_shell=True,
+                   marker=b'base-init', timeout=60, peer=peer,
+                   bootstrap_tcc=(flavor == 'tcc'))
+            rows, trailer = disk.disk_entries(raw_stage)
+            write_volume(compact_stage, prune_base_rows(rows), trailer)
+            os.replace(compact_stage, base_path)
+    return base_path
+
+
+def make_job_disk_from_base(path, base_path, files, cwd, cmd, marker):
+    rows, trailer = disk.disk_entries(base_path)
+    for drop in list(rows):
+        if drop.startswith('/workspace/') or drop in ('/job.c', '/job.cwd', '/job.cmd', '/job.marker', '/job.status'):
+            del rows[drop]
+    rows['/workspace'] = (DEFAULT_STAMP, None)
+    rows['/job.cwd'] = (DEFAULT_STAMP, ('/workspace' + ('/' + cwd if cwd else '')).encode())
+    rows['/job.cmd'] = (DEFAULT_STAMP, cmd.encode())
+    rows['/job.marker'] = (DEFAULT_STAMP, marker)
+    for k, v in files.items():
+        rows['/workspace/' + k] = (DEFAULT_STAMP, v)
+    write_volume(path, rows, trailer)
+
+
 def job(request, release, flavor, peer=None):
     encoded = request['files']
     cwd, cmd = request['cwd'], request['cmd']
@@ -150,19 +235,16 @@ def job(request, release, flavor, peer=None):
     if sum(len(v) for v in files.values() if v is not None) > DATA:
         raise ValueError('workspace exceeds 8 MiB')
     timeout = max(1, min(120, int(request['timeout'])))
-    def artifacts(variant):
-        result = subprocess.check_output([sys.executable, ROOT / 'scripts/kernel-release.py',
-                                          'boot-files', release, variant], text=True)
-        return Path(result.strip())
-    rust = artifacts('release')
+    rust = resolve_boot_files(release, 'release')
+    base_disk = cached_base_disk(rust, flavor, peer)
+    kernel = (resolve_boot_files(release, 'tcc') / 'tcc-kernel.elf') if flavor == 'tcc' else (rust / 'rust-release.elf')
+    package = None if flavor == 'tcc' else (rust / 'cpython.pkg')
     marker = ('end-' + secrets.token_hex(16)).encode()
     with tempfile.TemporaryDirectory(prefix='lixinos-codex-') as temp:
         image = Path(temp) / 'job.img'
-        make_disk(image, files, cwd, cmd, marker)
-        output = run_vm(image, rust/'rust-release.elf', rust/'cpython.pkg', flavor == 'rust',
-                        True, marker, timeout, peer)
-        if flavor == 'tcc':
-            output = run_vm(image, artifacts('tcc')/'tcc-kernel.elf', None, True, False, marker, timeout, peer)
+        make_job_disk_from_base(image, base_disk, files, cwd, cmd, marker)
+        output = run_vm(image, kernel, package, run=True, compile_shell=False,
+                        marker=marker, timeout=timeout, peer=peer)
         rows, _ = disk.disk_entries(image)
         status = rows.get('/job.status', (None, None))[1]
         if status is None or len(status) != 1 or rows.get('/workspace') is None or rows['/workspace'][1] is not None:
@@ -183,17 +265,16 @@ def job(request, release, flavor, peer=None):
 
 @contextmanager
 def slot():
-    cache = Path.home()/'Library/Caches/LixinOS/shell-workers'
-    cache.mkdir(mode=0o700, parents=True, exist_ok=True)
-    for index in range(2):
-        with (cache / str(index)).open('ab') as lock:
+    CACHE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for index in range(4):
+        with (CACHE_DIR / str(index)).open('ab') as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 continue
             yield
             return
-    raise ValueError('both isolated shells are busy')
+    raise ValueError('all isolated shells are busy')
 
 
 def deadline_expired(signum, frame):

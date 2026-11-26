@@ -1,6 +1,7 @@
-// Node's built-in Fetch loads a WebAssembly HTTP parser. The guest has V8 Lite.
-// Load the native HTTP transport on first use so the launcher also works offline.
-if (typeof WebAssembly === 'undefined' && process.versions.openssl) {
+// Node's built-in Fetch loads a WebAssembly HTTP parser (V8 Lite lacks Wasm)
+// and Undici's socket pooling stalls on LixinOS's guest TCP stack. Use the
+// native node:http/https transport lazily on LixinOS so offline CLI works too.
+if (process.versions.openssl && (typeof WebAssembly === 'undefined' || process.platform === 'lixinos')) {
   // Importing node:http from ESM enumerates its exports, including three
   // WebSocket getters backed by Undici. Headless uses the HTTP client.
   const http = require('node:http');

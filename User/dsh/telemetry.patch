@@ -1,6 +1,29 @@
 --- a/cordis.patch.yml
 +++ b/cordis.patch.yml
-@@ -201,6 +201,7 @@
+@@ -84,6 +84,7 @@
+ 
+     - id: plugin-package-inventory-deepseek
+       name: '@deepseek-ai/dsh-plugin-package-inventory-deepseek'
++      disabled: !!js process.platform === 'lixinos'
+ 
+     # The transport-independent default for Agents created by entry points.
+     # Settings may supply a saved selection; consumers read it at creation time.
+@@ -134,6 +135,7 @@
+     # document.
+     - id: llm-pi-ai
+       name: '@deepseek-ai/dsh-llm-pi-ai'
++      disabled: !!js process.platform === 'lixinos' && process.env.DSH_ENABLE_PI_AI !== '1'
+ 
+     - id: session-persistence-jsonl
+       name: '@deepseek-ai/dsh-session-persistence-jsonl'
+@@ -195,12 +197,14 @@
+     # projection column.
+     - id: session-projection-cache
+       name: '@deepseek-ai/dsh-session-projection-cache'
++      disabled: !!js process.platform === 'lixinos'
+       config:
+         writeEveryEvents: 200
+         writeIntervalMs: 5000
  
      - id: otel
        name: '@deepseek-ai/dsh-otel'
@@ -8,7 +31,7 @@
  
      # OTel releases a Session-log prefix only after explicit user feedback,
      # regardless of model provider. Ordinary activity never triggers capture.
-@@ -217,6 +218,7 @@
+@@ -217,6 +221,7 @@
      # Every CLI exit path drains by disposing the root on SIGINT/SIGTERM.
      - id: session-telemetry-otel
        name: '@deepseek-ai/dsh-session-telemetry-otel'

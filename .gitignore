@@ -3,3 +3,6 @@ Kernel/target/
 
 /data/
 __pycache__/
+
+# Local Alpine Linux VM disk (create with setup-alpine; see scripts/run-alpine.sh)
+/alpine.img

@@ -183,6 +183,10 @@ int main(int argc, char **argv) {
         rows["/tmp/outside.txt"] = stamp, b"out-of-workspace marker"
         # Exporting one setting must preserve the guest home used for provider discovery.
         rows["/home/lixin/.profile"] = stamp, b"export CODEX_SMOKE_TEST=1\n"
+        dynlink = ROOT / "Kernel/target/user-build/dynlink-port/package"
+        if dynlink.is_dir():
+            for entry in dynlink.iterdir():
+                VOLUME["tree"](rows, entry, "/" + entry.name)
         for entry in package.iterdir():
             VOLUME["tree"](rows, entry, "/" + entry.name)
         disk = directory / "codex.img"

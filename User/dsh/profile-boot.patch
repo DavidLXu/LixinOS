@@ -1,0 +1,33 @@
+--- a/lib/profile-boot-C14i-8IN.js
++++ b/lib/profile-boot-C14i-8IN.js
+@@ -1,7 +1,7 @@
+ import { PROFILE_PATCH_FILENAME, PROFILE_TEMPLATES, PluginPackages, boot, createRuntimeResolution, initProfile, installFailLoud, loadOverlayPatches, loadProfile, readProfilePatches, reportSkippedBundles, resolveProfileDir } from "@deepseek-ai/dsh-app-boot";
+ import { resolveDshHome } from "@deepseek-ai/dsh-home-paths";
+ import { dirname, join, resolve } from "node:path";
+-import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
++import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+ import { fileURLToPath } from "node:url";
+ import { installProxyFromEnvironment } from "@deepseek-ai/dsh-http-proxy";
+ import { DSH_LAUNCH_ENVIRONMENT_KEY } from "@deepseek-ai/dsh-launch-environment";
+@@ -217,7 +217,8 @@
+ 	if (fromDefaultProfile !== void 0) initializeProfileFromDefault(name, fromDefaultProfile);
+ 	const profile = loadProfile(NAME, name, INSTALL_ANCHOR, void 0, { userLayer });
+ 	reportSkippedBundles(NAME, profile);
+-	writeFileSync(join(profile.dir, PROFILE_ROOT_FILENAME), PROFILE_ROOT_CONFIG);
++	const rootPath = join(profile.dir, PROFILE_ROOT_FILENAME);
++	if (!existsSync(rootPath) || readFileSync(rootPath, "utf8") !== PROFILE_ROOT_CONFIG) writeFileSync(rootPath, PROFILE_ROOT_CONFIG);
+ 	return profile;
+ }
+ /**
+@@ -235,7 +236,10 @@
+ */
+ async function composeProfile(name, patchFiles, fromDefaultProfile, resolvedProfile) {
+ 	const profile = resolvedProfile?.profile ?? prepareProfile(name, true, fromDefaultProfile);
+-	if (resolvedProfile !== void 0) writeFileSync(join(profile.dir, PROFILE_ROOT_FILENAME), PROFILE_ROOT_CONFIG);
++	if (resolvedProfile !== void 0) {
++		const rootPath = join(profile.dir, PROFILE_ROOT_FILENAME);
++		if (!existsSync(rootPath) || readFileSync(rootPath, "utf8") !== PROFILE_ROOT_CONFIG) writeFileSync(rootPath, PROFILE_ROOT_CONFIG);
++	}
+ 	return {
+ 		profile,
+ 		resolution: await createRuntimeResolution({

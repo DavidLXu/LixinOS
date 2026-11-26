@@ -59,7 +59,70 @@ def require_local(path, info):
         raise OSError(message)
 
 
+_FNV1A_LIB = None
+
+
+def _load_fnv1a():
+    global _FNV1A_LIB
+    if _FNV1A_LIB is not None:
+        return _FNV1A_LIB
+    _FNV1A_LIB = False
+    try:
+        import ctypes
+        import shutil
+        cache = Path.home() / "Library/Caches/LixinOS"
+        cache.mkdir(mode=0o700, parents=True, exist_ok=True)
+        so = cache / "fnv1a_v1.dylib"
+        if not so.is_file():
+            cc = shutil.which("cc") or shutil.which("clang")
+            if not cc:
+                return False
+            src = (
+                "#include <stddef.h>\n#include <stdint.h>\n"
+                "uint32_t fnv1a32(const uint8_t *p, size_t n) {\n"
+                "  uint32_t h = 2166136261u;\n"
+                "  for (size_t i = 0; i < n; ++i) h = (h ^ p[i]) * 16777619u;\n"
+                "  return h;\n"
+                "}\n"
+            )
+            with tempfile.NamedTemporaryFile("w", suffix=".c", dir=cache, delete=False) as tf:
+                tf.write(src)
+                cpath = Path(tf.name)
+            tmp_so = cache / f".fnv1a.{os.getpid()}.dylib"
+            try:
+                subprocess.run([cc, "-O3", "-shared", "-fPIC", str(cpath), "-o", str(tmp_so)],
+                               check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                os.replace(tmp_so, so)
+            finally:
+                cpath.unlink(missing_ok=True)
+                tmp_so.unlink(missing_ok=True)
+        lib = ctypes.CDLL(str(so))
+        fn = lib.fnv1a32
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        fn.restype = ctypes.c_uint32
+        _FNV1A_LIB = (ctypes, fn)
+    except Exception:
+        _FNV1A_LIB = False
+    return _FNV1A_LIB
+
+
 def checksum(data):
+    accel = _load_fnv1a()
+    if accel:
+        ctypes, fn = accel
+        view = memoryview(data)
+        n = view.nbytes
+        if n == 0:
+            return 2166136261
+        if view.c_contiguous:
+            buf = (ctypes.c_char * n).from_buffer_copy(view) if view.readonly and not isinstance(data, (bytes, bytearray)) else None
+            if buf is not None:
+                return int(fn(buf, n))
+            if isinstance(data, bytearray):
+                arr = (ctypes.c_char * n).from_buffer(data)
+                return int(fn(arr, n))
+            if isinstance(data, bytes):
+                return int(fn(ctypes.c_char_p(data), n))
     value = 2166136261
     for byte in data:
         value = ((value ^ byte) * 16777619) & 0xffffffff

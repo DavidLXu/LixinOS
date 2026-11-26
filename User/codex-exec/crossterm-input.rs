@@ -55,7 +55,20 @@ impl EventSource for UnixInternalEventSource {
             if deadline.elapsed() {
                 return Ok(None);
             }
-            std::thread::sleep(Duration::from_millis(2));
+            let wait_ms = match deadline.leftover() {
+                Some(rem) => rem.as_millis().clamp(1, 25) as u32,
+                None => 25,
+            };
+            if let Ok(byte) = u8::try_from(unsafe { lx_timed_byte(wait_ms) }) {
+                input[0] = byte;
+                len = 1;
+                while len < input.len() {
+                    let Ok(next) = u8::try_from(unsafe { lx_timed_byte(0) }) else { break };
+                    input[len] = next;
+                    len += 1;
+                }
+                self.parser.buffer_external_input(&input[..len]);
+            }
         }
     }
 

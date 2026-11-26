@@ -1,0 +1,11 @@
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -609,7 +609,7 @@
+ * @param bundles - the initial `dsh.profile.bundles` layer list.
+ */
+ function initProfile(dir, bundles) {
+-	mkdirSync(dir, { recursive: true });
++	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+ 	const manifestPath = join(dir, "package.json");
+ 	if (!existsSync(manifestPath)) {
+ 		const manifest = {

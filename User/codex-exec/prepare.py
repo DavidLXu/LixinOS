@@ -46,11 +46,16 @@ def prepare(work):
     for directory, patch in [
         ("source", "codex.patch"), ("source", "output.patch"), ("source", "interactive.patch"),
         ("source", "tui.patch"), ("crossterm-port", "crossterm.patch"),
-        ("source", "readonly.patch"), ("source", "workspace.patch"), ("tokio-port", "tokio.patch"),
+        ("source", "readonly.patch"), ("source", "workspace.patch"), ("source", "perf.patch"),
+        ("tokio-port", "tokio.patch"),
     ]:
         command = ["patch", "-p1", "-f", "-i", str(PORT / patch)]
         cwd = work / directory
-        # The shell extension builds on the read-only patch and changes its context.
+        # Later guest patches build on earlier patches and alter their context.
+        if patch in ("tui.patch", "readonly.patch", "workspace.patch"):
+            installed = ["patch", "-p1", "-f", "-R", "--dry-run", "-i", str(PORT / "perf.patch")]
+            if subprocess.run(installed, cwd=cwd, capture_output=True).returncode == 0:
+                continue
         if patch == "readonly.patch":
             installed = ["patch", "-p1", "-f", "-R", "--dry-run", "-i", str(PORT / "workspace.patch")]
             if subprocess.run(installed, cwd=cwd, capture_output=True).returncode == 0:

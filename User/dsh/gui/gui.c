@@ -17,7 +17,7 @@ static GHashTable *pending_searches;
 static Turn *active;
 static char *archive, *thread_id, *session_id, *thread_title;
 static gboolean final_seen, stop_accepted;
-static char *stop_file, *last_text;
+static char *last_text;
 static GtkTextMark *preview_mark;
 static GString *preview_source;
 static GPtrArray *chat_links, *preview_links, *trace_links;
@@ -89,10 +89,113 @@ static void release_turn(gpointer value) {
 static gint by_time(gconstpointer a, gconstpointer b) {
     return strcmp((*(Turn *const *)a)->file, (*(Turn *const *)b)->file);
 }
-static void load_turns(void) {
-    GDir *dir = g_dir_open(archive, 0, NULL);
+static void load_native_sessions(void) {
+    const char *home = g_getenv("DSH_HOME");
+    if (!home || !*home)
+        return;
+    g_autofree char *sessions_dir = g_build_filename(home, "sessions", NULL);
+    GDir *dir = g_dir_open(sessions_dir, 0, NULL);
     if (!dir)
         return;
+    g_autoptr(GHashTable) existing = g_hash_table_new(g_str_hash, g_str_equal);
+    for (guint i = 0; i < turns->len; i++) {
+        const char *sid = field(((Turn *)g_ptr_array_index(turns, i))->data, "session");
+        if (*sid)
+            g_hash_table_add(existing, (gpointer)sid);
+    }
+    const char *name;
+    while ((name = g_dir_read_name(dir))) {
+        if (g_hash_table_contains(existing, name))
+            continue;
+        g_autofree char *events_path = g_build_filename(sessions_dir, name, "events.jsonl", NULL);
+        g_autofree char *contents = NULL;
+        if (!g_file_get_contents(events_path, &contents, NULL, NULL) || !contents)
+            continue;
+        g_auto(GStrv) lines = g_strsplit(contents, "\n", -1);
+        const char *cwd = "";
+        g_autofree char *created = NULL;
+        g_autofree char *first_prompt = NULL;
+        g_autofree char *last_reply = NULL;
+        JsonArray *events = json_array_new();
+        for (int i = 0; lines[i]; i++) {
+            if (!lines[i][0])
+                continue;
+            g_autoptr(JsonParser) p = json_parser_new();
+            if (!json_parser_load_from_data(p, lines[i], -1, NULL) ||
+                !JSON_NODE_HOLDS_OBJECT(json_parser_get_root(p)))
+                continue;
+            JsonObject *o = json_node_get_object(json_parser_get_root(p));
+            if (i == 0 && json_object_has_member(o, "cwd")) {
+                cwd = field(o, "cwd");
+                created = g_strdup(field(o, "createdAt"));
+                continue;
+            }
+            const char *ev_type = field(o, "type");
+            JsonObject *data = json_object_has_member(o, "data") &&
+                               JSON_NODE_HOLDS_OBJECT(json_object_get_member(o, "data"))
+                                   ? json_object_get_object_member(o, "data")
+                                   : NULL;
+            if (!data)
+                continue;
+            if (!strcmp(ev_type, "user/message") && !first_prompt &&
+                json_object_has_member(data, "message")) {
+                JsonObject *msg = json_object_get_object_member(data, "message");
+                JsonArray *content = msg && json_object_has_member(msg, "content")
+                                         ? json_object_get_array_member(msg, "content")
+                                         : NULL;
+                if (content && json_array_get_length(content) > 0) {
+                    JsonObject *blk = json_array_get_object_element(content, 0);
+                    if (blk && *field(blk, "text"))
+                        first_prompt = g_strdup(field(blk, "text"));
+                }
+            } else if (!strcmp(ev_type, "assistant/message") && json_object_has_member(data, "message")) {
+                JsonObject *msg = json_object_get_object_member(data, "message");
+                JsonArray *content = msg && json_object_has_member(msg, "content")
+                                         ? json_object_get_array_member(msg, "content")
+                                         : NULL;
+                for (guint k = 0; content && k < json_array_get_length(content); k++) {
+                    JsonObject *blk = json_array_get_object_element(content, k);
+                    if (blk && !strcmp(field(blk, "type"), "text") && *field(blk, "text")) {
+                        g_free(last_reply);
+                        last_reply = g_strdup(field(blk, "text"));
+                    }
+                }
+            }
+        }
+        if (!first_prompt || !*cwd) {
+            json_array_unref(events);
+            continue;
+        }
+        if (last_reply) {
+            JsonObject *fin = json_object_new();
+            json_object_set_string_member(fin, "type", "final");
+            json_object_set_string_member(fin, "text", last_reply);
+            json_array_add_object_element(events, fin);
+        }
+        g_autofree char *short_title = g_utf8_substring(first_prompt, 0, MIN(48, g_utf8_strlen(first_prompt, -1)));
+        g_strdelimit(short_title, "\r\n\t", ' ');
+        Turn *turn = g_new0(Turn, 1);
+        turn->file = g_strdup_printf("0000-%s-%s", created && *created ? created : "0", name);
+        turn->data = json_object_new();
+        json_object_set_string_member(turn->data, "title", short_title);
+        json_object_set_string_member(turn->data, "thread", name);
+        json_object_set_string_member(turn->data, "session", name);
+        json_object_set_string_member(turn->data, "cwd", cwd);
+        json_object_set_string_member(turn->data, "prompt", first_prompt);
+        json_object_set_array_member(turn->data, "events", events);
+        json_object_set_boolean_member(turn->data, "closed", TRUE);
+        g_ptr_array_add(turns, turn);
+    }
+    g_dir_close(dir);
+    g_ptr_array_sort(turns, by_time);
+}
+
+static void load_turns(void) {
+    GDir *dir = g_dir_open(archive, 0, NULL);
+    if (!dir) {
+        load_native_sessions();
+        return;
+    }
     const char *name;
     while ((name = g_dir_read_name(dir))) {
         if (!g_str_has_suffix(name, ".json"))
@@ -115,6 +218,7 @@ static void load_turns(void) {
     }
     g_dir_close(dir);
     g_ptr_array_sort(turns, by_time);
+    load_native_sessions();
 }
 static GtkWidget *transcript(GtkTextBuffer **buffer) {
     GtkWidget *view = gtk_text_view_new();
@@ -271,6 +375,14 @@ static gboolean draw_preview(gpointer unused) {
     if (!web_mark)
         insert(chat, "DeepSeek\n", "name");
     markdown_append(chat, preview_source->str, preview_links);
+    GtkTextIter end;
+    gtk_text_buffer_get_end_iter(chat, &end);
+    GtkTextMark *mark = gtk_text_buffer_get_mark(chat, "tail");
+    if (mark)
+        gtk_text_buffer_move_mark(chat, mark, &end);
+    else
+        mark = gtk_text_buffer_create_mark(chat, "tail", &end, FALSE);
+    gtk_text_view_scroll_mark_onscreen(g_object_get_data(G_OBJECT(chat), "view"), mark);
     return G_SOURCE_REMOVE;
 }
 static void clear_preview(void) {
@@ -285,6 +397,11 @@ static void clear_preview(void) {
 static void render_event(JsonObject *o, gboolean live) {
     const char *kind = field(o, "type");
     const char *text = field(o, "text");
+    if (!strcmp(kind, "preview_thinking")) {
+        if (live)
+            note("Thinking…");
+        return;
+    }
     if (!strcmp(kind, "preview_text")) {
         if (!preview_mark) {
             GtkTextIter end;
@@ -293,7 +410,7 @@ static void render_event(JsonObject *o, gboolean live) {
         }
         g_string_append(preview_source, text);
         if (!preview_timer)
-            preview_timer = g_timeout_add(120, draw_preview, NULL);
+            preview_timer = g_timeout_add(60, draw_preview, NULL);
         return;
     }
     clear_preview();
@@ -307,7 +424,6 @@ static void render_event(JsonObject *o, gboolean live) {
         if (live) {
             replace(&session_id, field(o, "sessionId"));
             json_object_set_string_member(active->data, "session", session_id);
-            save_turn(active);
         }
     } else if (!strcmp(kind, "status")) {
         if (!strcmp(field(o, "phase"), "step_end") && json_object_has_member(o, "usage")) {
@@ -502,10 +618,6 @@ static void receive(const char *line, gboolean is_stderr) {
 }
 static void completed(int code) {
     clear_preview();
-    if (stop_file)
-        remove(stop_file);
-    g_clear_pointer(&stop_file, g_free);
-    g_unsetenv("LIXINOS_DSH_STOP_FILE");
     if (!stop_accepted && (code || !final_seen)) {
         JsonObject *e = json_object_new();
         g_autofree char *s = g_strdup_printf("dsh exited with status %d. %s", code,
@@ -555,18 +667,12 @@ static void submit(void) {
     json_object_set_string_member(turn->data, "cwd", cwd);
     json_object_set_string_member(turn->data, "prompt", prompt);
     json_object_set_array_member(turn->data, "events", json_array_new());
-    if (!save_turn(turn)) {
-        release_turn(turn);
-        return;
-    }
     g_hash_table_remove_all(pending_searches);
     active = turn;
     g_ptr_array_add(turns, turn);
     replace(&thread_title, caption);
     final_seen = stop_accepted = FALSE;
     replace(&last_text, "");
-    stop_file = g_strdup_printf("%s/stop-%s", archive, uuid);
-    g_setenv("LIXINOS_DSH_STOP_FILE", stop_file, TRUE);
     g_string_truncate(diagnostic, 0);
     gtk_label_set_text(GTK_LABEL(title), thread_title);
     gtk_stack_set_visible_child_name(GTK_STACK(chat_page), "messages");
@@ -575,7 +681,7 @@ static void submit(void) {
     trace_message(USER, "User", prompt, NULL);
     list_history();
     controls(TRUE);
-    note("Starting DeepSeek Harness…");
+    note(dsh_ready() ? "Running…" : "Starting DeepSeek Harness…");
     int error = dsh_start(cwd, session_id, prompt, receive, completed);
     if (error) {
         g_string_assign(diagnostic, g_strerror(error));
@@ -588,9 +694,9 @@ static void send_clicked(GtkButton *w, gpointer unused) {
         submit();
         return;
     }
-    g_autoptr(GError) error = NULL;
-    if (!g_file_set_contents(stop_file, "stop", 4, &error)) {
-        note(error->message);
+    int error = dsh_cancel();
+    if (error) {
+        note(g_strerror(error));
         return;
     }
     gtk_widget_set_sensitive(GTK_WIDGET(w), FALSE);
@@ -700,6 +806,7 @@ static void connection(GtkButton *w, gpointer unused) {
                 g_unsetenv("DEEPSEEK_BASE_URL");
             if (*secret)
                 g_setenv("DEEPSEEK_API_KEY", secret, TRUE);
+            dsh_reset();
             note("Connection settings apply to the next turn.");
         }
     }
@@ -851,6 +958,8 @@ int main(int argc, char **argv) {
     load_turns();
     build_window(start);
     create_thread();
+    dsh_warmup(start);
     gtk_main();
+    dsh_shutdown();
     return 0;
 }

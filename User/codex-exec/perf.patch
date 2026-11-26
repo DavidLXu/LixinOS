@@ -1,0 +1,145 @@
+--- a/codex-rs/arg0/src/lib.rs
++++ b/codex-rs/arg0/src/lib.rs
+@@ -133,6 +133,11 @@
+     // before creating any threads/the Tokio runtime.
+     load_dotenv();
+ 
++    // LixinOS lacks symlinks and Linux bubblewrap; avoid creating and deleting
++    // per-invocation alias directories on the copy-on-write volume at every start.
++    #[cfg(lixinos)]
++    return None;
++
+     let (path_entry_guard, updated_path_env_var) = prepare_path_env_var_with_aliases(
+         InstallContext::current(),
+         std::env::var_os("PATH"),
+--- a/codex-rs/tui/src/startup_orchestration.rs
++++ b/codex-rs/tui/src/startup_orchestration.rs
+@@ -497,8 +497,6 @@
+     let additional_dirs = cli.add_dir.clone();
+ 
+     let mut overrides = ConfigOverrides {
+-        #[cfg(lixinos)]
+-        ephemeral: Some(true), // The guest filesystem has no durable Codex session store.
+         model,
+         approval_policy,
+         sandbox_mode,
+--- a/codex-rs/state/src/sqlite/connection.rs
++++ b/codex-rs/state/src/sqlite/connection.rs
+@@ -33,6 +33,18 @@
+                 let init_error_tx = init_error_tx.clone();
+                 Box::pin(async move {
+                     let result = async {
++                        #[cfg(lixinos)]
++                        {
++                            sqlx::query("PRAGMA journal_mode = MEMORY")
++                                .execute(&mut *connection)
++                                .await?;
++                            sqlx::query("PRAGMA synchronous = OFF")
++                                .execute(&mut *connection)
++                                .await?;
++                            return Ok::<(), Error>(());
++                        }
++                        #[cfg(not(lixinos))]
++                        {
+                         let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
+                             .fetch_one(&mut *connection)
+                             .await?;
+@@ -51,6 +63,7 @@
+                                 .await?;
+                         }
+                         Ok(())
++                        }
+                     }
+                     .await;
+                     result.map_err(|error| match init_error_tx.try_send(error) {
+@@ -86,27 +99,37 @@
+                     .execute(&mut *connection)
+                     .await?;
+             }
+-            let pragma = match journal_mode_policy {
+-                JournalModePolicy::InitializeWal => "PRAGMA journal_mode = WAL",
+-                JournalModePolicy::InitializeDelete | JournalModePolicy::RequireDelete => {
+-                    "PRAGMA journal_mode = DELETE"
+-                }
+-            };
+-            sqlx::query(pragma).execute(&mut *connection).await?;
++            #[cfg(lixinos)]
++            sqlx::query("PRAGMA journal_mode = MEMORY")
++                .execute(&mut *connection)
++                .await?;
++            #[cfg(not(lixinos))]
++            {
++                let pragma = match journal_mode_policy {
++                    JournalModePolicy::InitializeWal => "PRAGMA journal_mode = WAL",
++                    JournalModePolicy::InitializeDelete | JournalModePolicy::RequireDelete => {
++                        "PRAGMA journal_mode = DELETE"
++                    }
++                };
++                sqlx::query(pragma).execute(&mut *connection).await?;
++            }
+         }
+         // Initialization or another process can change the journal mode after after_connect.
+         // Match this connection's synchronization setting to the resulting journal mode.
+-        let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
+-            .fetch_one(&mut *connection)
+-            .await?;
+-        if journal == "wal" {
+-            sqlx::query("PRAGMA synchronous = NORMAL")
+-                .execute(&mut *connection)
++        #[cfg(not(lixinos))]
++        {
++            let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
++                .fetch_one(&mut *connection)
+                 .await?;
+-        } else if journal == "delete" {
+-            sqlx::query("PRAGMA synchronous = EXTRA")
+-                .execute(&mut *connection)
+-                .await?;
++            if journal == "wal" {
++                sqlx::query("PRAGMA synchronous = NORMAL")
++                    .execute(&mut *connection)
++                    .await?;
++            } else if journal == "delete" {
++                sqlx::query("PRAGMA synchronous = EXTRA")
++                    .execute(&mut *connection)
++                    .await?;
++            }
+         }
+         // Wait for the connection to return to the pool before startup requests it again.
+         // An asynchronous drop can otherwise cause the pool to open a second connection.
+--- a/codex-rs/rollout/src/recorder.rs
++++ b/codex-rs/rollout/src/recorder.rs
+@@ -1821,11 +1821,16 @@
+             && let Some(writer) = self.writer.as_mut()
+         {
+             writer.file.sync_data().await?;
+-            #[cfg(unix)]
++            #[cfg(all(unix, not(lixinos)))]
+             {
+                 for directory in &self.directories_to_sync {
+                     tokio::fs::File::open(directory).await?.sync_all().await?;
+                 }
++                self.directories_to_sync.clear();
++            }
++            #[cfg(lixinos)]
++            {
++                // LixinOS commits the full volume snapshot atomically on sync_data().
+                 self.directories_to_sync.clear();
+             }
+             self.realtime_sync_pending = false;
+--- a/codex-rs/core/src/tools/runtimes/unified_exec.rs
++++ b/codex-rs/core/src/tools/runtimes/unified_exec.rs
+@@ -610,12 +610,7 @@
+ 
+         #[cfg(lixinos)]
+         if !environment_is_remote {
+-            let command = req.prepared.hook_command.as_str();
+-            let words: Vec<_> = command.split_ascii_whitespace().collect();
+-            let literal = command.chars().all(|c| c.is_alphanumeric() || " ./_-".contains(c));
+-            let builtin = literal && matches!(words.as_slice(), ["pwd"] | ["ls"] | ["ls", _] | ["cat", _])
+-                && !words.get(1).is_some_and(|p| p.starts_with('-'));
+-            let output = if builtin {
++            let output = if lixinos_readonly::can_handle(req.prepared.hook_command.as_str()) {
+                 lixinos_readonly::execute(req, attempt).map(|bytes| (0, bytes))
+             } else {
+                 lixinos_workspace::execute(req, attempt, &ctx.cancellation_token).await

@@ -39,15 +39,31 @@ def build(output):
                     target = lib / name
                     target.parent.mkdir(exist_ok=True)
                     target.write_bytes(tar.extractfile(item).read())
-        subprocess.run(["patch", "-p1", "-i", port / "launcher.patch"], cwd=lib, check=True)
+        for lib_patch in ("launcher.patch", "chat-cli.patch", "profile-boot.patch"):
+            subprocess.run(["patch", "-p1", "-i", port / lib_patch], cwd=lib, check=True)
         for name in ("package.json", "package-lock.json"):
             shutil.copyfile(port / name, work / name)
         subprocess.run(["npm", "ci", "--ignore-scripts", "--omit=optional", "--no-audit", "--no-fund"], cwd=work, check=True)
         shutil.copytree(work / "node_modules", lib / "node_modules",
                         ignore=shutil.ignore_patterns(".bin", ".package-lock.json", "prebuilds", "*.map",
-                                                    "*.d.ts", "*.d.mts", "*.d.cts"))
+                                                    "*.d.ts", "*.d.mts", "*.d.cts", "*.ts", "*.mts", "*.cts",
+                                                    "README*", "CHANGELOG*", "HISTORY*", "CONTRIBUTING*",
+                                                    ".github", "test", "tests", "__tests__", "docs", "example", "examples"))
+        # Remove disabled telemetry packages and native-addon C/C++ build trees never used on LixinOS.
+        for dead in (
+            "@opentelemetry",
+            "node-pty/deps",
+            "node-pty/src",
+            "koffi/src",
+            "koffi/doc",
+            "sharp/src",
+        ):
+            target_dead = lib / "node_modules" / dead
+            if target_dead.exists():
+                shutil.rmtree(target_dead)
         plugins = lib / "node_modules/@deepseek-ai"
         for patch, plugin in (("resolver.patch", "dsh-app-boot"),
+                              ("app-boot.patch", "dsh-app-boot"),
                               ("session.patch", "dsh-session-persistence-jsonl"),
                               ("utf8.patch", "dsh-fs-local"),
                               ("history.patch", "dsh-session-persistence-jsonl"),
@@ -61,7 +77,7 @@ def build(output):
         subprocess.run(["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"],
                        cwd=host_tools, check=True)
         subprocess.run(["node", host_tools / "unicode.cjs", lib / "node_modules"], check=True)
-        for name in ("fetch.cjs", "workspace.mjs", "volume.cjs"):
+        for name in ("fetch.cjs", "workspace.mjs", "volume.cjs", "chat.mjs", "chat.yml"):
             shutil.copyfile(port / name, lib / name)
         (stage / "bin").mkdir()
         subprocess.run([compiler, "-Os", "-ffreestanding", "-fno-builtin", "-nostdlib",

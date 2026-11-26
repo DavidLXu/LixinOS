@@ -1,0 +1,31 @@
+--- a/lib/bin.js
++++ b/lib/bin.js
+@@ -207,7 +207,27 @@
+ async function runCli(options = {}) {
+ 	const version = manifest.version;
+ 	const { manageDesktopProfile, ...profileOptions } = options;
+-	const invocation = parseDshArgs(process.argv.slice(2), version, manageDesktopProfile);
++	const rawArgv = process.argv.slice(2);
++	if (process.platform === "lixinos" && (rawArgv[0] === "chat" || (rawArgv.length === 0 && process.stdin.isTTY))) {
++		const chatArgs = rawArgv[0] === "chat" ? rawArgv.slice(1) : rawArgv;
++		const { StartupError, loadLayeredEnv } = await import("@deepseek-ai/dsh-app-boot");
++		const { runProfile } = await import("./profile-boot.js");
++		try {
++			await runProfile({
++				environment: loadLayeredEnv("dsh"),
++				profile: "headless",
++				patchFiles: ["/lib/dsh/chat.yml"],
++				args: chatArgs,
++				...profileOptions
++			});
++		} catch (error) {
++			if (!(error instanceof StartupError)) throw error;
++			await reportStartupFailure(error, { home: resolveDshHome(), version, profile: "chat" });
++			process.exit(1);
++		}
++		return;
++	}
++	const invocation = parseDshArgs(rawArgv, version, manageDesktopProfile);
+ 	switch (invocation.mode) {
+ 		case "profile": {
+ 			const { StartupError, loadLayeredEnv } = await import("@deepseek-ai/dsh-app-boot");

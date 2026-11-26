@@ -1,3 +1,7 @@
+- id: headless-startup
+  disabled: true
+- id: headless-runner
+  disabled: true
 - insert:
-    - id: lixinos-window-controls
+    - id: lixinos-gui-worker
       name: /lib/dsh-gui/control.mjs
