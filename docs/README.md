@@ -1,6 +1,6 @@
 # LixinOS 系统手册
 
-LixinOS 是一个提供 Rust 原版内核和 TCC 自举内核的 ARM64 操作系统，在 Apple Silicon Mac 的 QEMU 虚拟机里运行。你可以在系统里编辑 Python 和 C 源码、运行脚本、编译程序，再把程序保存在虚拟磁盘上。当前版本为 [0.5.0](0.5.0.md)。
+LixinOS 是一个提供 Rust 原版内核和 TCC 自举内核的 ARM64 操作系统，在 Apple Silicon Mac 的 QEMU 虚拟机里运行。你可以在系统里编辑 Python 和 C 源码、运行脚本、编译程序，再把程序保存在虚拟磁盘上。当前版本为 [0.6.0](0.6.0.md)。
 
 ## 从终端开始
 
