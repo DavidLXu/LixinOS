@@ -61,12 +61,13 @@ pub(crate) struct Batch {
     changes: Changes,
     moved_versions: Versions,
     moved_times: disk::Times,
+    moved_modes: BTreeMap<String,crate::permissions::Mode>,
     touched: BTreeSet<String>,
 }
 
 impl Batch {
     pub fn new(volume: &Volume) -> Self {
-        Self { generation: volume.disk.revision(), changes: Changes::new(), moved_versions: Versions::new(), moved_times: disk::Times::new(), touched: BTreeSet::new() }
+        Self { generation: volume.disk.revision(), changes: Changes::new(), moved_versions: Versions::new(), moved_times: disk::Times::new(), moved_modes:BTreeMap::new(), touched: BTreeSet::new() }
     }
 
     fn unchanged(&self, volume: &Volume) -> Result<()> {
@@ -92,6 +93,7 @@ impl Batch {
         self.unchanged(volume)?;
         let files = &volume.files;
         if flags > 1 { return Err("invalid filesystem flags"); }
+        if matches!(op,2|3|5) && !crate::permissions::allowed(volume,path,8) {return Err("permission denied");}
         if op != 4 { volume.require_writable(path)?; }
         if matches!(op, 4 | 5) { volume.require_writable(other)?; }
         if path == "/" {
@@ -161,6 +163,8 @@ impl Batch {
                     if let Some(version) = volume.versions.get(source) {
                         if dest.ends_with(".py") { self.moved_versions.insert(dest.clone(), version.clone()); }
                     }
+                    if !crate::permissions::allowed(volume,source,8) {return Err("permission denied");}
+                    self.moved_modes.insert(dest.clone(),crate::permissions::get(volume,source).ok_or("missing source permissions")?);
                     self.changes.insert(source.clone(), None);
                     self.moved_times.insert(dest.clone(), volume.disk.times.get(source).copied().unwrap_or_default());
                     self.changes.insert(dest, Some(value.clone()));
@@ -175,8 +179,13 @@ impl Batch {
         Ok(())
     }
 
-    pub fn commit(self, volume: &mut Volume) -> Result<()> {
+    pub fn commit(mut self, volume: &mut Volume) -> Result<()> {
         self.unchanged(volume)?;
+        if !self.moved_modes.is_empty() {
+            let mut data=crate::permissions::records(volume)?.to_vec();
+            for (path,mode) in &self.moved_modes {data=crate::permissions::encode(&data,path,Some(mode))?;}
+            self.changes.insert(crate::permissions::METADATA.into(),Some(Some(disk::FileData::from_vec(data))));
+        }
         volume.apply_changes(self.changes, self.moved_versions, self.moved_times, self.touched)
     }
 }

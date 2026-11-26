@@ -53,6 +53,7 @@ def build(output):
                               ("history.patch", "dsh-session-persistence-jsonl"),
                               ("guest-files.patch", "dsh-fs-local"),
                               ("guest-shell.patch", "dsh-tool-bash"),
+                              ("web-search.patch", "dsh-web-search-deepseek"),
                               ("telemetry.patch", "dsh-base")):
             subprocess.run(["patch", "-p1", "-i", port / patch], cwd=plugins / plugin, check=True)
         host_tools = work / "build-tools"

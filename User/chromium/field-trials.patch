@@ -1,0 +1,46 @@
+--- a/content/shell/app/shell_main_delegate.cc
++++ b/content/shell/app/shell_main_delegate.cc
+@@ -284,7 +284,8 @@
+ }
+ 
+ bool ShellMainDelegate::ShouldCreateFeatureList(InvokedIn invoked_in) {
+-  return std::holds_alternative<InvokedInChildProcess>(invoked_in);
++  return BUILDFLAG(SHELL_MINIMAL) ||
++         std::holds_alternative<InvokedInChildProcess>(invoked_in);
+ }
+ 
+ bool ShellMainDelegate::ShouldInitializeMojo(InvokedIn invoked_in) {
+@@ -437,8 +438,8 @@
+ 
+ std::optional<int> ShellMainDelegate::PostEarlyInitialization(
+     InvokedIn invoked_in) {
+-  if (!ShouldCreateFeatureList(invoked_in)) {
+-    // Apply field trial testing configuration since content did not.
++  if (std::holds_alternative<InvokedInBrowserProcess>(invoked_in)) {
++    // Initialize local preferences and, in the test shell, the trial configuration.
+     browser_client_->CreateFeatureListAndFieldTrials();
+   }
+   if (!ShouldInitializeMojo(invoked_in)) {
+--- a/content/shell/browser/shell_content_browser_client.cc
++++ b/content/shell/browser/shell_content_browser_client.cc
+@@ -61,7 +61,10 @@
+ #include "content/public/common/content_switches.h"
+ #include "content/public/common/isolated_world_ids.h"
+ #include "content/public/common/url_constants.h"
++#include "content/shell/web_test_buildflags.h"
++#if !BUILDFLAG(SHELL_MINIMAL)
+ #include "content/public/test/setup_field_trials.h"
++#endif
+ #include "content/shell/browser/rust_test_service_ffi.rs.h"
+ #include "content/shell/browser/shell.h"
+ #include "content/shell/browser/shell_browser_context.h"
+@@ -878,7 +881,9 @@
+ 
+ void ShellContentBrowserClient::CreateFeatureListAndFieldTrials() {
+   GetSharedState().local_state = CreateLocalState();
++#if !BUILDFLAG(SHELL_MINIMAL)
+   SetupFieldTrials();
++#endif
+ }
+ 
+ // Tests may install their own ShellContentBrowserClient, track the list here.

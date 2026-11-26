@@ -115,6 +115,8 @@ impl BlockStore {
         if full != 0 {
             let (aligned, rest) = dst.split_at_mut(full);
             for chunk in aligned.chunks_mut(IO_CHUNK) {
+                #[cfg(feature = "retina")]
+                crate::graphics::boot_tick();
                 self.dev
                     .read_blocks(base + sec, chunk)
                     .map_err(|_| "disk read failed")?;
@@ -324,6 +326,8 @@ impl<'a> SeqReader<'a> {
     }
 
     fn refill(&mut self, offset: usize) -> Result<()> {
+        #[cfg(feature = "retina")]
+        crate::graphics::boot_tick();
         let aligned = offset / 512 * 512;
         let avail = self.payload_len.saturating_sub(aligned);
         let read_bytes = avail.next_multiple_of(512).min(IO_CHUNK);
@@ -689,6 +693,8 @@ impl SnapshotWriter<'_> {
     }
 
     fn flush_chunk(&mut self) -> Result<()> {
+        #[cfg(feature = "retina")]
+        crate::graphics::boot_tick();
         if self.chunk.is_empty() {
             return Ok(());
         }
@@ -797,6 +803,8 @@ fn read_index_blob(
     unsafe { buf.set_len(rounded) };
     let base = SNAPSHOT_BASE + slot * slot_sectors + 1 + meta.idx_sec_off as usize;
     for (i, chunk) in buf.chunks_mut(IO_CHUNK).enumerate() {
+        #[cfg(feature = "retina")]
+        crate::graphics::boot_tick();
         dev.read_blocks(base + i * (IO_CHUNK / 512), chunk)
             .map_err(|_| "disk read failed")?;
     }
@@ -829,7 +837,7 @@ impl Disk {
         (self.slot_sectors - 1) * 512
     }
     pub(crate) fn scratch_path(&self, path: &str) -> bool {
-        self.slot_sectors > LARGE_SLOT && path.starts_with("/scratch/")
+        self.slot_sectors > LARGE_SLOT && (path.starts_with("/scratch/") || path.starts_with("/tmp/"))
     }
     fn history_start(&self) -> usize {
         SNAPSHOT_BASE + 2 * self.slot_sectors
@@ -889,8 +897,7 @@ impl Disk {
         self.live_bytes = len;
         if self.slot_sectors > LARGE_SLOT {
             self.scratch_records = files
-                .range(String::from("/scratch/")..)
-                .take_while(|(path, _)| path.starts_with("/scratch/"))
+                .iter().filter(|(path,_)|self.scratch_path(path) || path.as_str()==crate::permissions::METADATA)
                 .map(|(path, entry)| (path.clone(), Self::record_bytes(path, entry)))
                 .collect();
         }
@@ -904,7 +911,7 @@ impl Disk {
     ) -> Result<()> {
         let mut records = BTreeMap::new();
         for &(path, _) in paths {
-            if self.scratch_path(path) {
+            if self.scratch_path(path) || path==crate::permissions::METADATA {
                 let size = files
                     .get(path)
                     .map_or(0, |entry| Self::record_bytes(path, entry));

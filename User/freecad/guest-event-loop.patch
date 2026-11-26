@@ -1,0 +1,48 @@
+--- a/src/Gui/Application.cpp
++++ b/src/Gui/Application.cpp
+@@ -2455,18 +2455,21 @@
+ #else
+     std::wstring filename = fi.toStdWString();
+ #endif
++    auto execute = [&]() {
++        Base::Console().log("Init: Executing event loop…\n");
++        QApplication::exec();
++
++        // Qt can't handle exceptions thrown from event handlers, so we need
++        // to manually rethrow SystemExitExceptions.
++        if (mainApp.caughtException) {
++            throw Base::SystemExitException(*mainApp.caughtException.get());
++        }
++
++    };
+     try {
+         boost::interprocess::file_lock flock(filename.c_str());
+         if (flock.try_lock()) {
+-            Base::Console().log("Init: Executing event loop…\n");
+-            QApplication::exec();
+-
+-            // Qt can't handle exceptions thrown from event handlers, so we need
+-            // to manually rethrow SystemExitExceptions.
+-            if (mainApp.caughtException) {
+-                throw Base::SystemExitException(*mainApp.caughtException.get());
+-            }
+-
++            execute();
+             // close the lock file, in case of a crash we can see the existing lock file
+             // on the next restart and try to repair the documents, if needed.
+             flock.unlock();
+@@ -2483,6 +2486,14 @@
+         }
+     }
+     catch (const boost::interprocess::interprocess_exception& e) {
++        // The pid-specific marker still records abnormal exits on filesystems
++        // without advisory locking. Preserve all other lock failures.
++        if (e.get_native_error() == ENOTSUP || e.get_native_error() == ENOSYS) {
++            execute();
++            lock.close();
++            fi.deleteFile();
++            return;
++        }
+         QString msg = QString::fromLocal8Bit(e.what());
+         Base::Console().error(
+             "Failed to create a file lock for the IPC: %s\n"

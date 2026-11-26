@@ -23,6 +23,8 @@ struct _GdkBroadwayServer {
     guint32 serial, time;
     guint read_source, reply_source;
     gboolean right_click;
+    gboolean opens_urls;
+    char *pending_url;
     gboolean down, dirty;
     char key_text[6];
     unsigned key_bytes;
@@ -46,6 +48,7 @@ static void dispose(GObject *object)
     if (server->read_source) g_clear_handle_id(&server->read_source, g_source_remove);
     if (server->reply_source) g_clear_handle_id(&server->reply_source, g_source_remove);
     g_clear_pointer(&server->windows, g_ptr_array_unref);
+    g_clear_pointer(&server->pending_url, g_free);
     G_OBJECT_CLASS(gdk_broadway_server_parent_class)->dispose(object);
 }
 
@@ -164,7 +167,7 @@ static void keyboard(GdkBroadwayServer *server, guint k)
         {"[H", GDK_KEY_Home}, {"[F", GDK_KEY_End}, {"OH", GDK_KEY_Home}, {"OF", GDK_KEY_End},
         {"[1~", GDK_KEY_Home}, {"[4~", GDK_KEY_End}, {"[7~", GDK_KEY_Home}, {"[8~", GDK_KEY_End},
         {"[2~", GDK_KEY_Insert}, {"[3~", GDK_KEY_Delete},
-        {"[5~", GDK_KEY_Page_Up}, {"[6~", GDK_KEY_Page_Down}
+        {"[5~", GDK_KEY_Page_Up}, {"[6~", GDK_KEY_Page_Down}, {"[24~", GDK_KEY_F12}
     };
     if (server->escape_size) {
         if (server->escape_size > 1 || k == '[' || k == 'O') {
@@ -177,7 +180,10 @@ static void keyboard(GdkBroadwayServer *server, guint k)
             if (server->escape_size > 2 && k >= 0x40 && k <= 0x7e) {
                 for (gsize i = 0; i < G_N_ELEMENTS(navigation); ++i) {
                     if (!strcmp(server->escape, navigation[i].sequence)) {
-                        key_event(server, navigation[i].key, 0);
+                        guint key = navigation[i].key;
+                        if (key == GDK_KEY_F12 && !g_strcmp0(g_getenv("LIXINOS_COMPOSE_KEY"), "F12"))
+                            key = GDK_KEY_Multi_key;
+                        key_event(server, key, 0);
                         break;
                     }
                 }
@@ -219,7 +225,19 @@ static gboolean geometry(GdkBroadwayServer *server, WindowEvent event)
     server->width = event.x;
     server->height = event.y;
     server->right_click = (event.value & WINDOW_CLIENT_RIGHT_CLICK_AVAILABLE) != 0;
+    server->opens_urls = (event.value & WINDOW_CLIENT_OPEN_URL_AVAILABLE) != 0;
     server->dirty = TRUE;
+    return TRUE;
+}
+
+gboolean gdk_lixinos_open_web_uri(const char *uri)
+{
+    GdkBroadwayServer *server = GDK_BROADWAY_DISPLAY(gdk_display_get_default())->server;
+    if (!server || !server->opens_urls || strlen(uri) >= WINDOW_CLIENT_CLIPBOARD_MAX ||
+        !(g_str_has_prefix(uri, "https://") || g_str_has_prefix(uri, "http://")))
+        return FALSE;
+    g_free(server->pending_url);
+    server->pending_url = g_strdup(uri);
     return TRUE;
 }
 
@@ -277,10 +295,17 @@ static gboolean reply(gpointer data)
         }
         if (start == count) frame.encoded_size = used * sizeof *runs;
     }
+    unsigned encoded = frame.encoded_size;
+    if (server->pending_url) {
+        frame.encoded_size |= WINDOW_CLIENT_OPEN_URL;
+        frame.clipboard_size = strlen(server->pending_url);
+    }
     gboolean ok = transfer(STDOUT_FILENO, &frame, sizeof frame);
     if (ok && pixels)
-        ok = transfer(STDOUT_FILENO, frame.encoded_size ? runs : pixels,
-                      frame.encoded_size ? frame.encoded_size : count * sizeof *pixels);
+        ok = transfer(STDOUT_FILENO, encoded ? runs : pixels, encoded ? encoded : count * sizeof *pixels);
+    if (ok && server->pending_url)
+        ok = transfer(STDOUT_FILENO, server->pending_url, frame.clipboard_size);
+    g_clear_pointer(&server->pending_url, g_free);
     g_free(runs);
     g_free(pixels);
     if (!ok) _exit(1);

@@ -7,7 +7,7 @@ import subprocess
 port = Path(__file__).resolve().parent
 
 
-def link(source, sdk, output, objects=None):
+def link(source, sdk, output, objects=None, dynamic=False):
     release = source / "out/Release"
     if objects is None:
         commands = subprocess.check_output(["ninja", "-t", "commands", "node"], cwd=release, text=True)
@@ -21,9 +21,18 @@ def link(source, sdk, output, objects=None):
     def compiler_file(name):
         return subprocess.check_output(["c++", "-print-file-name=" + name], text=True).strip()
     platform = output.with_suffix(".platform.o")
-    subprocess.run(["cc", "-D__lixinos__", "-Os", "-ffunction-sections", "-I", source/"deps/uv/include", "-c", port/"platform.c", "-o", platform], check=True)
+    pic = ["-fPIC", "-DLX_DYNAMIC_RUNTIME"] if dynamic else []
+    subprocess.run(["cc", *pic, "-D__lixinos__", "-Os", "-ffunction-sections", "-I", source/"deps/uv/include", "-c", port/"platform.c", "-o", platform], check=True)
     volume = output.with_suffix(".volume.o")
-    subprocess.run(["cc", "-Os", "-I", source / "src", "-c", port / "volume.c", "-o", volume], check=True)
+    subprocess.run(["cc", *pic, "-Os", "-I", source / "src", "-c", port / "volume.c", "-o", volume], check=True)
+    if dynamic:
+        subprocess.run(["c++", "-pie", "-nostdlib", "-Wl,-E,-z,text,--gc-sections,--build-id=none,-z,max-page-size=4096",
+                        "-Wl,--dynamic-linker,/lib/ld-musl-aarch64.so.1,-rpath,/lib/cxx-runtime",
+                        "-Wl,--wrap=pthread_getattr_np,--wrap=getrlimit,--wrap=uv_guess_handle,--wrap=getaddrinfo,--wrap=read",
+                        "-o", output, sdk/"Scrt1.o", sdk/"crti.o", compiler_file("crtbeginS.o"),
+                        platform, volume, *objects, "-lstdc++", "-lgcc_s", "-lgcc", "-latomic",
+                        sdk/"libc.so", compiler_file("crtendS.o"), sdk/"crtn.o"], cwd=release, check=True)
+        return
     subprocess.run(["c++", "-static", "-no-pie", "-nostdlib", "-Wl,--gc-sections,--build-id=none,-z,max-page-size=4096",
                     "-Wl,-T," + str(port/"program.ld"), "-Wl,--wrap=pthread_getattr_np,--wrap=getrlimit,--wrap=uv_guess_handle,--wrap=getaddrinfo,--wrap=read",
                     "-o", output, sdk/"crt1.o", sdk/"crti.o", compiler_file("crtbeginT.o"), platform, volume, *objects,
@@ -36,5 +45,6 @@ if __name__ == "__main__":
     parser.add_argument("source", type=Path)
     parser.add_argument("sdk", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--dynamic", action="store_true")
     args = parser.parse_args()
-    link(args.source.resolve(), args.sdk.resolve(), args.output.resolve())
+    link(args.source.resolve(), args.sdk.resolve(), args.output.resolve(), dynamic=args.dynamic)

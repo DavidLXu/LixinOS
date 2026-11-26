@@ -1,0 +1,11 @@
+--- Clp/src/ClpModel.cpp
++++ Clp/src/ClpModel.cpp
+@@ -3845,7 +3845,7 @@
+      writer.setMpsData(*(matrix_->getPackedMatrix()), COIN_DBL_MAX,
+                        getColLower(), getColUpper(),
+                        objective,
+-                       reinterpret_cast<const char*> (NULL) /*integrality*/,
++                       static_cast<const char*> (NULL) /*integrality*/,
+                        getRowLower(), getRowUpper(),
+                        columnNames, rowNames);
+      // Pass in array saying if each variable integer

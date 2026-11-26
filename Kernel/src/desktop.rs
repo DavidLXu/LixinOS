@@ -15,7 +15,7 @@ pub(super) fn resume(host: &Context, _image: &[u8], mut io: utility::Context) ->
         let mail = unsafe { core::slice::from_raw_parts(user::git_mailbox(), 522) };
         let action = i32::from_le_bytes(mail[..4].try_into().unwrap());
         let width = u32::from_le_bytes(mail[4..8].try_into().unwrap()) as usize;
-        let title = if matches!(action, -2 | -3) { Vec::new() } else { crate::graphics::title_strip(canvas, width)? };
+        let title = if matches!(action, -2 | -3 | -5) { Vec::new() } else { crate::graphics::title_strip(canvas, width)? };
         let path = String::from(
             mail[8..]
                 .split(|b| *b == 0)
@@ -27,7 +27,7 @@ pub(super) fn resume(host: &Context, _image: &[u8], mut io: utility::Context) ->
         canvas.arena.set_mapped(false);
         let result = open(host, action, &path, &mut sessions, &title);
         canvas.arena.set_mapped(true);
-        if matches!(action, -2 | -3) { crate::graphics::begin_canvas(); }
+        if matches!(action, -2 | -3 | -5) { crate::graphics::begin_canvas(); }
         let reply = user::saved_mailbox(&mut memory);
         reply[..4].copy_from_slice(&(sessions.len() as i32).to_le_bytes());
         let error = result.err().unwrap_or("").as_bytes();
@@ -52,6 +52,20 @@ fn open(
     sessions: &mut Sessions,
     title: &[u32],
 ) -> Result<()> {
+    if action == -5 {
+        let path = host.services.path(path)?;
+        let image = host.services.executable_bytes(&path)?;
+        let services = host.services.clone();
+        let history = host.history.clone();
+        let req = Spawn { args: alloc::vec![path.clone()], path, flags: 0 };
+        let pid = crate::scheduler::spawn(alloc::boxed::Box::new(move || {
+            run_child(services, history, req, image, utility::Streams::default())
+        }), crate::scheduler::pane())?;
+        return match crate::scheduler::wait(pid)? {
+            0 => Ok(()),
+            _ => Err("graphical application exited with an error"),
+        };
+    }
     if action == -2 && path == "/bin/links" {
         let image = host.services.executable_bytes(path)?;
         let code = utility::segment(&image).ok_or("invalid browser executable")?;
@@ -92,8 +106,8 @@ fn open(
         return result;
     }
     reap_hidden(sessions);
-    let active = if action == 0 {
-        start_tab(host, sessions, title, None)?
+    let active = if action == 0 || action == -4 {
+        start_tab(host, sessions, title, None, (action == -4).then_some(path))?
     } else {
         let index = (action as usize).wrapping_sub(1).min(sessions.len().saturating_sub(1));
         let tab = sessions.get(index).ok_or("unknown terminal")?;
@@ -111,7 +125,7 @@ fn reap_hidden(sessions: &mut Sessions) {
     });
 }
 
-fn start_tab(host: &Context, sessions: &mut Sessions, title: &[u32], position: Option<(usize, usize)>) -> Result<usize> {
+fn start_tab(host: &Context, sessions: &mut Sessions, title: &[u32], position: Option<(usize, usize)>, command: Option<&str>) -> Result<usize> {
     if sessions.len() >= graphics::MAX_TABS {
         return Err("terminal tab limit reached");
     }
@@ -130,8 +144,9 @@ fn start_tab(host: &Context, sessions: &mut Sessions, title: &[u32], position: O
         graphics::stash_tab();
         graphics::show_tab(id, position);
     }
+    let args = command.map(|cmd| (3, alloc::format!("/bin/bash\0--launch\0{cmd}\0")));
     let result = crate::scheduler::spawn(alloc::boxed::Box::new(move || {
-        drive(ctx, shell, true, None)
+        drive(ctx, shell, true, args)
     }), crate::scheduler::pane());
     match result {
         Ok(pid) => {
@@ -178,7 +193,7 @@ fn run_tabs(host: &Context, sessions: &mut Sessions, title: &[u32], mut active: 
             }
             Some(TabAction::New) => {
                 let position = graphics::stash_tab();
-                match start_tab(host, sessions, title, position) {
+                match start_tab(host, sessions, title, position, None) {
                     Ok(index) => active = index,
                     Err(_) => graphics::show_tab(selected_id, position),
                 }

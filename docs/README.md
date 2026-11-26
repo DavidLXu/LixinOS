@@ -68,7 +68,7 @@ git -C ~/Desktop/lixinos-project status
 
 以 `python hello.py` 为例，shell 先按当前目录找到脚本，把文件内容交给用户态的 MicroPython。解释器在 ARM64 的 EL0 执行 Python 代码，调用内核的终端接口输出结果。脚本结束后，控制权回到 shell。内核本身运行在 EL1，负责页表、异常处理和设备访问。[用户态 shell](../User/bash/bash.c) · [用户程序加载器](../Kernel/src/user.rs) · [MicroPython 移植层](../User/python/port.c)
 
-启动器分配一个虚拟 CPU，使用共享盘时为 Rust 内核分配 12 GiB RAM，为 TCC 内核分配 24 GiB RAM。内核使用用户态区域上方的 RAM 作为堆，每个终端窗格为前台用户程序保留 4 MiB 区域，代码页与可写数据页使用不同权限。用 `--split` 启动时，两个窗格共享磁盘，各自保存工作目录、变量和前台程序状态；Ctrl+Tab 暂停当前窗格并恢复另一个。读 `htop` 时应把堆用量看作整个 guest 内存的一部分。[内核入口](../Kernel/src/main.rs) · [分屏实现](../Kernel/src/panes.rs)
+启动器分配一个虚拟 CPU，使用共享盘时为 Rust 内核分配 6 GiB RAM，为 TCC 内核分配 24 GiB RAM。内核使用用户态区域上方的 RAM 作为堆，每个终端窗格为前台用户程序保留 4 MiB 区域，代码页与可写数据页使用不同权限。用 `--split` 启动时，两个窗格共享磁盘，各自保存工作目录、变量和前台程序状态；Ctrl+Tab 暂停当前窗格并恢复另一个。读 `htop` 时应把堆用量看作整个 guest 内存的一部分。[内核入口](../Kernel/src/main.rs) · [分屏实现](../Kernel/src/panes.rs)
 
 ## 重启后，哪些东西还在？
 

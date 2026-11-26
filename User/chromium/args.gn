@@ -1,0 +1,54 @@
+# ARM64 Linux ABI used by linux-run. Select //content/shell:content_shell.
+target_os = "linux"
+target_cpu = "arm64"
+is_debug = false
+dcheck_always_on = false
+exclude_unwind_tables = true
+is_component_build = false
+optimize_for_size = true
+symbol_level = 0
+blink_symbol_level = 0
+v8_symbol_level = 0
+
+# The guest compositor supplies the window, input and software buffers.
+ozone_auto_platforms = false
+ozone_platform = "wayland"
+ozone_platform_wayland = true
+use_gtk = false
+use_glib = false
+# A Wayland client uses wl_shm for its own window. PipeWire is for capturing other windows.
+rtc_use_pipewire = false
+use_qt5 = false
+use_qt6 = false
+use_dawn = false
+skia_use_dawn = false
+build_dawn_tests = false
+dawn_use_swiftshader = false
+dawn_enable_vulkan = false
+enable_vulkan = false
+use_vaapi = false
+use_on_device_model_service = false
+enable_protocol_handler_permission_request = false
+bundle_ozone_gl_libraries = false
+angle_shared_libvulkan = false
+angle_enable_vulkan = false
+angle_enable_swiftshader = false
+enable_swiftshader = false
+enable_swiftshader_vulkan = false
+
+enable_printing = false
+use_cups = false
+enable_print_preview = false
+enable_pdf = false
+enable_extensions = false
+bundle_linux_crashpad_handler = false
+enable_background_mode = false
+enable_webui_ntp = false
+content_shell_enable_web_tests = false
+enable_vr = false
+use_pulseaudio = false
+use_alsa = false
+enable_devtools_frontend = false
+
+# Initialize Blink bindings when creating a context, avoiding a second host Blink build.
+use_v8_context_snapshot = false

@@ -1,0 +1,94 @@
+--- a/src/core/mutter.c
++++ b/src/core/mutter.c
+@@ -23,6 +23,11 @@
+ #include <glib/gi18n-lib.h>
+ #include <glib-unix.h>
+ #include <stdlib.h>
++#ifdef __lixinos__
++#include <spawn.h>
++#include <sys/wait.h>
++#include <unistd.h>
++#endif
+ 
+ #include "compositor/meta-plugin-manager.h"
+ #include "meta/main.h"
+@@ -126,12 +131,37 @@
+   g_unix_signal_add (SIGTERM, on_sigterm, context);
+ }
+ 
++#ifdef __lixinos__
++typedef struct
++{
++  GPid pid;
++  MetaContext *context;
++} LxSessionChild;
++
++/* LixinOS reports child completion through waitpid, without SIGCHLD. */
++static gboolean
++check_session_child (gpointer data)
++{
++  LxSessionChild *child = data;
++  int status;
++  pid_t result = waitpid (child->pid, &status, WNOHANG);
++  if (result == 0 || (result < 0 && errno == EINTR))
++    return G_SOURCE_CONTINUE;
++  command_exited_cb (child->pid, result < 0 ? EXIT_FAILURE : status,
++                     child->context);
++  return G_SOURCE_REMOVE;
++}
++#endif
++
+ int
+ main (int argc, char **argv)
+ {
+   g_autoptr (MetaContext) context = NULL;
+   g_autoptr (GError) error = NULL;
+ 
++#ifdef __lixinos__
++  LxSessionChild child;
++#endif
+   context = meta_create_context ("Mutter");
+ 
+   meta_context_add_option_entries (context, mutter_options, GETTEXT_PACKAGE);
+@@ -169,6 +199,15 @@
+ 
+       command_argv = g_steal_pointer (&argv_ignored);
+ 
++#ifdef __lixinos__
++      int spawn_error = posix_spawnp (&command_pid, command_argv[0], NULL, NULL,
++                                      command_argv, environ);
++      if (spawn_error)
++        {
++          g_printerr ("Failed to run the command: %s\n", g_strerror (spawn_error));
++          return EXIT_FAILURE;
++        }
++#else
+       if (!g_spawn_async (NULL, command_argv, NULL,
+                           G_SPAWN_DO_NOT_REAP_CHILD | G_SPAWN_SEARCH_PATH,
+                           NULL, NULL, &command_pid, &error))
+@@ -177,7 +216,14 @@
+           return EXIT_FAILURE;
+         }
+ 
++#endif
++#ifdef __lixinos__
++      child.pid = command_pid;
++      child.context = context;
++      g_timeout_add (100, check_session_child, &child);
++#else
+       g_child_watch_add (command_pid, command_exited_cb, context);
++#endif
+     }
+ 
+   if (meta_context_get_compositor_type (context) == META_COMPOSITOR_TYPE_WAYLAND)
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -1312,7 +1312,7 @@
+     mutter_c_args,
+     '-DG_LOG_DOMAIN="mutter"',
+   ],
+-  dependencies: [libmutter_dep],
++  dependencies: [libmutter_dep, cc.find_library('lx-mutter-spawn', dirs: get_option('prefix') / get_option('libdir'), required: lixinos)],
+   install_dir: bindir,
+   install: true,
+ )

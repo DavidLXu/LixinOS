@@ -3,9 +3,8 @@
 
 #define PAGE 4096U
 #define TABLE_SPAN (512 * PAGE)
-#define MAP_TABLES (LX_SHARED_LIMIT / TABLE_SPAN)
-#define TABLE_POOL 128
-#define SHARED_FILES (2 * NATIVE_TASKS)
+#define MAP_BLOCKS (LX_SHARED_APERTURE / TABLE_SPAN)
+#define SHARED_FILES LX_DESCRIPTOR_LIMIT
 
 struct shared_file {
     unsigned refs, mappings, size, position;
@@ -16,12 +15,11 @@ static struct shared_file files[SHARED_FILES];
 struct mapping {
     struct shared_file *file;
     unsigned bytes, count;
-    u8 tables[MAP_TABLES];
+    u64 (*tables)[512];
 };
-static struct mapping maps[NATIVE_TASKS][LX_SHARED_MAPS];
+static struct mapping maps[NATIVE_TASKS][MAP_BLOCKS];
+static unsigned map_end[NATIVE_TASKS];
 static u64 aperture[2][512] __attribute__((aligned(PAGE)));
-static u64 page_tables[TABLE_POOL][512] __attribute__((aligned(PAGE)));
-static u8 tables_used[TABLE_POOL];
 static unsigned mapped_banks[2] = {NATIVE_TASKS,NATIVE_TASKS};
 #define mapped_bank mapped_banks[smp_cpu()]
 
@@ -92,18 +90,18 @@ long shared_transfer(struct shared_file *file, u8 *bytes, unsigned count, int wr
 
 u64 shared_root(unsigned cpu) { return (u64)aperture[cpu] | 3; }
 
-static void publish(unsigned bank, unsigned slot, int visible) {
+static void publish(unsigned cpu, unsigned bank, unsigned slot, int visible) {
     struct mapping *m = &maps[bank][slot];
     for (unsigned i = 0; i < m->count; i++)
-        aperture[smp_cpu()][slot * MAP_TABLES + i] = visible ? ((u64)page_tables[m->tables[i]] | 3) : 0;
+        aperture[cpu][slot + i] = visible ? ((u64)m->tables[i] | 3) : 0;
 }
 
 void shared_switch(unsigned bank) {
     if (mapped_bank == bank) return;
     if (mapped_bank < NATIVE_TASKS) {
-        for (unsigned i = 0; i < LX_SHARED_MAPS; i++) publish(mapped_bank, i, 0);
+        for (unsigned i = 0; i < map_end[mapped_bank]; i++) publish(smp_cpu(), mapped_bank, i, 0);
     }
-    for (unsigned i = 0; i < LX_SHARED_MAPS; i++) publish(bank, i, 1);
+    for (unsigned i = 0; i < map_end[bank]; i++) publish(smp_cpu(), bank, i, 1);
     mapped_bank = bank;
 }
 
@@ -112,54 +110,56 @@ long shared_map(unsigned bank, struct shared_file *file, u64 bytes, u64 offset, 
         (offset & (PAGE - 1)) || (prot != 1 && prot != 3)) return -22;
     bytes = (bytes + PAGE - 1) & ~(u64)(PAGE - 1);
     if (offset + bytes > ((file->size + PAGE - 1) & ~(PAGE - 1))) return -22;
-    unsigned slot = 0;
-    while (slot < LX_SHARED_MAPS && maps[bank][slot].file) slot++;
-    if (slot == LX_SHARED_MAPS) return -12;
-    struct mapping *m = &maps[bank][slot];
     const unsigned count = (bytes + TABLE_SPAN - 1) / TABLE_SPAN;
-    unsigned found = 0;
-    for (unsigned i = 0; i < TABLE_POOL && found < count; i++)
-        if (!tables_used[i]) m->tables[found++] = i;
-    if (found != count) return -12;
+    unsigned slot = 0;
+    for (unsigned i = 0; i < map_end[bank]; i++) {
+        if (!maps[bank][i].file) continue;
+        if (slot + count <= i) break;
+        slot = i + maps[bank][i].count;
+    }
+    if (slot + count > MAP_BLOCKS) return -12;
+    struct mapping *m = &maps[bank][slot];
+    m->tables = (u64 (*)[512])file_buffer(count * PAGE);
+    if (!m->tables) return -12;
 
     const u64 permissions = 3 | (1UL << 10) | (3UL << 8) | (1UL << 6) |
                             (1UL << 53) | (1UL << 54) | (prot == 1 ? 1UL << 7 : 0);
     for (unsigned i = 0; i < count; i++) {
-        unsigned table = m->tables[i];
-        tables_used[table] = 1;
         for (unsigned j = 0; j < 512; j++) {
             u64 at = i * TABLE_SPAN + j * PAGE;
-            page_tables[table][j] = at < bytes ? ((u64)file->data + offset + at) | permissions : 0;
+            m->tables[i][j] = at < bytes ? ((u64)file->data + offset + at) | permissions : 0;
         }
     }
     shared_ref(file);
     file->mappings++;
     m->file = file;
+    if (slot >= map_end[bank]) map_end[bank] = slot + 1;
     m->bytes = bytes;
     m->count = count;
-    publish(bank, slot, 1);
+    for (unsigned cpu=0;cpu<2;cpu++)
+        if (mapped_banks[cpu]==bank) publish(cpu,bank,slot,1);
     sync_image();
-    return LX_SHARED_BASE + slot * LX_SHARED_LIMIT;
+    return LX_SHARED_BASE + slot * TABLE_SPAN;
 }
 
 static void unmap(unsigned bank, unsigned slot) {
     struct mapping *m = &maps[bank][slot];
-    if (mapped_bank == bank) {
-        publish(bank, slot, 0);
-        sync_image();
-    }
-    for (unsigned i = 0; i < m->count; i++) tables_used[m->tables[i]] = 0;
+    for (unsigned cpu=0;cpu<2;cpu++)
+        if (mapped_banks[cpu]==bank) publish(cpu,bank,slot,0);
+    sync_image();
+    release_buffer((u8 *)m->tables, m->count * PAGE);
     m->file->mappings--;
     shared_release(m->file);
     m->file = 0;
     m->count = 0;
+    while (map_end[bank] && !maps[bank][map_end[bank] - 1].file) map_end[bank]--;
 }
 
 long shared_unmap(unsigned bank, u64 address, u64 bytes) {
     if (!bytes || bytes > LX_SHARED_LIMIT || address < LX_SHARED_BASE ||
-        address >= LX_SHARED_BASE + LX_SHARED_MAPS * LX_SHARED_LIMIT ||
-        (address - LX_SHARED_BASE) % LX_SHARED_LIMIT) return -22;
-    unsigned slot = (address - LX_SHARED_BASE) / LX_SHARED_LIMIT;
+        address >= LX_SHARED_BASE + LX_SHARED_APERTURE ||
+        (address - LX_SHARED_BASE) % TABLE_SPAN) return -22;
+    unsigned slot = (address - LX_SHARED_BASE) / TABLE_SPAN;
     struct mapping *m = &maps[bank][slot];
     if (!m->file || m->bytes != ((bytes + PAGE - 1) & ~(u64)(PAGE - 1))) return -22;
     unmap(bank, slot);
@@ -167,6 +167,6 @@ long shared_unmap(unsigned bank, u64 address, u64 bytes) {
 }
 
 void shared_clear(unsigned bank) {
-    for (unsigned i = 0; i < LX_SHARED_MAPS; i++)
+    for (unsigned i = 0; i < map_end[bank]; i++)
         if (maps[bank][i].file) unmap(bank, i);
 }

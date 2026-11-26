@@ -1,0 +1,16 @@
+--- a/src/client/qwaylandinputdevice.cpp
++++ b/src/client/qwaylandinputdevice.cpp
+@@ -1169,7 +1169,12 @@
+         return;
+     }
+ 
+-    char *map_str = static_cast<char *>(mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0));
++#ifdef __lixinos__
++    constexpr int mapMode = MAP_SHARED;
++#else
++    constexpr int mapMode = MAP_PRIVATE;
++#endif
++    char *map_str = static_cast<char *>(mmap(nullptr, size, PROT_READ, mapMode, fd, 0));
+     if (map_str == MAP_FAILED) {
+         close(fd);
+         return;

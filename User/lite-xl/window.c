@@ -1,4 +1,5 @@
 #include "window.h"
+#include "../gui/shared-clipboard.h"
 
 #include <errno.h>
 #include <ctype.h>
@@ -314,11 +315,8 @@ void lxl_damage(SDL_Surface *surface, const SDL_Rect *rects, int count)
 void lxl_copy(const char *value)
 {
     size_t size = strlen(value);
-    if (size > sizeof clipboard) {
-        size = sizeof clipboard;
-        while (((unsigned char)value[size] & 0xc0) == 0x80)
-            --size;
-    }
+    if (size <= LX_CLIP_MAX) clip_store(value, size);
+    if (size > sizeof clipboard) { copied = 0; return; }
     memcpy(clipboard, value, size);
     copied = size;
 }
@@ -434,4 +432,18 @@ void lxl_bind(lua_State *L)
     lua_pushcfunction(L, save);
     lua_setfield(L, -2, "lixin_save");
     lua_pop(L, 1);
+}
+
+int lxl_shared_paste(lua_State *L)
+{
+    FILE *file = fopen(LX_CLIP_FILE, "rb");
+    if (!file) return 0;
+    char *bytes = malloc(LX_CLIP_MAX + 1);
+    if (!bytes) { fclose(file); return 0; }
+    size_t size = fread(bytes, 1, LX_CLIP_MAX + 1, file);
+    int ok = !ferror(file) && size <= LX_CLIP_MAX;
+    fclose(file);
+    if (ok) lua_pushlstring(L, bytes, size);
+    free(bytes);
+    return ok;
 }

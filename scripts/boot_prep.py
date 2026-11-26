@@ -5,6 +5,7 @@ from datetime import datetime
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import shutil
@@ -69,16 +70,35 @@ def emit(pairs):
         print(f"{k}={shlex.quote(str(v))}")
 
 
+def disk_magic(disk):
+    if disk.is_file() and not disk_image.cloud_only(disk.stat()):
+        with disk.open("rb") as source:
+            return source.read(8)
+    return b""
+
+
+def ram_profile(magic, kernel_bytes=None):
+    """Return the default and minimum guest memory in MiB for this boot."""
+    if magic == b"LIXBLD01":
+        return (24576, 24576) if kernel_bytes is not None else (6144, 4096)
+    if kernel_bytes is not None and b"LIXDISK4" in kernel_bytes:
+        return 1536, 1536
+    return 640, 1
+
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--phase", choices=("early", "launch"), required=True)
+    p.add_argument("--phase", choices=("early", "picker", "launch"), required=True)
     p.add_argument("--disk", default="")
+    p.add_argument("--picker-tcc-disk", default="")
+    p.add_argument("--picked-image", action="store_true")
     p.add_argument("--release", default="")
     p.add_argument("--auto-release", action="store_true")
     p.add_argument("--choice", default="")
     p.add_argument("--explicit-mode", default="")
     p.add_argument("--mode", default="--window")
     p.add_argument("--gpu", default="auto")
+    p.add_argument("--ram", default="")
     p.add_argument("--qemu", default="")
     p.add_argument("--custom-kernel", default="")
     p.add_argument("--release-dir", default="")
@@ -103,6 +123,44 @@ def main():
         return 0
 
     disk = Path(args.disk)
+    requested_mib = None
+    if args.ram:
+        size = re.fullmatch(r"([1-9][0-9]*)([MG])", args.ram.upper())
+        if not size:
+            p.error("--ram 需要带 M 或 G 的正整数，例如 4096M 或 5G")
+        requested_mib = int(size[1]) * (1024 if size[2] == "G" else 1)
+
+    if args.phase == "picker":
+        magic = disk_magic(disk)
+        tcc_disk = args.picker_tcc_disk
+        loader = Path(args.custom_kernel)
+        if args.picked_image:
+            # prepare() can migrate raw images. Only offer existing LixinOS disks here.
+            disk_image.require_local(disk, disk.stat())
+            with disk.open("rb") as source:
+                if source.read(disk_image.SECTOR) in (disk_image.HEADER, disk_image.PREVIOUS_HEADER, disk_image.BUILD_HEADER):
+                    disk_image.snapshot_slots(source)
+                elif not disk_image.snapshot_headers(source):
+                    raise ValueError("所选文件没有可用的 LixinOS 文件系统快照")
+            tcc_disk = str(disk)
+            loader = Path(os.environ.get("LIXINOS_TCC_LOADER") or disk.with_suffix(".loader.elf"))
+            if not args.release and not loader.is_file():
+                tcc_disk = ""
+        def profile(name, path, loader_path, memory):
+            default, minimum = memory
+            return dict(name=name, disk=str(path), loader=str(loader_path),
+                        initial=max(requested_mib or default, minimum), minimum=minimum)
+        profiles = [profile("rust", disk, "", ram_profile(magic))]
+        if tcc_disk:
+            tcc_magic = disk_magic(Path(tcc_disk))
+            if args.release:
+                loader = kr.boot_files_info(args.release, "tcc")[0] / "tcc-kernel.elf"
+            kernel_bytes = loader.read_bytes()
+            if tcc_magic != b"LIXBLD01" or b"LIXBLD01" in kernel_bytes:
+                profiles.append(profile("tcc", tcc_disk, loader, ram_profile(tcc_magic, kernel_bytes)))
+        print(json.dumps(profiles))
+        return 0
+
     pref_mode, pref_zone, pref_kernel, pref_port, pref_model = disk_image.boot_preferences(disk).split()
     mode = args.explicit_mode or f"--{pref_mode}"
     timezone = args.timezone or pref_zone
@@ -168,36 +226,28 @@ def main():
 
     # Prepare disk only when kernel image is already available (release or custom);
     # source builds prepare after cargo build.
-    ram = "640M"
-    disk_prepared = False
-    if custom_kernel or use_release:
+    disk_prepared = bool(custom_kernel or use_release)
+    kernel_bytes = None
+    if disk_prepared:
         kpath = Path(kernel_image)
         if not kpath.is_absolute():
             kpath = ROOT / "Kernel" / kpath
         if not os.access(kpath, os.R_OK):
             sys.stderr.write(f"Cannot read kernel image: {kernel_image}\n")
             return 1
-        if not custom_kernel:
-            disk_image.prepare(disk, False)
-        else:
-            kbytes = kpath.read_bytes()
-            if b"LIXDISK4" in kbytes:
-                disk_image.prepare(disk, False)
-                ram = "1536M"
-            else:
-                disk_image.prepare(disk, True)
-        with disk.open("rb") as f:
-            magic = f.read(8)
-        if magic == b"LIXBLD01":
-            if custom_kernel:
-                kbytes = kpath.read_bytes()
-                if b"LIXBLD01" not in kbytes:
-                    sys.stderr.write("This TCC image needs a loader with build-volume support.\n")
-                    return 1
-                ram = "24G"
-            else:
-                ram = "12G"
-        disk_prepared = True
+        if custom_kernel:
+            kernel_bytes = kpath.read_bytes()
+        disk_image.prepare(disk, kernel_bytes is not None and b"LIXDISK4" not in kernel_bytes)
+    magic = disk_magic(disk)
+    if magic == b"LIXBLD01" and kernel_bytes is not None and b"LIXBLD01" not in kernel_bytes:
+        sys.stderr.write("This TCC image needs a loader with build-volume support.\n")
+        return 1
+    default, minimum = ram_profile(magic, kernel_bytes)
+    ram = f"{default // 1024}G" if default % 1024 == 0 else f"{default}M"
+    if requested_mib is not None:
+        if requested_mib < minimum:
+            p.error(f"当前内核和磁盘的启动配置至少需要 {minimum} MiB RAM")
+        ram = args.ram.upper()
 
     emit({
         "release": release,

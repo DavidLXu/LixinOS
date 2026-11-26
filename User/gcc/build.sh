@@ -27,7 +27,7 @@ if [[ $phase == all || $phase == fetch ]]; then bash "$port/fetch.sh"; fi
 prepare_runtime() {
     mkdir -p rt
     for src in "$port/../cpython"/{posix,memory,threads}.c "$port/../cpython/switch.S" "$port/../tcc/api.c" "$port/terminal.c"; do
-        "$py/cc" -Os -ffunction-sections -fdata-sections -c "$src" -o "rt/$(basename "${src%.*}").o"
+        "$py/cc" -DLX_THREADED_API -mno-outline-atomics -Os -ffunction-sections -fdata-sections -c "$src" -o "rt/$(basename "${src%.*}").o"
     done
     "$py/cc" -std=gnu++98 -fno-exceptions -fno-rtti -Os -ffunction-sections -c "$port/new.cc" -o rt/new.o
     aarch64-none-elf-ar rcsD rt/runtime.a rt/*.o

@@ -1,0 +1,25 @@
+--- a/sal/osl/unx/file.cxx
++++ b/sal/osl/unx/file.cxx
+@@ -1291,6 +1291,10 @@
+ 
+ }
+ 
++#ifdef __lixinos__
++extern "C" void *lx_writer_map_readonly(int, size_t, off_t);
++#endif
++
+ oslFileError SAL_CALL osl_mapFile(
+     oslFileHandle Handle,
+     void**        ppAddr,
+@@ -1322,7 +1326,11 @@
+ 
+     off_t const nOffset = sal::static_int_cast< off_t >(uOffset);
+ 
++#ifdef __lixinos__
++    void *p = lx_writer_map_readonly(pImpl->m_fd, nLength, nOffset);
++#else
+     void* p = mmap(nullptr, nLength, PROT_READ, MAP_SHARED, pImpl->m_fd, nOffset);
++#endif
+ 
+     if (p == MAP_FAILED)
+         return oslTranslateFileError(errno);

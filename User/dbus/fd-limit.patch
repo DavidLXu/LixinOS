@@ -1,0 +1,20 @@
+--- a/dbus/dbus-sysdeps-util-unix.c
++++ b/dbus/dbus-sysdeps-util-unix.c
+@@ -433,6 +433,8 @@
+ 
+   old = lim;
+ 
++  /* LixinOS exposes a fixed per-process descriptor table even to root. */
++#ifndef __lixinos__
+   if (getuid () == 0)
+     {
+       /* We are privileged, so raise the soft limit to at least
+@@ -447,6 +449,8 @@
+           lim.rlim_max < lim.rlim_cur)
+         lim.rlim_max = lim.rlim_cur;
+     }
++
++#endif
+ 
+   /* Raise the soft limit to match the hard limit, which we can do even
+    * if we are unprivileged. In particular, systemd >= 240 will normally

@@ -1,4 +1,5 @@
-#pragma once
+#ifndef LX_UNICODE_H
+#define LX_UNICODE_H
 /* Each wide character occupies a lead cell and an unpainted continuation. */
 #define WIDE_TAIL 0x110000
 static inline int han_slot(unsigned c) {
@@ -21,3 +22,4 @@ static inline unsigned utf8_next(const char **text) {
     *text=(const char *)s;
     return c;
 }
+#endif

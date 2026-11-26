@@ -1,0 +1,50 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -79,6 +79,15 @@
+ cmake_dependent_option(COIN_BUILD_DOCUMENTATION_MAN "Build Coin man pages." OFF "COIN_BUILD_DOCUMENTATION" OFF)
+ cmake_dependent_option(COIN_BUILD_DOCUMENTATION_QTHELP "Build QtHelp documentation." OFF "COIN_BUILD_DOCUMENTATION" OFF)
+ cmake_dependent_option(COIN_BUILD_DOCUMENTATION_CHM "Build compressed HTML help manual (requires HTML help compiler)" OFF "COIN_BUILD_DOCUMENTATION" OFF)
++
++option(COIN_USE_EGL "Use EGL for OpenGL entry-point lookup" OFF)
++if(COIN_USE_EGL)
++  find_library(COIN_EGL_LIBRARY EGL REQUIRED)
++  find_path(COIN_EGL_INCLUDE EGL/egl.h REQUIRED)
++  list(APPEND COIN_TARGET_INCLUDE_DIRECTORIES ${COIN_EGL_INCLUDE})
++  list(APPEND COIN_TARGET_LINK_LIBRARIES ${COIN_EGL_LIBRARY})
++  add_compile_definitions(COIN_USE_EGL)
++endif()
+ 
+ option(COIN_THREADSAFE "Enable thread safe render traversals." OFF)
+ option(HAVE_VRML97 "Enable VRML97 support." ON)
+@@ -207,7 +216,7 @@
+     list(APPEND COIN_TARGET_LINK_LIBRARIES ${X11_LIBRARIES} ${X11_GL_LIB} ${X11_GLU_LIB})
+   endif()
+ else()
+-  if(UNIX AND NOT APPLE)
++  if(UNIX AND NOT APPLE AND NOT COIN_USE_EGL)
+     find_package(X11 REQUIRED)
+     list(APPEND COIN_TARGET_INCLUDE_DIRECTORIES ${X11_INCLUDE_DIR})
+     list(APPEND COIN_TARGET_LINK_LIBRARIES ${X11_LIBRARIES})
+--- a/src/glue/gl.cpp
++++ b/src/glue/gl.cpp
+@@ -574,11 +574,20 @@
+   return glue->dl_handle;
+ }
+ 
++#ifdef COIN_USE_EGL
++#include <EGL/egl.h>
++#endif
++
+ /* doc in header file */
+ void *
+ cc_glglue_getprocaddress(const cc_glglue * glue, const char * symname)
+ {
+   void * ptr = NULL;
++
++#ifdef COIN_USE_EGL
++  ptr = reinterpret_cast<void *>(eglGetProcAddress(symname));
++  goto returnpoint;
++#endif
+ 
+   // FIXME: also supply 'glue' to coin_[x]gl_getprocaddress()
+   ptr = coin_wgl_getprocaddress(glue, symname);

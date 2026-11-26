@@ -97,7 +97,19 @@ static int event(struct input_queue *q, struct event *out) {
     return 1;
 }
 
-static unsigned modifiers;
+static unsigned modifiers, navigation_keys;
+/* Canvas geometry request 2 reports held Up, Down, Left, Right and Space. */
+unsigned canvas_navigation_keys(void) { return navigation_keys; }
+static unsigned navigation_mask(unsigned code) {
+    switch (code) {
+    case 103: return 1;
+    case 108: return 2;
+    case 105: return 4;
+    case 106: return 8;
+    case 57: return 16;
+    default: return 0;
+    }
+}
 int keyboard_poll(void) {
     static unsigned caps;
     static const char *pending = "";
@@ -105,6 +117,7 @@ int keyboard_poll(void) {
     static const char shifted[] = "!@#$%^&*()_+\0\0QWERTYUIOP{}\0\0ASDFGHJKL:\"~\0|ZXCVBNM<>?";
     static const char *nav[] = {"\033[H", "\033[A", "\033[5~", "\033[D",  "\033[C",
                                 "\033[F", "\033[B", "\033[6~", "\033[2~", "\033[3~"};
+    static const char *app_nav[] = {"\033OH","\033OA",0,"\033OD","\033OC","\033OF","\033OB",0,0,0};
     static const char *fn[] = {"\033OP",   "\033OQ",   "\033OR",   "\033OS",
                                "\033[15~", "\033[17~", "\033[18~", "\033[19~",
                                "\033[20~", "\033[21~", "\033[23~", "\033[24~"};
@@ -118,7 +131,11 @@ int keyboard_poll(void) {
                                   : code == 54 ? 2
                                   : code == 29 ? 4
                                   : code == 97 ? 8
+                                  : code == 56 ? 16
+                                  : code == 100 ? 32
                                                : 0;
+        unsigned held = navigation_mask(code);
+        if (e.value) navigation_keys |= held; else navigation_keys &= ~held;
         if (mask) {
             if (e.value)
                 modifiers |= mask;
@@ -146,9 +163,10 @@ int keyboard_poll(void) {
         if (code == 57)
             return 32;
         if (code >= 102 && code <= 111) {
-            static const char *app[] = {"\033OH","\033OA",0,"\033OD","\033OC","\033OF","\033OB",0,0,0};
-            unsigned k=code-102;
-            pending=display_application_cursor() && app[k] ? app[k] : nav[k];
+            unsigned k = code - 102;
+            pending = nav[k];
+            if (display_application_cursor() && app_nav[k])
+                pending = app_nav[k];
         }
         else if (code >= 59 && code <= 68)
             pending = fn[code - 59];
@@ -169,7 +187,10 @@ int keyboard_poll(void) {
 }
 
 static unsigned pointer_down, suppress_pointer, pointer_x, pointer_y;
-static int pointer_seen, right_down, right_press;
+static int pointer_seen, right_down, right_press, middle_down;
+unsigned input_modifiers(void) {
+    return !!(modifiers & 3) | (!!(modifiers & 12) << 1) | (!!(modifiers & 48) << 2);
+}
 long tablet_position(unsigned width, unsigned height, unsigned bar) {
     if (!pointer_seen)
         return -1;
@@ -193,6 +214,7 @@ long tablet_poll(unsigned width, unsigned height, unsigned bar) {
             right_press |= e.value && !right_down;
             right_down = !!e.value;
         }
+        if (e.type == 1 && e.code == 274) middle_down = !!e.value;
         if (e.type == 2 && e.code == 8)
             wheel = (int)e.value;
         if (e.type == 0 && e.code == 0) {
@@ -201,7 +223,7 @@ long tablet_poll(unsigned width, unsigned height, unsigned bar) {
             pointer_y = y;
             long val = tablet_position(width, height, bar) | (pointer_down && !suppress_pointer) << 24 |
                        (wheel > 0) << 26 | (wheel < 0) << 27 | (long)right_press << 29 |
-                       (long)!!(modifiers & 3) << 32 | (long)!!(modifiers & 12) << 33;
+                       (long)input_modifiers() << 32 | (long)right_down << 35 | (long)middle_down << 36;
             right_press = 0;
             wheel = 0;
             return val;

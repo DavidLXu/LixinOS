@@ -1,6 +1,17 @@
 #include "../console.h"
 #include "lixin.h"
 
+#ifdef LX_THREADED_API
+extern int lx_runtime_lock(void);
+extern void lx_runtime_unlock(int *);
+extern void lx_delay(unsigned);
+static void wait_standard(int fd,unsigned mask) {
+    while (lx_poll(fd,mask,0)==0) lx_delay(1);
+}
+#define MAIL_GUARD int held __attribute__((cleanup(lx_runtime_unlock))) = lx_runtime_lock();
+#else
+#define MAIL_GUARD
+#endif
 #define MAIL ((char *)0x443d7000)
 static int request(const char *path) {
     unsigned n = 0;
@@ -10,9 +21,13 @@ static int request(const char *path) {
     return 0;
 }
 long lx_stat(const char *path) {
+    MAIL_GUARD
+
     return request(path) ? -5 : console_call(7, 0);
 }
 long lx_dir(const char *path, unsigned index, char name[513]) {
+    MAIL_GUARD
+
     if (request(path)) return -5;
     long result = console_call(7, (long)index + 1);
     if (result >= 0 || result == LX_DIR) {
@@ -22,24 +37,38 @@ long lx_dir(const char *path, unsigned index, char name[513]) {
     return result;
 }
 int lx_open(const char *path) {
+    MAIL_GUARD
+
     return request(path) ? -1 : console_call(8, 0);
 }
 int lx_read(int fd, void *buffer, int count) {
+    MAIL_GUARD
+
     if (count < 0) return -1;
     if (count > 4096) count = 4096;
+#ifdef LX_THREADED_API
+    if (held && count && !fd) wait_standard(fd,LX_READABLE);
+#endif
     long n = console_call(9, ((unsigned long)(unsigned)fd << 32) | (unsigned)count);
     if (n < 0 || n > count) return -1;
     for (long i = 0; i < n; ++i) ((char *)buffer)[i] = MAIL[i];
     return n;
 }
-int lx_open_write(const char *path,int append) {return request(path) ? -1 : console_call(40,append);}
+int lx_open_write(const char *path,int append) {
+    MAIL_GUARD
+return request(path) ? -1 : console_call(40,append);}
 int lx_poll(int fd,unsigned events,int timeout_ms) {
     if (fd<0 || fd>65535 || events>3 || timeout_ms < -1) return -1;
     return console_call(41,(unsigned long)fd<<48 | (unsigned long)events<<32 | (unsigned)timeout_ms);
 }
 int lx_write(int fd, const void *data, int count) {
+    MAIL_GUARD
+
     if (count < 0 || (!data && count)) return -1;
     if (count > 4096) count = 4096;
+#ifdef LX_THREADED_API
+    if (held && count && fd==1) wait_standard(fd,LX_WRITABLE);
+#endif
     for (int i=0; i<count; ++i) MAIL[i]=((const char *)data)[i];
     return console_call(39, (unsigned long)(unsigned)fd << 32 | (unsigned)count);
 }
@@ -64,6 +93,8 @@ long lx_process_call(unsigned op, unsigned index) {
     return console_call(18, ((unsigned long)index << 32) | op);
 }
 int lx_spawn_async(const char *path,int argc,char **argv) {
+    MAIL_GUARD
+
     if (!path || !argv || argc<1 || argc>512) return -1;
     char *args=(char *)0x443d8000;
     for (int i=-1;i<argc;i++) {
@@ -79,10 +110,14 @@ int lx_spawn_async(const char *path,int argc,char **argv) {
     return lx_process_call(18,8);
 }
 int lx_wait(int pid) {
+    MAIL_GUARD
+
     *(char *)0x443d8000=0;
     return lx_process_call(19,(unsigned)pid);
 }
 int lx_pid(void) {
+    MAIL_GUARD
+
     *(char *)0x443d8000=0;
     return lx_process_call(23,0);
 }
@@ -100,6 +135,8 @@ int lx_key_byte(void) {
 int lx_timed_byte(unsigned ms) { return console_call(14, ms); }
 
 int lx_tcp_connect(const char *host, int port) {
+    MAIL_GUARD
+
     if (!host || port <= 0 || port > 65535) return -1;
     unsigned i = 0;
     while (i < 253 && host[i]) { MAIL[i] = host[i]; ++i; }
@@ -107,15 +144,21 @@ int lx_tcp_connect(const char *host, int port) {
     MAIL[i] = 0;
     return console_call(25, port);
 }
-int lx_tcp_read(int fd, void *data, int count) {
+static int tcp_receive(int fd, void *data, int count, unsigned flags) {
+    MAIL_GUARD
+
     if (count < 0 || (!data && count)) return -1;
     if (count > 4096) count = 4096;
-    long n = console_call(26, ((unsigned long)(unsigned)fd << 32) | (unsigned)count);
+    long n = console_call(26, ((unsigned long)(unsigned)fd << 32) | flags | (unsigned)count);
     if (n > count) return -1;
     for (int i = 0; i < n; ++i) ((char *)data)[i] = MAIL[i];
     return n;
 }
+int lx_tcp_read(int fd, void *data, int count) { return tcp_receive(fd, data, count, 0); }
+int lx_tcp_peek(int fd, void *data, int count) { return tcp_receive(fd, data, count, 1u << 31); }
 int lx_tcp_write(int fd, const void *data, int count) {
+    MAIL_GUARD
+
     if (count < 0 || (!data && count)) return -1;
     if (count > 4096) count = 4096;
     for (int i = 0; i < count; ++i) MAIL[i] = ((const char *)data)[i];
@@ -124,6 +167,8 @@ int lx_tcp_write(int fd, const void *data, int count) {
 int lx_tcp_close(int fd) { return console_call(28, (unsigned long)(unsigned)fd << 32); }
 
 int lx_random(void *buffer, int count) {
+    MAIL_GUARD
+
     if (count < 0 || (!buffer && count)) return -1;
     unsigned char *p = buffer;
     while (count) {
@@ -139,6 +184,8 @@ int lx_random(void *buffer, int count) {
 unsigned long lx_canvas_size(void) { return console_call(19, 0); }
 int lx_canvas_present(const unsigned *pixels, unsigned x, unsigned y,
                       unsigned width, unsigned height) {
+    MAIL_GUARD
+
     unsigned long *mail = (unsigned long *)0x443d8000UL;
     mail[0] = (unsigned long)pixels;
     mail[1] = x;
@@ -150,6 +197,8 @@ int lx_canvas_present(const unsigned *pixels, unsigned x, unsigned y,
 long lx_canvas_pointer(void) { return console_call(21, 0); }
 
 int lx_save_file(const char *path, const void *data, unsigned length) {
+    MAIL_GUARD
+
     if (!path || (!data && length) || length > 32768 || request(path))
         return -1;
     char *bytes = (char *)0x443d8000UL;
@@ -160,12 +209,16 @@ int lx_save_file(const char *path, const void *data, unsigned length) {
 }
 
 int lx_save_parts(const char *path, unsigned long descriptor) {
+    MAIL_GUARD
+
     return request(path) ? -1 : console_call(22, descriptor);
 }
 
 /* Preserve the legacy descriptor on 32-bit-addressable buffers. The Rust
  * build kernel also accepts a contiguous range in a high user heap. */
 int lx_save_buffer(const char *path, const void *data, unsigned length) {
+    MAIL_GUARD
+
     unsigned parts[] = {length != 0, 0, (unsigned)(unsigned long)data, length};
     if ((unsigned long)data < 0xa0000000UL && (unsigned long)parts < 0xa0000000UL)
         return lx_save_parts(path, (unsigned long)parts << 32 | length);

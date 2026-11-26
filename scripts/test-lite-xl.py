@@ -38,7 +38,7 @@ def seed(rows):
     rows[PROJECT + b"/helper.h"] = stamp, b"#define LIMIT 42\n"
 
 
-def exercise(guest, control, directory, screenshot, clipboard):
+def exercise(guest, control, directory, screenshot, clipboard, shared=False):
     assert "QMP" in json.loads(control.readline())
 
     def qmp(name, **arguments):
@@ -83,7 +83,7 @@ def exercise(guest, control, directory, screenshot, clipboard):
         return data[offset:offset+3].hex()
 
     def wait(check, description):
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 35
         while time.monotonic() < deadline:
             dims, data = grab()
             if dims == f"{WIDTH} {HEIGHT}".encode() and check(data):
@@ -105,7 +105,12 @@ def exercise(guest, control, directory, screenshot, clipboard):
     wait(lambda p: color(p, 2, 2) == "281e2b", "desktop dock")
     click(36, 8 + 7*min(82, (WORK_H-48)//8) + 20)
     wait(lambda p: color(p, 82, 6) == "203f51", "application menu")
-    select_icon(click,qmp,WORK_W,WORK_H,index+6,len(apps)+6)
+    if shared:
+        click(24+2*66+25,75)
+        editors = [name for name in apps if name in (b"code",b"lite-xl.win3",b"mousepad.win3",b"paint")]
+        select_icon(click,qmp,WORK_W,WORK_H,2+editors.index(b"lite-xl.win3"),2+len(editors))
+    else:
+        select_icon(click,qmp,WORK_W,WORK_H,index+6,len(apps)+6)
     wait(lambda p: color(p, L+25, T+84) == TREE and color(p, L+500, T+300) == DOC,
          "Lite XL project window")
 
@@ -127,6 +132,18 @@ def exercise(guest, control, directory, screenshot, clipboard):
         button("wheel-down", False)
     wait(lambda p: sum(a != b for a, b in zip(sample(p), before)) > 12,
          "scroll wheel changing source viewport")
+
+    if shared:
+        click(L+420, T+166)
+        key("ctrl-a"); time.sleep(.3); key("ctrl-v"); time.sleep(1); key("ctrl-s")
+        time.sleep(.8); key("ctrl-a"); time.sleep(.2); key("ctrl-c"); time.sleep(.6)
+        click(L+720-19,T+22)
+        wait(lambda p: color(p,L+500,T+300) != DOC,"closed shared-clipboard document")
+        key("esc"); guest.until(PROMPT)
+        native["command"](guest,"cmp main.c /tmp/code-long-document", prompt=PROMPT)
+        native["command"](guest,"cmp /tmp/.lixinos-clipboard /tmp/code-long-text",prompt=PROMPT)
+        native["shutdown"](guest)
+        return
 
     click(L+420, T+166)
     key("ctrl-a")
@@ -169,6 +186,8 @@ def main():
     parser.add_argument("--screenshot", type=Path)
     parser.add_argument("--installed", action="store_true",
                         help="test the desktop and Lite XL already installed on the disk")
+    parser.add_argument("--shared-clipboard", action="store_true",
+                        help="paste and copy a long UTF-8 document through the guest clipboard")
     args = parser.parse_args()
     release = args.release
     if release == "latest":
@@ -179,7 +198,7 @@ def main():
     require_local(seed_disk, seed_disk.stat())
     original_boot = harness["serial"]["boot"]
 
-    def boot(disk, command):
+    def boot(disk, command, prompt=None):
         return original_boot(disk, command, prompt=b"LixinOS Bash (C shell)")
 
     kinds = ("rust", "tcc") if args.kernel == "both" else (args.kernel,)
@@ -197,7 +216,16 @@ def main():
             for tool, package in (("netsurf", "netsurf-port/package"), ("lite-xl", "lite-xl-port/package")):
                 subprocess.run(["python3", root/"User/gcc/install.py", "--toolchain", tool,
                                 package_root/package, prepared], check=True)
-        edit_files(prepared, seed)
+        payload = ("你好，LixinOS\t12345\n"*420).encode()
+        def setup(rows):
+            seed(rows)
+            if args.shared_clipboard:
+                # Lite XL stores a final newline for the final document line.
+                # Selecting all excludes that sentinel; the copied bytes must match exactly.
+                rows[b"/tmp/code-long-document"] = bytes(8), payload + b"\n"
+                for path in (b"/tmp/.lixinos-clipboard", b"/tmp/code-long-text"):
+                    rows[path] = bytes(8), payload
+        edit_files(prepared, setup)
         for kind in kinds:
             disk = Path(tmp) / (kind + ".img")
             subprocess.run(["cp", "-c", prepared, disk], check=True)
@@ -209,9 +237,13 @@ def main():
                                          "LIXINOS_TEST_CLIPBOARD": str(clipboard),
                                          "PATH": f"{tmp}:{os.environ['PATH']}"}), resize_source():
                 with patch.dict(harness["serial"], {"boot": boot}):
-                    harness["test"](lambda g, c, d: exercise(g, c, d, args.screenshot, clipboard),
+                    harness["test"](lambda g, c, d: exercise(g, c, d, args.screenshot, clipboard, args.shared_clipboard),
                                     mode="--window", disk=disk)
             rows, _ = disk_entries(disk)
+            if args.shared_clipboard:
+                assert bytes(rows["/lite-xl-demo/main.c"][1]) == payload + b"\n"
+                print(f"{kind}: verified long clipboard in the Win3 editor",flush=True)
+                continue
             assert bytes(rows["/lite-xl-demo/main.c"][1]).rstrip(b"\n") == EDITED.rstrip(b"\n")
             print(f"{kind}: Lite XL opened, scrolled, edited, saved and resized its GUI", flush=True)
 

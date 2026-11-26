@@ -1,0 +1,15 @@
+cmake_minimum_required(VERSION 3.20)
+project(nfs2_lixinos C CXX)
+set(CMAKE_CXX_STANDARD 17)
+file(GLOB core "${SOURCE}/src/lib/*.cpp" "${SOURCE}/src/lib/sdl-backend/*.cpp"
+     "${SOURCE}/src/lib/winapi/*.cpp" "${SOURCE}/src/lib/winapi/*/*.cpp")
+list(FILTER core EXCLUDE REGEX "/(renderer|gliderenderer|glidetmu|glide2x)[.]cpp$")
+file(GLOB game "${SOURCE}/src/nfs2se/*.cpp" "${SOURCE}/src/nfs2se/disassembly/*.cpp")
+add_executable(nfs2 ${core} ${game} renderer.cpp platform.c audio.c ../ra2-native/emutls.c)
+target_include_directories(nfs2 PRIVATE "${SOURCE}/include" "${SOURCE}/src/nfs2se/disassembly"
+    "${NEON}" "${SDL}/include" "${SDL_BUILD}/include-config-minsizerel")
+target_compile_options(nfs2 PRIVATE -fno-strict-aliasing -fwrapv)
+target_compile_definitions(nfs2 PRIVATE WITH_MMX _GNU_SOURCE)
+target_link_libraries(nfs2 PRIVATE "${SDL_BUILD}/libSDL2.a")
+target_link_options(nfs2 PRIVATE -Wl,--wrap=__emutls_get_address)
+target_link_options(nfs2 PRIVATE "-Wl,--wrap=clock_gettime")

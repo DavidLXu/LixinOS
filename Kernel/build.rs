@@ -12,7 +12,7 @@ fn source_manifest(dir: &Path, root: &Path, entries: &mut String) {
         if path.is_dir() {
             writeln!(entries, "({guest:?}, None),").unwrap();
             source_manifest(&path, root, entries);
-        } else if matches!(guest.as_str(), "/src/agent/chat.md" | "/src/agent/native.py" | "/src/agent/desktop.py" | "/src/agent/desktop.md") || guest == "/src/games/snake.py" || guest == "/src/links/COPYING" || guest == "/src/ssh/prepare-sunset.py" || guest == "/src/links/prepare.py" || guest == "/src/links/webdeps.py" || guest == "/src/links/events.js" || matches!(
+        } else if matches!(guest.as_str(), "/src/tcc/embed-gui.py" | "/src/agent/chat.md" | "/src/agent/native.py" | "/src/agent/desktop.py" | "/src/agent/desktop.md") || guest == "/src/games/snake.py" || guest == "/src/links/COPYING" || guest == "/src/ssh/prepare-sunset.py" || guest == "/src/links/prepare.py" || guest == "/src/links/webdeps.py" || guest == "/src/links/events.js" || matches!(
             path.extension().and_then(|s| s.to_str()),
             Some("c" | "h" | "ld" | "def" | "rs" | "swift")
         ) || matches!(
@@ -120,8 +120,8 @@ fn main() {
     let cc = fs::read_dir("target/user-build").unwrap().filter_map(Result::ok)
         .map(|entry| entry.path().join("bin/aarch64-none-elf-gcc"))
         .find(|cc| cc.is_file()).unwrap_or_else(|| "aarch64-none-elf-gcc".into());
-    for source in ["smp.c", "smp-arch.S", "gpu.c"] {
-        if source == "gpu.c" && std::env::var_os("CARGO_FEATURE_RETINA").is_none() { continue; }
+    for source in ["smp.c", "vm.c", "swap.c", "identity.c", "record-lock.c", "interp.c", "audio.c", "kthread.c", "smp-arch.S", "gpu.c", "boot-splash.c"] {
+        if matches!(source, "gpu.c" | "boot-splash.c") && std::env::var_os("CARGO_FEATURE_RETINA").is_none() { continue; }
         let object = Path::new(&std::env::var_os("OUT_DIR").unwrap()).join(format!("{source}.o"));
         assert!(Command::new(&cc).args(["-c", "-O2", "-mgeneral-regs-only", "-ffreestanding",
             "-fno-stack-protector", "-fno-builtin", "-o"]).arg(&object)

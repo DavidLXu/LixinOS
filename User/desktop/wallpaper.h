@@ -1,5 +1,8 @@
 /* The Links desktop already links this decoder through links/image.c.
  * NetSurf and the in-guest single-file build only need the PNG/JPEG code. */
+#ifdef LX_NETSURF
+unsigned char *desktop_image_rgba(unsigned char *,int,int,int,int *,int *);
+#else
 #define STBI_NO_STDIO
 #ifndef LX_DESKTOP_BROWSER
 #define STB_IMAGE_STATIC
@@ -15,11 +18,13 @@
 #endif
 #include "../gui/stb_image.h"
 
-static uint32_t *load_wall_image(const char *path, int width, int height)
+#endif
+
+static uint32_t *load_scaled_image(const char *path,int width,int height,int fit)
 {
     const int64_t max_pixels = 16 * 1024 * 1024;
     const long max_compressed = 32L * 1024 * 1024;
-    const uint32_t background = 0x26494cU;
+    const uint32_t background = fit ? PAPER : 0x26494cU;
     static const unsigned char png_signature[8] = {
         0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a
     };
@@ -71,30 +76,29 @@ static uint32_t *load_wall_image(const char *path, int width, int height)
         return NULL;
     }
 
-    int info_w = 0, info_h = 0, info_comp = 0;
-    if (!stbi_info_from_memory(data, data_size, &info_w, &info_h, &info_comp) ||
-        info_w <= 0 || info_h <= 0 ||
-        (int64_t)info_w * info_h > max_pixels) {
-        free(data);
-        return NULL;
-    }
-
-    int src_w = 0, src_h = 0, src_comp = 0;
-    unsigned char *rgba = stbi_load_from_memory(data, data_size,
-                                                &src_w, &src_h, &src_comp, 4);
+    int src_w=0,src_h=0;
+#ifdef LX_NETSURF
+    unsigned char *rgba=desktop_image_rgba(data,data_size,is_png,max_pixels,&src_w,&src_h);
+#else
+    int components=0;
+    unsigned char *rgba=NULL;
+    if (stbi_info_from_memory(data,data_size,&src_w,&src_h,&components) &&
+        src_w>0 && src_h>0 && (int64_t)src_w*src_h<=max_pixels)
+        rgba=stbi_load_from_memory(data,data_size,&src_w,&src_h,&components,4);
+#endif
     free(data);
     if (rgba == NULL)
         return NULL;
     if (src_w <= 0 || src_h <= 0 ||
         (int64_t)src_w * src_h > max_pixels) {
-        stbi_image_free(rgba);
+        free(rgba);
         return NULL;
     }
 
     uint32_t *out = (uint32_t *)malloc((size_t)width * (size_t)height *
                                        sizeof(uint32_t));
     if (out == NULL) {
-        stbi_image_free(rgba);
+        free(rgba);
         return NULL;
     }
 
@@ -102,6 +106,16 @@ static uint32_t *load_wall_image(const char *path, int width, int height)
     int64_t oh = height;
     int64_t sw = src_w;
     int64_t sh = src_h;
+    int pad_x=0,pad_y=0;
+    if (fit) {
+        if (ow*sh>oh*sw) ow=oh*sw/sh;
+        else oh=ow*sh/sw;
+        if (ow<1) ow=1;
+        if (oh<1) oh=1;
+        pad_x=(width-ow)/2;
+        pad_y=(height-oh)/2;
+        for (int i=0;i<width*height;i++) out[i]=background;
+    }
     int width_dominant = (ow * sh >= oh * sw);
     int64_t x_base = 0;
     int64_t y_base = 0;
@@ -114,7 +128,7 @@ static uint32_t *load_wall_image(const char *path, int width, int height)
     unsigned int bg_g = (background >> 8) & 0xffU;
     unsigned int bg_b = background & 0xffU;
 
-    for (int y = 0; y < height; y++) {
+    for (int y = 0; y < oh; y++) {
         int64_t sy;
         if (width_dominant)
             sy = ((int64_t)y * sw + y_base) / ow;
@@ -122,9 +136,9 @@ static uint32_t *load_wall_image(const char *path, int width, int height)
             sy = (int64_t)y * sh / oh;
 
         const unsigned char *src_row = rgba + (size_t)sy * src_w * 4;
-        uint32_t *dst_row = out + (size_t)y * width;
+        uint32_t *dst_row = out + (size_t)(y+pad_y) * width + pad_x;
 
-        for (int x = 0; x < width; x++) {
+        for (int x = 0; x < ow; x++) {
             int64_t sx;
             if (width_dominant)
                 sx = (int64_t)x * sw / ow;
@@ -142,6 +156,10 @@ static uint32_t *load_wall_image(const char *path, int width, int height)
         }
     }
 
-    stbi_image_free(rgba);
+    free(rgba);
     return out;
+}
+
+static uint32_t *load_wall_image(const char *path,int width,int height) {
+    return load_scaled_image(path,width,height,0);
 }

@@ -30,11 +30,14 @@ if [[ ! -x "$build/tools/bin/cvt" ]]; then
 fi
 export PATH="$build/tools/bin:$PATH"
 for diff in "$port/mutter-wayland.patch" "$port/mutter-pixbuf.patch" "$port/mutter-headless.patch" \
-    "$port/mutter-static-plugin.patch" "$port/mutter-static-gvdb.patch" "$port/mutter-display.patch"; do
+    "$port/mutter-static-plugin.patch" "$port/mutter-static-gvdb.patch" "$port/mutter-display.patch" "$port/mutter-spawn.patch" "$port/mutter-keymap.patch" "$port/mutter-keyboard-order.patch" "$port/mutter-single-client.patch"; do
     if ! patch -f -Rs --dry-run -p1 -d "$src" < "$diff" >/dev/null 2>&1; then
         patch -f -s -p1 -d "$src" < "$diff"
     fi
 done
+"$build/cc" -Os -ffunction-sections -fdata-sections -I"$cache/cpython-port/musl-1.2.5/src/process" \
+    -c "$root/User/rust/spawn.c" -o "$build/mutter-spawn.o"
+"${cross[0]}/bin/aarch64-none-elf-ar" rcs "$prefix/lib/liblx-mutter-spawn.a" "$build/mutter-spawn.o"
 install -m 644 "$port/wayland-source.c" "$port/wayland-source.h" "$src/src/wayland/"
 install -m 644 "$port/mutter-display.c" "$src/src/backends/lixin-display.c"
 install -m 644 "$port/mutter-display.h" "$src/src/backends/lixin-display.h"

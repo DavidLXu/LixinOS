@@ -1,0 +1,18 @@
+--- a/store/source/lockbyte.cxx
++++ b/store/source/lockbyte.cxx
+@@ -467,10 +467,11 @@
+             return osl_File_E_OVERFLOW;
+         m_nSize = sal::static_int_cast<sal_uInt32>(uSize);
+ 
+-        m_hFile = hFile;
+-
+-        // Acquire mapping.
+-        return osl_mapFile (hFile, reinterpret_cast<void**>(&m_pAddr), m_nSize, 0, osl_File_MapFlag_RandomAccess);
++        // The caller retains the handle when mapping fails and retries with buffered I/O.
++        result = osl_mapFile (hFile, reinterpret_cast<void**>(&m_pAddr), m_nSize, 0, osl_File_MapFlag_RandomAccess);
++        if (result == osl_File_E_None)
++            m_hFile = hFile;
++        return result;
+     }
+ 
+     /** @see MappedLockBytes::destructor.

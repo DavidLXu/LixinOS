@@ -3,6 +3,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include "../console.h"
+#include "../../Kernel/native/vm.h"
 
 #define BASE 0x78000000UL
 #define LIMIT 0xa0000000UL /* SVC 37 enforces the capacity of the running kernel. */
@@ -29,7 +30,11 @@ static size_t brk_capacity(void) {
 static unsigned char wide_pages[WIDE_SIZE / PAGE / 8];
 static unsigned char extra_pages[EXTRA_SIZE / PAGE / 8];
 // The launcher reserves two MiB above the image for the interpreter's C stack.
+#ifdef LX_DYNAMIC_RUNTIME
+extern char __end_image[] __attribute__((weak));
+#else
 extern char __end_image[];
+#endif
 static unsigned char pages[(LIMIT - BASE) / PAGE / 8];
 static uintptr_t heap_start(void) { return (uintptr_t)__end_image + (2UL << 20); }
 
@@ -91,7 +96,35 @@ static long allocate(struct pool *p, unsigned first, unsigned count) {
     memset(address, 0, (size_t)count * PAGE);
     return (long)address;
 }
-long lx_mmap(long addr, unsigned long bytes, long prot, long flags, long fd) {
+static long page_request(unsigned op, unsigned long addr, unsigned long bytes, long prot,
+                         long flags, long fd, unsigned long offset) {
+    volatile unsigned long *args = (void *)0x443d7000UL;
+    args[0] = addr; args[1] = bytes; args[2] = prot; args[3] = flags;
+    args[4] = fd; args[5] = offset;
+    return console_call(62, op);
+}
+long lx_madvise(uintptr_t addr, unsigned long size, long advice) {
+    if (addr & (PAGE-1)) return -EINVAL;
+    if (advice != MADV_DONTNEED) return -ENOTSUP;
+    if (!size) return 0;
+    if (addr < LX_VM_BASE || addr >= LX_VM_BASE + LX_VM_SIZE) return -ENOMEM;
+    return page_request(LX_VM_DISCARD,addr,size,0,0,-1,0);
+}
+long lx_mprotect(uintptr_t addr, unsigned long size, long prot) {
+    if (addr < LX_VM_BASE || addr >= LX_VM_BASE + LX_VM_SIZE) return -ENOTSUP;
+    return page_request(LX_VM_PROTECT, addr, size, prot, 0, -1, 0);
+}
+long lx_mmap(long addr, unsigned long bytes, long prot, long flags, long fd, unsigned long offset) {
+    static int paged;
+    if (!paged) paged = console_call(62, LX_VM_QUERY) == 1 ? 1 : -1;
+    if (paged > 0) {
+        long type = flags & MAP_TYPE;
+        if (type != MAP_PRIVATE && !(type == MAP_SHARED && (flags & MAP_ANONYMOUS))) return -ENOTSUP;
+        if (flags & ~(MAP_TYPE | MAP_FIXED | MAP_FIXED_NOREPLACE | MAP_ANONYMOUS |
+                      MAP_NORESERVE | MAP_STACK | MAP_DENYWRITE | MAP_POPULATE)) return -ENOTSUP;
+        return page_request(flags & MAP_ANONYMOUS ? LX_VM_MAP : LX_VM_FILE,
+                            addr, bytes, prot, flags, fd, offset);
+    }
     (void)addr;
     if (fd != -1 || (flags & MAP_FIXED_NOREPLACE) ||
         (flags & (MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED)) != (MAP_ANONYMOUS | MAP_PRIVATE) ||
@@ -109,6 +142,8 @@ long lx_mmap(long addr, unsigned long bytes, long prot, long flags, long fd) {
     return allocate(&wide, 0, count);
 }
 long lx_munmap(uintptr_t addr, unsigned long size) {
+    if (addr >= LX_VM_BASE && addr < LX_VM_BASE + LX_VM_SIZE)
+        return page_request(LX_VM_UNMAP, addr, size, 0, 0, -1, 0);
     if (addr % PAGE || !size) return -EINVAL;
     struct pool *p = addr >= WIDE_BASE ? &wide : addr >= secondary.base ? &secondary : &primary;
     uintptr_t limit = p->base + (uintptr_t)p->pages * PAGE;
@@ -126,6 +161,10 @@ long lx_munmap(uintptr_t addr, unsigned long size) {
     return 0;
 }
 long lx_brk(uintptr_t addr) {
+#ifdef LX_DYNAMIC_RUNTIME
+    // mallocng obtains its metadata from a protected mmap on PIE processes.
+    if (!__end_image) return 0;
+#endif
     static uintptr_t end;
     if (!end)
         end = heap_start();

@@ -1,4 +1,4 @@
-//! Single-user Unix stream endpoints and their in-memory address namespace.
+//! Unix stream endpoints and their in-memory address namespace.
 use alloc::{collections::{BTreeMap, VecDeque}, rc::{Rc, Weak}, vec::Vec};
 use core::cell::{RefCell, UnsafeCell};
 use crate::pipe::{self, Reader, Writer};
@@ -25,6 +25,7 @@ pub(crate) struct Endpoint {
     input: Option<ReadEnd>,
     output: Option<WriteEnd>,
     pub peer: usize,
+    pub credentials: [u32;2],
 }
 
 impl Endpoint {
@@ -34,8 +35,8 @@ impl Endpoint {
         let left_data = Rc::new(RefCell::new(Ancillary::default()));
         let right_data = Rc::new(RefCell::new(Ancillary::default()));
         (
-            Self { input: Some((left_read, left_data.clone())), output: Some((left_write, right_data.clone())), peer: right },
-            Self { input: Some((right_read, right_data)), output: Some((right_write, left_data)), peer: left },
+            Self { input: Some((left_read, left_data.clone())), output: Some((left_write, right_data.clone())), peer: right, credentials: crate::permissions::effective_ids() },
+            Self { input: Some((right_read, right_data)), output: Some((right_write, left_data)), peer: left, credentials: crate::permissions::effective_ids() },
         )
     }
 
@@ -96,6 +97,7 @@ impl Drop for Endpoint {
 
 pub(crate) struct Listener {
     pub pid: usize,
+    credentials: [u32;2],
     pub backlog: usize,
     pub pending: VecDeque<Endpoint>,
 }
@@ -112,7 +114,7 @@ pub(crate) fn bind(name: &[u8], pid: usize) -> Result<Rc<RefCell<Listener>>, i64
     names.retain(|_, slot| slot.strong_count() != 0);
     if names.contains_key(name) { return Err(-98); }
     if names.len() == LIMIT { return Err(-105); }
-    let listener = Rc::new(RefCell::new(Listener { pid, backlog: 0, pending: VecDeque::new() }));
+    let listener = Rc::new(RefCell::new(Listener { pid, credentials:crate::permissions::effective_ids(), backlog: 0, pending: VecDeque::new() }));
     names.insert(name.to_vec(), Rc::downgrade(&listener));
     Ok(listener)
 }
@@ -123,7 +125,8 @@ pub(crate) fn connect(name: &[u8], pid: usize) -> Result<Endpoint, i64> {
     let mut listener = listener.borrow_mut();
     if listener.backlog == 0 { return Err(-111); }
     if listener.pending.len() >= listener.backlog { return Err(-11); }
-    let (client, server) = Endpoint::pair(pid, listener.pid);
+    let (mut client, server) = Endpoint::pair(pid, listener.pid);
+    client.credentials=listener.credentials;
     listener.pending.push_back(server);
     Ok(client)
 }

@@ -23,6 +23,19 @@ const STATUS_CLOCK: u32 = 0xd4e3ff;
 #[cfg(feature = "split")]
 const WIDE_FOCUS: usize = 39 * CW;
 const FONT: &[u8; 95 * CW * CH] = include_bytes!(concat!(env!("OUT_DIR"), "/font.gray"));
+// Published once after mounting the boot disk. Early boot uses the linked atlas.
+type ConsoleAtlas = [u8; 95 * CW * CH];
+static DISK_FONT: core::sync::atomic::AtomicPtr<ConsoleAtlas> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+pub fn load_console_font(file: &crate::disk::FileData) {
+    if file.len() == core::mem::size_of::<ConsoleAtlas>() {
+        if let Ok(bytes) = file.try_as_slice() {
+            let owned = alloc::boxed::Box::into_raw(bytes.to_vec().into_boxed_slice()) as *mut ConsoleAtlas;
+            DISK_FONT.store(owned, core::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 #[repr(align(4096))]
 struct Frame([u32; W * H]);
 // QEMU scans out from this page-aligned physical allocation for the entire boot.
@@ -174,7 +187,9 @@ fn glyph(fb: &mut [u32], offset: usize, width: usize, byte: u8, fg: u32, bg: u32
 }
 
 fn glyph_at(fb: &mut [u32], stride: usize, offset: usize, width: usize, byte: u8, fg: u32, bg: u32) {
-    let glyph = &FONT[(byte - 32) as usize * CW * CH..];
+    // The boot-time allocation lives for the lifetime of the kernel.
+    let atlas = unsafe { DISK_FONT.load(core::sync::atomic::Ordering::Acquire).as_ref() }.unwrap_or(FONT);
+    let glyph = &atlas[(byte - 32) as usize * CW * CH..];
     for row in 0..CH {
         let start = offset + row * stride;
         for (x, p) in fb[start..start + width].iter_mut().enumerate() {
@@ -283,6 +298,10 @@ impl Terminal {
     }
 }
 pub fn put(byte: u8) -> bool {
+    if let Some(log) = unsafe { (&mut *addr_of_mut!(BOOT_LOG)).as_mut() } {
+        log.push(byte);
+        return true; // The caller still mirrors boot diagnostics to the UART.
+    }
     let id = crate::scheduler::terminal_id();
     if id != 0 && popup::write_hidden_tab(id, byte) {
         return false;
@@ -337,10 +356,22 @@ fn focus_label(bar: &mut [u32]) {
 struct Keyboard {
     dev: VirtIOInput<Dma, MmioTransport<'static>>,
     modifiers: u8,
+    navigation_keys: u8,
     caps: bool,
     pending: &'static [u8],
 }
 static mut KEYBOARD: Option<Keyboard> = None;
+unsafe extern "C" {
+    fn boot_splash_begin(fb: *mut u32, stride: u32, width: u32, height: u32);
+    fn boot_splash_tick();
+    fn boot_splash_end();
+}
+static mut BOOT_LOG: Option<alloc::vec::Vec<u8>> = None;
+
+pub fn boot_tick() {
+    unsafe { boot_splash_tick(); }
+}
+
 pub fn init() {
     let layout = core::alloc::Layout::new::<Frame>();
     unsafe {
@@ -348,6 +379,27 @@ pub fn init() {
         if FB.is_null() { alloc::alloc::handle_alloc_error(layout); }
     }
     display::init();
+    unsafe {
+        let size = display::size();
+        boot_splash_begin(FB.cast(), W as u32, size.width as u32, size.height as u32);
+        BOOT_LOG = Some(alloc::vec::Vec::new());
+        init_tablet();
+        let transport =
+            MmioTransport::new(NonNull::new(0x0a00_0200 as *mut _).unwrap(), 512).unwrap();
+        *addr_of_mut!(KEYBOARD) = Some(Keyboard {
+            dev: VirtIOInput::new(transport).unwrap(),
+            modifiers: 0,
+            navigation_keys: 0,
+            caps: false,
+            pending: &[],
+        });
+    }
+    crate::clipboard::init();
+}
+
+pub fn finish_boot() {
+    let Some(log) = (unsafe { (&mut *addr_of_mut!(BOOT_LOG)).take() }) else { return; };
+    unsafe { boot_splash_end(); }
     unsafe {
         let fb = &mut (*FB).0;
         fb.fill(BG);
@@ -359,17 +411,11 @@ pub fn init() {
             }
         }
         start_status();
-        init_tablet();
-        let transport =
-            MmioTransport::new(NonNull::new(0x0a00_0200 as *mut _).unwrap(), 512).unwrap();
-        *addr_of_mut!(KEYBOARD) = Some(Keyboard {
-            dev: VirtIOInput::new(transport).unwrap(),
-            modifiers: 0,
-            caps: false,
-            pending: &[],
-        });
     }
-    crate::clipboard::init();
+    for byte in log { put(byte); }
+    let size = display::size();
+    display::damage(0, 0, size.width, size.height);
+    display::refresh();
 }
 #[cfg(not(feature = "split"))]
 static mut KEY_INPUT: alloc::collections::VecDeque<u8> = alloc::collections::VecDeque::new();
@@ -402,11 +448,17 @@ fn hardware_key() -> Option<u8> {
         if e.event_type != 1 {
             continue;
         }
+        let navigation = match e.code {
+            103 => 1, 108 => 2, 105 => 4, 106 => 8, 57 => 16, _ => 0,
+        };
+        if e.value == 0 { k.navigation_keys &= !navigation; } else { k.navigation_keys |= navigation; }
         let mask = match e.code {
             42 => 1,
             54 => 2,
             29 => 4,
             97 => 8,
+            56 => 16,
+            100 => 32,
             _ => 0,
         };
         if mask != 0 {
@@ -557,20 +609,19 @@ fn memory_value(bytes: usize) -> alloc::string::String {
 }
 
 fn ram_value(used: usize) -> alloc::string::String {
-    const MIB: usize = 1 << 20;
-    const GIB: usize = 1 << 30;
+    // One tenth of a decimal megabyte, rounded to the nearest tenth.
+    let tenths = |bytes: usize| bytes / 100_000 + usize::from(bytes % 100_000 >= 50_000);
+    let used = tenths(used);
     let Some(total) = crate::inspect::ram_size() else {
-        return alloc::format!("{}/--", memory_value(used));
+        return alloc::format!("{}.{}/--MB", used / 10, used % 10);
     };
-    let (unit, suffix) = if total >= GIB { (GIB, "GiB") } else { (MIB, "MiB") };
-    let used = (used * 10 + unit / 2) / unit;
-    let total = (total * 10 + unit / 2) / unit;
+    let total = tenths(total);
     let capacity = if total % 10 == 0 {
         alloc::format!("{}", total / 10)
     } else {
         alloc::format!("{}.{}", total / 10, total % 10)
     };
-    alloc::format!("{}.{}/{capacity}{suffix}", used / 10, used % 10)
+    alloc::format!("{}.{}/{capacity}MB", used / 10, used % 10)
 }
 
 fn disk_value(usage: StorageUsage) -> alloc::string::String {
@@ -597,6 +648,7 @@ fn start_status() {
     draw_status(None);
 }
 pub fn sample() {
+    if unsafe { (&*addr_of!(BOOT_LOG)).is_some() } { boot_tick(); return; }
     display::refresh();
     let u = unsafe { &mut *addr_of_mut!(USAGE) };
     let now = crate::monitor::cpu_counters();
@@ -610,12 +662,6 @@ pub fn sample() {
 
 fn draw_status(cpu: Option<u64>) {
     display::damage(0, 0, W, CH);
-    let stack = crate::monitor::kernel_stack_usage().map_or_else(|| "--".into(), |(used, total)| {
-        let used = memory_value(used);
-        let total = memory_value(total);
-        let unit = if total.ends_with("MiB") { "MiB" } else { "KiB" };
-        alloc::format!("{}/{total}", used.strip_suffix(unit).unwrap_or(&used))
-    });
     let (heap, _) = crate::monitor::heap_usage();
     // User images and process stacks are charged to the heap.
     let kernel_span = crate::monitor::kernel_span_bytes();
@@ -630,7 +676,6 @@ fn draw_status(cpu: Option<u64>) {
         ("CPU", cpu, 0x8fbef4),
         ("RAM", ram_value(kernel_span + heap), 0x77d5d2),
         ("HEAP", memory_value(heap), 0xc6aef2),
-        ("STACK", stack, 0xe4b4aa),
         ("FILES", files, 0xa9d295),
         ("DISK", disk, 0xf0c47a),
     ];
@@ -714,6 +759,7 @@ struct Pointer {
     left: bool,
     right: bool,
     right_press: bool,
+    middle: bool,
     wheel: i32,
     suppress: bool,
     cancel: bool,
@@ -735,6 +781,7 @@ fn init_tablet() {
             left: false,
             right: false,
             right_press: false,
+            middle: false,
             wheel: 0,
             suppress: false,
             cancel: false,
@@ -758,6 +805,7 @@ impl Pointer {
                     self.right_press |= down && !self.right;
                     self.right = down;
                 }
+                (1, 274) => self.middle = e.value != 0,
                 (2, 8) => self.wheel = (e.value as i32).signum(),
                 (0, 0) => {
                     self.position = Some((self.x, self.y));
@@ -768,7 +816,6 @@ impl Pointer {
                     let local_x = x.saturating_sub(left).min(pane_width() - 1) / 2;
                     let local_y = y.saturating_sub(CH).min(canvas_h() * 2 - 1) / 2;
                     let wheel = core::mem::take(&mut self.wheel);
-                    let mods = unsafe { (&*addr_of!(KEYBOARD)).as_ref().map_or(0, |k| k.modifiers) };
                     return Some(
                         local_x as u64
                             | ((local_y as u64) << 12)
@@ -776,8 +823,9 @@ impl Pointer {
                             | (u64::from(inside) << 25)
                             | (u64::from(wheel > 0) << 26)
                             | (u64::from(wheel < 0) << 27)
-                            | (u64::from(mods & 3 != 0) << 32)
-                            | (u64::from(mods & 12 != 0) << 33)
+                            | (input_modifiers() << 32)
+                            | (u64::from(self.right) << 35)
+                            | (u64::from(self.middle) << 36)
                             | if core::mem::take(&mut self.right_press) { edit_menu::RIGHT_PRESS } else { 0 },
                     );
                 }
@@ -809,6 +857,15 @@ pub fn canvas_size() -> u64 {
         return 0;
     }
     canvas_w() as u64 | ((canvas_h() as u64) << 16)
+}
+/// Held Up, Down, Left, Right and Space on the focused foreground canvas.
+pub fn canvas_navigation_keys() -> u64 {
+    if !pointer_focused() || !tab_input_allowed() { return u64::MAX; }
+    unsafe { (&*addr_of!(KEYBOARD)).as_ref().map_or(u64::MAX, |k| u64::from(k.navigation_keys)) }
+}
+pub fn input_modifiers() -> u64 {
+    let mods = unsafe { (&*addr_of!(KEYBOARD)).as_ref().map_or(0, |k| k.modifiers) };
+    u64::from(mods & 3 != 0) | (u64::from(mods & 12 != 0) << 1) | (u64::from(mods & 48 != 0) << 2)
 }
 fn read_pointer() -> u64 {
     if !pointer_focused() { return u64::MAX; }

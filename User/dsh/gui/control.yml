@@ -1,0 +1,3 @@
+- insert:
+    - id: lixinos-window-controls
+      name: /lib/dsh-gui/control.mjs

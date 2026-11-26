@@ -1,0 +1,62 @@
+--- a/sources/shiboken6/libshiboken/CMakeLists.txt
++++ b/sources/shiboken6/libshiboken/CMakeLists.txt
+@@ -102,7 +102,7 @@
+ # Note: This must be set on the cpp file!
+ set_property(SOURCE "pep384impl.cpp" PROPERTY SKIP_UNITY_BUILD_INCLUSION ON)
+ 
+-add_library(libshiboken SHARED ${libshiboken_SRC})
++add_library(libshiboken STATIC ${libshiboken_SRC})
+ add_library(Shiboken6::libshiboken ALIAS libshiboken)
+ 
+ target_include_directories(libshiboken PUBLIC
+--- a/sources/shiboken6/shibokenmodule/CMakeLists.txt
++++ b/sources/shiboken6/shibokenmodule/CMakeLists.txt
+@@ -25,7 +25,7 @@
+     COMMENT "Running generator for 'Shiboken'..."
+ )
+ 
+-add_library(shibokenmodule MODULE ${sample_SRC})
++add_library(shibokenmodule STATIC ${sample_SRC})
+ target_include_directories(shibokenmodule PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+                                                   ${CMAKE_SOURCE_DIR})
+ 
+--- a/sources/pyside6/libpyside/CMakeLists.txt
++++ b/sources/pyside6/libpyside/CMakeLists.txt
+@@ -89,7 +89,7 @@
+ set(other_files ${pyside_folder_py_files} ${setup_folder_py_files})
+ add_other_files(${other_files})
+ 
+-add_library(pyside6 SHARED ${libpyside_SRC} ${other_files})
++add_library(pyside6 STATIC ${libpyside_SRC} ${other_files})
+ add_library(PySide6::pyside6 ALIAS pyside6)
+ 
+ #does nothing if QFP_NO_OVERRIDE_OPTIMIZATION_FLAGS (no-size-optimization) flag is not set
+--- a/sources/pyside6/cmake/Macros/PySideModules.cmake
++++ b/sources/pyside6/cmake/Macros/PySideModules.cmake
+@@ -258,7 +258,7 @@
+                         COMMENT "Running generator for ${module_NAME}...")
+ 
+     include_directories(${module_NAME} ${${module_INCLUDE_DIRS}} ${pyside6_SOURCE_DIR})
+-    add_library(${module_NAME} MODULE ${${module_SOURCES}}
++    add_library(${module_NAME} STATIC ${${module_SOURCES}}
+                                       ${${module_STATIC_SOURCES}})
+ 
+     append_size_optimization_flags(${module_NAME})
+--- a/sources/pyside6/cmake/PySideHelpers.cmake
++++ b/sources/pyside6/cmake/PySideHelpers.cmake
+@@ -148,12 +148,12 @@
+     # this is needed to avoid including the wrapper specific to macOS when building for Android
+     # from a macOS host
+     if(NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
+-        if(CMAKE_HOST_APPLE)
++        if(APPLE)
+             set(ENABLE_MAC "1")
+-        elseif(CMAKE_HOST_WIN32)
++        elseif(WIN32)
+             set(ENABLE_WIN "1")
+             set(ENABLE_UNIX "0")
+-        elseif(NOT CMAKE_HOST_UNIX)
++        elseif(NOT UNIX)
+             message(FATAL_ERROR "OS not supported")
+         endif()
+     endif()

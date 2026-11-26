@@ -1,0 +1,26 @@
+--- a/vcl/unx/generic/glyphs/freetype_glyphcache.cxx
++++ b/vcl/unx/generic/glyphs/freetype_glyphcache.cxx
+@@ -98,6 +98,10 @@
+     }
+ }
+ 
++#ifdef __lixinos__
++extern "C" void *lx_writer_map_readonly(int, size_t, off_t);
++#endif
++
+ bool FreetypeFontFile::Map()
+ {
+     if (mnRefCount++ == 0)
+@@ -128,8 +132,12 @@
+             return false;
+         }
+         mnFileSize = aStat.st_size;
++#ifdef __lixinos__
++        mpFileMap = static_cast<unsigned char *>(lx_writer_map_readonly(nFile, mnFileSize, 0));
++#else
+         mpFileMap = static_cast<unsigned char*>(
+             mmap( nullptr, mnFileSize, PROT_READ, MAP_SHARED, nFile, 0 ));
++#endif
+         if( mpFileMap == MAP_FAILED )
+         {
+             SAL_WARN("vcl.unx.freetype", "mmap of '" << maNativeFileName << "' failed: " << strerror(errno));

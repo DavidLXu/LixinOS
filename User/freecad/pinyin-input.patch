@@ -1,0 +1,10 @@
+--- a/src/Main/CMakeLists.txt
++++ b/src/Main/CMakeLists.txt
+@@ -175,3 +175,7 @@
+         )
+     endif(WIN32)
+ endif(BUILD_GUI)
++
++if(TARGET FreeCADMain AND LIXINOS_QT_PINYIN_SOURCE)
++    target_sources(FreeCADMain PRIVATE "${LIXINOS_QT_PINYIN_SOURCE}")
++endif()

@@ -272,7 +272,10 @@ impl Connections {
             *slot = None;
             return 0;
         }
-        let Some(data) = mail.get_mut(..value as u32 as usize) else {
+        // The top bit of the read size requests a non-consuming TCP read.
+        let peek = op == 26 && value as u32 & (1 << 31) != 0;
+        let size = if peek { value as u32 & !(1 << 31) } else { value as u32 };
+        let Some(data) = mail.get_mut(..size as usize) else {
             return -1;
         };
         if data.is_empty() {
@@ -281,7 +284,13 @@ impl Connections {
         net.poll(now());
         let s = net.sockets.get_mut::<tcp::Socket>(h);
         if op == 26 {
-            match s.recv_slice(data) {
+            let received = if peek && s.can_recv() {
+                s.peek_slice(data)
+            } else {
+                // With an empty receive queue, recv_slice distinguishes EOF and reset.
+                s.recv_slice(data)
+            };
+            match received {
                 Ok(0) => -2,
                 Ok(n) => n as i64,
                 Err(tcp::RecvError::Finished) => 0,

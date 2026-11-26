@@ -1,0 +1,26 @@
+--- a/content/shell/BUILD.gn
++++ b/content/shell/BUILD.gn
+@@ -502,6 +502,23 @@
+         "//ui/views/controls/webview",
+         "//ui/wm:test_support",
+       ]
++      if (shell_minimal) {
++        # Desktop Aura needs the widget delegates, while its focus test clients
++        # and compositor fixtures belong to the alternate shell implementation.
++        deps -= [
++          "//ui/aura:test_support",
++          "//ui/views:test_support",
++          "//ui/wm:test_support",
++        ]
++        sources -= [
++          "browser/shell_platform_data_aura.cc",
++          "browser/shell_platform_data_aura.h",
++        ]
++        sources += [
++          "//ui/views/test/desktop_test_views_delegate_aura.cc",
++          "//ui/views/test/test_views_delegate_aura.cc",
++        ]
++      }
+     } else {
+       sources += [
+         "browser/shell_platform_delegate_aura.cc",

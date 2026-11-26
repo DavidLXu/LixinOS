@@ -50,8 +50,11 @@ static int exchange(struct gpu_header *cmd, u32 size, u32 type, u32 ctx,
                     u32 expected, u32 response_size) {
     if (!active) return 0;
     cmd->type = type;
-    cmd->flags = 1;
-    cmd->fence = ++fence;
+    /* A 2D scanout upload is followed on this queue by a fenced FLUSH.
+     * Wait for its command response here and for GPU completion at FLUSH. */
+    int fenced = type != TRANSFER;
+    cmd->flags = fenced;
+    cmd->fence = fenced ? ++fence : 0;
     cmd->context = ctx;
     cmd->padding = 0;
     reply.display.header.type = 0;
@@ -74,7 +77,7 @@ static int exchange(struct gpu_header *cmd, u32 size, u32 type, u32 ctx,
     BARRIER();
     unsigned slot = control.seen++ % Q;
     return control.used.ring[slot].id == 0 && control.used.ring[slot].len >= response_size &&
-           reply.display.header.type == expected && reply.display.header.fence == fence;
+           reply.display.header.type == expected && (!fenced || reply.display.header.fence == fence);
 }
 static int command(u32 type, u32 ctx, u32 body_size) {
     return exchange(&request.header, sizeof(request.header) + body_size, type, ctx, OK,
@@ -181,6 +184,9 @@ void gpu_refresh(void) {
     if (!active || !dirty.w) return;
     u64 now = smp_ticks();
     if (now - last_flush < interval) return;
+    /* Pace frame starts. The synchronous upload and flush consume part of
+     * this frame's budget, especially on a VirGL host. */
+    last_flush = now;
     if (scanout != framebuffer) {
         for (u32 y = dirty.y; y < dirty.y + dirty.h; ++y)
             memcpy(scanout + y * width + dirty.x, framebuffer + y * pitch + dirty.x, dirty.w * 4);
@@ -194,7 +200,6 @@ void gpu_refresh(void) {
     request.body.flush.id = resource;
     request.body.flush.padding = 0;
     if (send_command(FLUSH, sizeof(request.body.flush))) dirty.w = 0;
-    last_flush = smp_ticks();
 }
 
 enum { CTX_CREATE = 0x200, CTX_DESTROY, CTX_ATTACH, CTX_DETACH, CREATE_3D,

@@ -1,0 +1,18 @@
+--- a/modules/pam_unix/passverify.c
++++ b/modules/pam_unix/passverify.c
+@@ -251,6 +251,16 @@
+ 				return PAM_AUTHINFO_UNAVAIL;
+ #else
++#ifdef __lixinos__
++			/* The display manager is already privileged. The kernel
++			 * enforces shadow-file permissions at open time. */
++			if (geteuid() == 0) {
++				*spwdent = pam_modutil_getspnam(pamh, name);
++				if (!*spwdent || !(*spwdent)->sp_pwdp)
++					return PAM_AUTHINFO_UNAVAIL;
++				return PAM_SUCCESS;
++			}
++#endif
+ 			/*
+ 			 * The helper has to be invoked to deal with
+ 			 * the shadow password file entry.

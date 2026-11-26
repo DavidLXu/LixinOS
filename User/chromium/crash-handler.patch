@@ -1,0 +1,25 @@
+--- a/components/crash/core/app/BUILD.gn
++++ b/components/crash/core/app/BUILD.gn
+@@ -7,6 +7,11 @@
+ 
+ import("//base/debug/debug.gni")
+ import("//components/gwp_asan/buildflags/buildflags.gni")
++
++declare_args() {
++  # Embed a separate Linux handler when the application offers crash reporting.
++  bundle_linux_crashpad_handler = true
++}
+ 
+ if (is_android) {
+   import("//build/config/android/config.gni")
+@@ -87,7 +92,9 @@
+ 
+   if (is_linux || is_chromeos) {
+     sources += [ "crashpad_linux.cc" ]
+-    data_deps = [ ":chrome_crashpad_handler" ]
++    if (bundle_linux_crashpad_handler) {
++      data_deps = [ ":chrome_crashpad_handler" ]
++    }
+   }
+ 
+   if (is_ios) {

@@ -1,0 +1,100 @@
+--- a/bridges/source/cpp_uno/shared/vtablefactory.cxx
++++ b/bridges/source/cpp_uno/shared/vtablefactory.cxx
+@@ -105,11 +105,13 @@
+     if (p == MAP_FAILED) {
+         p = nullptr;
+     }
++    #ifndef __lixinos__
+     else if (mprotect (p, n, PROT_READ | PROT_WRITE | PROT_EXEC) == -1)
+     {
+         munmap (p, n);
+         p = nullptr;
+     }
++    #endif
+ #if defined MACOSX
+ done:
+ #endif
+--- a/bridges/source/cpp_uno/gcc3_linux_aarch64/cpp2uno.cxx
++++ b/bridges/source/cpp_uno/gcc3_linux_aarch64/cpp2uno.cxx
+@@ -475,6 +475,29 @@
+ 
+ namespace {
+ 
++#ifdef __lixinos__
++extern "C" {
++extern const unsigned char lx_writer_uno_slots[];
++sal_Int32 lx_writer_uno_arguments[8192][2];
++}
++constexpr std::size_t codeSnippetSize = 0;
++// getVtables() holds the factory mutex while constructing and publishing the vtable.
++const unsigned char * staticSlot(sal_Int32 function, sal_Int32 offset)
++{
++    static unsigned count;
++    unsigned i = 0;
++    while (i < count && (lx_writer_uno_arguments[i][0] != function ||
++                         lx_writer_uno_arguments[i][1] != offset))
++        ++i;
++    if (i == count) {
++        if (count == 8192) throw std::bad_alloc();
++        lx_writer_uno_arguments[i][0] = function;
++        lx_writer_uno_arguments[i][1] = offset;
++        ++count;
++    }
++    return lx_writer_uno_slots + i * 8;
++}
++#else
+ std::size_t const codeSnippetSize = 8 * 4;
+ 
+ unsigned char * generateCodeSnippet(
+@@ -500,6 +523,7 @@
+         = reinterpret_cast<unsigned long>(&vtableSlotCall);
+     return code + codeSnippetSize;
+ }
++#endif
+ 
+ }
+ 
+@@ -557,20 +581,32 @@
+                     = reinterpret_cast<
+                         typelib_InterfaceAttributeTypeDescription *>(td);
+                 // Getter:
++#ifdef __lixinos__
++                (s++)->fn = staticSlot(functionOffset++, vtableOffset);
++#else
+                 (s++)->fn = code + writetoexecdiff;
+                 code = generateCodeSnippet(
+                     code, functionOffset++, vtableOffset);
++#endif
+                 // Setter:
+                 if (!atd->bReadOnly) {
++#ifdef __lixinos__
++                    (s++)->fn = staticSlot(functionOffset++, vtableOffset);
++#else
+                     (s++)->fn = code + writetoexecdiff;
+                     code = generateCodeSnippet(
+                         code, functionOffset++, vtableOffset);
++#endif
+                 }
+                 break;
+             }
+         case typelib_TypeClass_INTERFACE_METHOD:
++#ifdef __lixinos__
++            (s++)->fn = staticSlot(functionOffset++, vtableOffset);
++#else
+             (s++)->fn = code + writetoexecdiff;
+             code = generateCodeSnippet(code, functionOffset++, vtableOffset);
++#endif
+             break;
+         default:
+             assert(false);
+@@ -583,7 +619,9 @@
+ void bridges::cpp_uno::shared::VtableFactory::flushCode(
+     unsigned char const * begin, unsigned char const * end)
+ {
+-#if !defined ANDROID && !defined MACOSX
++#if defined __lixinos__
++    (void)begin; (void)end;
++#elif !defined ANDROID && !defined MACOSX
+    static void (*clear_cache)(unsigned char const *, unsigned char const *)
+        = (void (*)(unsigned char const *, unsigned char const *)) dlsym(
+            RTLD_DEFAULT, "__clear_cache");

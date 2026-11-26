@@ -12,13 +12,16 @@ enum { CLIENT_EVENTS = 64 };
 typedef struct {
     int pid, input, output, stopping;
     unsigned received, clipboard_bytes, header_bytes, scratch_capacity, encoded_capacity;
-    int adaptive, extended, right_click, configuring, target_w, target_h, width, height;
+    int adaptive, extended, right_click, modifiers, toggle_fullscreen, configuring, target_w, target_h, width, height;
     unsigned interval;
     long next_tick, close_deadline;
     const char *error;
     WindowReply reply;
+    char title[200];
+    int sending_title, title_changed, sending_url, url_ready;
     char clipboard[WINDOW_CLIENT_CLIPBOARD_MAX];
-    char paste[WINDOW_CLIENT_CLIPBOARD_MAX];
+    char paste[WINDOW_CLIENT_CLIPBOARD_MAX], drop_path[513];
+    int accepts_files, drop_queued;
     unsigned short *pixels, *scratch, *encoded;
     int busy, ready, head, count, sent, overflow, paste_queued;
     long close_requested_at;
@@ -123,6 +126,16 @@ static void client_collect_paste(WindowClient *c) {
     c->paste_queued = 1;
 }
 
+static int client_drop_file(WindowClient *c,const char *path) {
+    size_t n=strlen(path);
+    if (!c->accepts_files || c->drop_queued || c->stopping || c->count==CLIENT_EVENTS ||
+        !n || n>=sizeof c->drop_path) return 0;
+    memcpy(c->drop_path,path,n);
+    c->drop_queued=1;
+    client_event(c,(WindowEvent){.type=WINDOW_CLIENT_FILE_DROP,.value=n});
+    return 1;
+}
+
 static void client_shutdown(WindowClient *client) {
     if (!client->pid) return;
     client_close(client);
@@ -142,6 +155,22 @@ static int prepare_patch(WindowClient *c) {
         return 0;
     }
     unsigned bytes = (unsigned)u.w * u.h * sizeof *c->scratch;
+    if (c->extended) {
+        c->modifiers = !!(c->reply.encoded_size & WINDOW_CLIENT_WANT_MODIFIERS);
+        c->toggle_fullscreen |= !!(c->reply.encoded_size & WINDOW_CLIENT_FULLSCREEN);
+        c->accepts_files = !!(c->reply.encoded_size & WINDOW_CLIENT_ACCEPT_FILES);
+        c->sending_title = !!(c->reply.encoded_size & WINDOW_CLIENT_WINDOW_TITLE);
+        c->sending_url = !!(c->reply.encoded_size & WINDOW_CLIENT_OPEN_URL);
+        if (c->sending_url && (c->sending_title || c->reply.clipboard_size >= sizeof c->clipboard)) {
+            c->error = "Invalid browser request";
+            return 0;
+        }
+        if (c->sending_title && c->reply.clipboard_size >= sizeof c->title) {
+            c->error = "Application sent an overlong title";
+            return 0;
+        }
+        c->reply.encoded_size &= ~(WINDOW_CLIENT_WANT_MODIFIERS | WINDOW_CLIENT_FULLSCREEN | WINDOW_CLIENT_WINDOW_TITLE | WINDOW_CLIENT_ACCEPT_FILES | WINDOW_CLIENT_OPEN_URL);
+    }
     unsigned encoded = c->reply.encoded_size;
     if (encoded && (encoded % 4 || encoded >= bytes)) {
         c->error = "Application sent an invalid encoded redraw";
@@ -199,7 +228,15 @@ static int commit_patch(WindowClient *c) {
         c->close_requested_at = 0;
         c->confirm_force_close = 0;
     }
-    if (c->reply.clipboard_size)
+    if (c->sending_url) {
+        c->clipboard[c->reply.clipboard_size] = 0;
+        c->url_ready = strlen(c->clipboard) == c->reply.clipboard_size &&
+            (!strncmp(c->clipboard,"https://",8) || !strncmp(c->clipboard,"http://",7));
+    } else if (c->sending_title) {
+        memcpy(c->title,c->clipboard,c->reply.clipboard_size);
+        c->title[c->reply.clipboard_size]=0;
+        c->title_changed=1;
+    } else if (c->reply.clipboard_size)
         lx_copy_text(c->clipboard, c->reply.clipboard_size);
     if (!u.w) return 0;
     if (u.w == c->target_w && u.h == c->target_h) {
@@ -275,20 +312,23 @@ static int client_tick(WindowClient *client, int visible) {
     }
     if (!client->count) return 0;
     WindowEvent *event = &client->events[client->head];
-    int length = sizeof *event + (event->type == WINDOW_CLIENT_PASTE ? event->value : 0);
+    const char *payload = event->type==WINDOW_CLIENT_PASTE ? client->paste :
+                          event->type==WINDOW_CLIENT_FILE_DROP ? client->drop_path : NULL;
+    int length = sizeof *event + (payload ? event->value : 0);
     /* Both guest kernels guarantee one writable byte after poll on this
      * single-writer pipe. TCC's blocking write waits for the entire count. */
     for (int budget = 128; client->sent < length && budget; --budget) {
         int ready = lx_poll(client->input, LX_WRITABLE, 0);
         if (ready <= 0) return ready;
         const char *byte = client->sent < (int)sizeof *event ? (const char *)event + client->sent :
-                           client->paste + (client->sent - sizeof *event);
+                           payload + (client->sent - sizeof *event);
         if (lx_write(client->input, byte, 1) != 1) return -1;
         ++client->sent;
     }
     if (client->sent < length) return 0;
     client->sent = 0;
     if (event->type == WINDOW_CLIENT_PASTE) client->paste_queued = 0;
+    if (event->type == WINDOW_CLIENT_FILE_DROP) client->drop_queued = 0;
     client->awaiting_close_reply = event->type == WINDOW_CLIENT_CLOSE;
     client->configuring = event->type == WINDOW_CLIENT_CONFIGURE;
     if (client->configuring) {

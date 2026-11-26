@@ -1,0 +1,5 @@
+--- a/idl/source/objects/types.cxx
++++ b/idl/source/objects/types.cxx
+@@ -253,1 +253,1 @@
+-    rOutStm.WriteOString( "__attribute__((__weak__))" ) << endl;
++    rOutStm.WriteOString( "extern __attribute__((__weak__))" ) << endl;

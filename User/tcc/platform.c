@@ -74,6 +74,10 @@ enum { HEADER_COUNT = sizeof(paths) / sizeof(paths[0]), HEADER_FD = 32 };
 int _open(const char *path, int flags, ...) {
     if (flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND)) { errno = EROFS; return -1; }
 #if defined(LX_COMPILER) || defined(LX_SAVED_RUNTIME)
+    if (!strcmp(path, "/include/lixin-gui.h")) {
+        int fd = lx_open("/src/gui/lixin-gui.h");
+        if (fd >= 0) return fd;
+    }
     for (int i = 0; i < HEADER_COUNT; ++i) {
         if (!strcmp(path, paths[i]) && offsets[i] < 0) { offsets[i] = 0; return i + HEADER_FD; }
     }

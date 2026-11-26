@@ -1,16 +1,27 @@
 # Desktop window applications
 
 Run `desktop` in a graphical shell. **Apps** in the dock (or Ctrl+G) opens
-a full-screen application grid. Scroll with the wheel or drag vertically, filter
+a full-screen application grid. Choose **终端** for installed CLI tools such as Codex or Python. Clicking one opens a terminal tab, runs the displayed command and leaves Bash available when it finishes. Graphical games and editors open directly. Scroll with the wheel or drag vertically, filter
 by category at the top, and click an icon to open it. Click **完成** or press Esc to return.
 See the [应用清单](../../docs/applications.md) for launcher names and shell commands. In the
 **窗口** tab, click a row to raise the window or restore it from the dock.
 Ctrl+] cycles through the visible windows. The number identifies the external client slot. The Eyes dock shortcut
 opens Eyes or brings its most recent instance forward.
 
+Launcher and dock icons come from `/lib/netsurf/launcher-icons.bin`, a
+pre-rendered bank of 76x76 and 40x40 RGBA images. Regenerate it from the
+artwork in `User/desktop/icons/` with:
+
+```sh
+python3 User/desktop/launcher-icons.py /path/to/launcher-icons.bin
+```
+
+The desktop falls back to its 16x16 vector-style glyphs if the file is absent.
+See `User/desktop/icons/README.md` for artwork sources and licences.
+
 ## 系统设置
 
-在 Desktop 打开 **Apps → 系统 → 系统设置**。点一行进入编辑，输入新值或点「切换选项」，然后点「保存」。左上角返回会放弃本次输入。滚轮或拖动滚动条可以浏览长列表。上下键或 J/K 选择，回车打开。在编辑页面用 Tab 切换焦点、空格激活按钮、Ctrl+B 返回。
+在 Desktop 打开 **Apps → 系统 → 系统设置**。常规窗口默认显示「启动与连接」，点左侧分类可切换面板。窄窗口通过左上角返回分类列表。点一行进入编辑，输入新值或点「切换选项」，然后点「保存」。左上角返回会放弃本次输入。滚轮或拖动滚动条可以浏览长列表。上下键或 J/K 选择，回车打开。在编辑页面用 Tab 切换焦点、空格激活按钮、Ctrl+B 返回。
 
 | 页面 | 可用项目 | 生效时间 |
 | --- | --- | --- |
@@ -22,7 +33,7 @@ opens Eyes or brings its most recent instance forward.
 
 登录项保存在 `/home/lixin/.profile`。常规变量可直接改值，带空格的值沿用 Shell 引号。复合语句可整行编辑，其他行及原有注释保留。Agent 使用 `/agent-policy/settings.py`。启动偏好随磁盘保存在 `/.desktop-boot`，命令行选项和 Mac 环境变量优先。时区可以从常用选项中选择，也可以输入城市时区名。SSH 端口填 0 由系统分配，模型填 `auto` 使用桥接默认值。
 
-在 Mac 上为另一块已关机的桌面盘安装：
+在 Mac 上构建时需要 `rsvg-convert` 和 Python Pillow，用来将图标与插画嵌入应用。为另一块已关机的桌面盘安装：
 
 ```sh
 bash User/desktop/build-settings.sh
@@ -30,6 +41,8 @@ python3 User/gcc/install.py --toolchain settings Kernel/target/user-build/settin
 ```
 
 ## Files
+
+点文件窗口底部的「图标」切换到图标视图，PNG 和 JPEG 会显示缩略图。点击排序栏切换顺序。点「列表」恢复详细列表，选中的文件会保留。
 
 Open **Files** from the dock. Click a row to select it, then double-click or
 press Enter to open it. Up and Down select adjacent entries. Scroll the wheel one row at a time
@@ -139,11 +152,26 @@ than the raw rectangle. The final clipboard_size bytes are UTF-8 text.
 For a nonzero size up to 4096, the desktop publishes the text after
 receiving the complete reply.
 
+Viewer clients negotiate additional features through CONFIGURE.value. When
+`WINDOW_CLIENT_VIEWER_AVAILABLE` is set, the high bits of encoded_size can
+request modifier input, toggle fullscreen, or mark the trailing bytes as a
+window title (up to 199 bytes). With modifier input, KEY.x carries Shift,
+Ctrl and Alt in bits 0–2. POINTER.value carries left in bit 0, modifiers in
+bits 1–3, and right and middle in bits 4–5 on a host advertising
+`WINDOW_CLIENT_RAW_BUTTONS_AVAILABLE`. A client opting into file drops on
+a host advertising `WINDOW_CLIENT_FILE_DROP_AVAILABLE` receives the guest
+path as a length-prefixed payload following a FILE_DROP event.
+
+The NetSurf desktop advertises `WINDOW_CLIENT_OPEN_URL_AVAILABLE`. A client
+can set `WINDOW_CLIENT_OPEN_URL` on a reply and send an HTTP or HTTPS URL
+in its trailing payload (up to 4095 bytes). Desktop opens the address in
+its browser and raises the browser window.
+
 ## Task manager and calendar
 
 Open **Apps → 系统 → 任务管理器** to view the same live PID, parent PID, state and
 foreground/background information as `ps`. The list refreshes every second.
-Use J/K (lowercase) or the two header arrows to scroll.
+Use J/K (lowercase) or the two header arrows to scroll. Click PID, CPU or 内存 to sort, and click again to reverse the order. P/C/M (lowercase) select the same columns. CPU defaults to busiest first.
 
 Open **Apps → 工具 → 日历** for the Gregorian month containing the guest RTC date
 (UTC). The highlighted cell marks today. Click the header arrows or press

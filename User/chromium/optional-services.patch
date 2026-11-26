@@ -1,0 +1,266 @@
+--- a/components/custom_handlers/BUILD.gn
++++ b/components/custom_handlers/BUILD.gn
+@@ -1,6 +1,11 @@
+ # Copyright 2021 The Chromium Authors
+ # Use of this source code is governed by a BSD-style license that can be
+ # found in the LICENSE file.
++
++declare_args() {
++  # Full desktop embedders provide this permission prompt; Content Shell has its own delegate.
++  enable_protocol_handler_permission_request = true
++}
+ 
+ static_library("custom_handlers") {
+   sources = [
+@@ -32,14 +37,15 @@
+     sources += [
+       "protocol_handler_navigation_throttle.cc",
+       "protocol_handler_navigation_throttle.h",
+-      "register_protocol_handler_permission_request.cc",
+-      "register_protocol_handler_permission_request.h",
+     ]
+-
+-    deps += [
+-      "//components/permissions",
+-      "//ui/base",
+-    ]
++    deps += [ "//ui/base" ]
++    if (enable_protocol_handler_permission_request) {
++      sources += [
++        "register_protocol_handler_permission_request.cc",
++        "register_protocol_handler_permission_request.h",
++      ]
++      deps += [ "//components/permissions" ]
++    }
+   }
+ }
+ 
+--- a/content/shell/BUILD.gn
++++ b/content/shell/BUILD.gn
+@@ -378,6 +378,8 @@
+   ]
+ 
+   if (shell_minimal) {
++    deps -= [ "//components/permissions" ]
++    deps += [ "//components/content_settings/core/common:features" ]
+     sources -= [
+       "utility/shell_content_utility_client.cc",
+       "utility/shell_content_utility_client.h",
+--- a/content/shell/browser/shell_permission_manager.cc
++++ b/content/shell/browser/shell_permission_manager.cc
+@@ -7,7 +7,12 @@
+ #include "base/command_line.h"
+ #include "base/functional/callback.h"
+ #include "components/content_settings/core/common/features.h"
++#include "content/public/browser/permission_request_description.h"
++#include "content/public/browser/web_contents.h"
++#include "content/shell/web_test_buildflags.h"
++#if !BUILDFLAG(SHELL_MINIMAL)
+ #include "components/permissions/permission_util.h"
++#endif
+ #include "content/public/browser/permission_controller.h"
+ #include "content/public/browser/permission_result.h"
+ #include "content/public/browser/render_frame_host.h"
+@@ -23,6 +28,19 @@
+ namespace content {
+ 
+ namespace {
++
++GURL CommittedPermissionOrigin(RenderFrameHost* frame) {
++#if BUILDFLAG(SHELL_MINIMAL)
++  // Preserve desktop PermissionUtil's visible URL fallback before first commit.
++  GURL origin = frame->GetLastCommittedOrigin().GetURL();
++  if (origin.is_empty() && frame->IsInPrimaryMainFrame()) {
++    return WebContents::FromRenderFrameHost(frame)->GetVisibleURL();
++  }
++  return origin;
++#else
++  return permissions::PermissionUtil::GetLastCommittedOriginAsURL(frame);
++#endif
++}
+ 
+ bool IsAllowlistedPermissionType(PermissionType permission) {
+   switch (permission) {
+@@ -173,9 +191,9 @@
+     return PermissionResult(blink::mojom::PermissionStatus::DENIED);
+   return PermissionResult(GetPermissionStatus(
+       permission_descriptor,
+-      permissions::PermissionUtil::GetLastCommittedOriginAsURL(
++      CommittedPermissionOrigin(
+           render_frame_host),
+-      permissions::PermissionUtil::GetLastCommittedOriginAsURL(
++      CommittedPermissionOrigin(
+           render_frame_host->GetMainFrame())));
+ }
+ 
+@@ -197,7 +215,7 @@
+   }
+   return PermissionResult(GetPermissionStatus(
+       permission_descriptor, overridden_origin.GetURL(),
+-      permissions::PermissionUtil::GetLastCommittedOriginAsURL(
++      CommittedPermissionOrigin(
+           render_frame_host->GetMainFrame())));
+ }
+ 
+--- a/content/utility/BUILD.gn
++++ b/content/utility/BUILD.gn
+@@ -9,6 +9,7 @@
+ import("//mojo/public/tools/bindings/mojom.gni")
+ import("//printing/buildflags/buildflags.gni")
+ import("//services/accessibility/buildflags.gni")
++import("//services/on_device_model/on_device_model.gni")
+ import("//services/screen_ai/buildflags/features.gni")
+ 
+ source_set("utility") {
+@@ -40,7 +41,6 @@
+     "//base",
+     "//build:branding_buildflags",
+     "//components/on_device_translation/buildflags",
+-    "//components/optimization_guide/core:features",
+     "//components/services/storage",
+     "//components/services/storage/public/mojom",
+     "//content:export",
+@@ -49,7 +49,6 @@
+     "//content/public/common:common_sources",
+     "//content/public/common:content_descriptor_keys",
+     "//content/services/auction_worklet",
+-    "//content/utility/on_device_model:on_device_model_sandbox_init",
+     "//device/vr/buildflags",
+     "//media:media_buildflags",
+     "//mojo/public/cpp/bindings",
+@@ -61,9 +60,6 @@
+     "//services/data_decoder:lib",
+     "//services/data_decoder/public/cpp",
+     "//services/network:network_service",
+-    "//services/on_device_model:on_device_model_service",
+-    "//services/on_device_model/public/cpp",
+-    "//services/on_device_model/public/mojom",
+     "//services/screen_ai/buildflags",
+     "//services/service_manager/public/cpp",
+     "//services/service_manager/public/mojom",
+@@ -76,6 +72,18 @@
+     "//third_party/blink/public:blink_headers",
+     "//url",
+   ]
++
++  if (is_linux && !use_on_device_model_service) {
++    defines = [ "OMIT_LINUX_ON_DEVICE_MODEL_SERVICE" ]
++  } else {
++    deps += [
++      "//components/optimization_guide/core:features",
++      "//content/utility/on_device_model:on_device_model_sandbox_init",
++      "//services/on_device_model:on_device_model_service",
++      "//services/on_device_model/public/cpp",
++      "//services/on_device_model/public/mojom",
++    ]
++  }
+ 
+   # When library CDMs are supported, we support running the CDM in the utility
+   # process using mojo MediaService. On Windows, we use MediaFoundationService.
+--- a/content/utility/services.cc
++++ b/content/utility/services.cc
+@@ -12,7 +12,9 @@
+ #include "base/task/single_thread_task_runner.h"
+ #include "build/branding_buildflags.h"
+ #include "build/build_config.h"
++#if !defined(OMIT_LINUX_ON_DEVICE_MODEL_SERVICE)
+ #include "components/optimization_guide/core/optimization_guide_features.h"
++#endif
+ #include "components/services/storage/public/mojom/storage_service.mojom.h"
+ #include "components/services/storage/storage_service_impl.h"
+ #include "content/child/child_process.h"
+@@ -32,8 +34,10 @@
+ #include "services/audio/service_factory.h"
+ #include "services/data_decoder/data_decoder_service.h"
+ #include "services/network/network_service.h"
++#if !defined(OMIT_LINUX_ON_DEVICE_MODEL_SERVICE)
+ #include "services/on_device_model/on_device_model_service.h"
+ #include "services/on_device_model/public/mojom/on_device_model_service.mojom.h"
++#endif
+ #include "services/tracing/public/mojom/tracing_service.mojom.h"
+ #include "services/tracing/tracing_service.h"
+ #include "services/video_capture/public/mojom/video_capture_service.mojom.h"
+@@ -334,11 +338,13 @@
+   return service;
+ }
+ 
++#if !defined(OMIT_LINUX_ON_DEVICE_MODEL_SERVICE)
+ auto RunOnDeviceModel(
+     mojo::PendingReceiver<on_device_model::mojom::OnDeviceModelService>
+         receiver) {
+   return on_device_model::OnDeviceModelService::Create(std::move(receiver));
+ }
++#endif
+ 
+ #if BUILDFLAG(ENABLE_VR) && !BUILDFLAG(IS_ANDROID)
+ auto RunXrDeviceService(
+@@ -404,9 +410,11 @@
+   services.Add(RunOOPVideoDecoderFactoryProcessService);
+ #endif
+ 
++#if !defined(OMIT_LINUX_ON_DEVICE_MODEL_SERVICE)
+   if (optimization_guide::features::CanLaunchOnDeviceModelService()) {
+     services.Add(RunOnDeviceModel);
+   }
++#endif
+ 
+ #if BUILDFLAG(IS_WIN) || (BUILDFLAG(GOOGLE_CHROME_BRANDING) && \
+                           (BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_LINUX)))
+--- a/content/utility/utility_main.cc
++++ b/content/utility/utility_main.cc
+@@ -29,13 +29,17 @@
+ #include "content/public/common/content_switches.h"
+ #include "content/public/common/main_function_params.h"
+ #include "content/public/utility/content_utility_client.h"
++#if !defined(OMIT_LINUX_ON_DEVICE_MODEL_SERVICE)
+ #include "content/utility/on_device_model/on_device_model_sandbox_init.h"
++#endif
+ #include "content/utility/utility_thread_impl.h"
+ #include "printing/buildflags/buildflags.h"
+ #include "sandbox/policy/mojom/sandbox.mojom.h"
+ #include "sandbox/policy/sandbox.h"
+ #include "sandbox/policy/sandbox_type.h"
++#if !defined(OMIT_LINUX_ON_DEVICE_MODEL_SERVICE)
+ #include "services/on_device_model/public/mojom/on_device_model_service.mojom.h"
++#endif
+ #include "services/tracing/public/cpp/trace_startup.h"
+ 
+ #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
+@@ -272,9 +276,11 @@
+     }
+   }
+ 
++#if !defined(OMIT_LINUX_ON_DEVICE_MODEL_SERVICE)
+   if (utility_sub_type == on_device_model::mojom::OnDeviceModelService::Name_) {
+     CHECK(on_device_model::PreSandboxInit());
+   }
++#endif
+ 
+ #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
+ 
+@@ -316,9 +322,13 @@
+       pre_sandbox_hook = base::BindOnce(&audio::AudioPreSandboxHook);
+       break;
+     case sandbox::mojom::Sandbox::kOnDeviceModelExecution:
++#if defined(OMIT_LINUX_ON_DEVICE_MODEL_SERVICE)
++      return 1;
++#else
+       on_device_model::AddSandboxLinuxOptions(sandbox_options);
+       pre_sandbox_hook = base::BindOnce(&on_device_model::PreSandboxHook);
+       break;
++#endif
+     case sandbox::mojom::Sandbox::kSpeechRecognition:
+       pre_sandbox_hook =
+           base::BindOnce(&speech::SpeechRecognitionPreSandboxHook);
+@@ -485,9 +495,11 @@
+ 
+   run_loop.Run();
+ 
++#if !defined(OMIT_LINUX_ON_DEVICE_MODEL_SERVICE)
+   if (utility_sub_type == on_device_model::mojom::OnDeviceModelService::Name_) {
+     CHECK(on_device_model::Shutdown());
+   }
++#endif
+ 
+ #if defined(LEAK_SANITIZER)
+   // Invoke LeakSanitizer before shutting down the utility thread, to avoid

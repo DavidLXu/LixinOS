@@ -7,7 +7,14 @@ PHDRS {
 }
 SECTIONS {
     . = 0x78000000 + SIZEOF_HEADERS;
-    .text : { *(.text*) *(.rodata*) *(.eh_frame*) } :text
+    .text : { *(.text*) *(.rodata*) *(.gcc_except_table*) } :text
+    /* Archive members may follow crtend.o on a static link. Register their
+       unwind records before the terminator emitted by crtend.o. */
+    .eh_frame : {
+        KEEP(*crtbegin.o(.eh_frame))
+        KEEP(*(EXCLUDE_FILE (*crtend.o) .eh_frame))
+        KEEP(*crtend.o(.eh_frame))
+    } :text
     . = ALIGN(0x200000);
     .data : { *(.data*) *(.got*) } :data
     .init_array : {

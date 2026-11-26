@@ -1,0 +1,13 @@
+--- a/gio/giounix-private.c
++++ b/gio/giounix-private.c
+@@ -18,6 +18,10 @@
+  */
+ 
+ #include "config.h"
++#ifdef __lixinos__
++/* musl declares epoll_create1, but the guest implements poll. */
++#undef HAVE_EPOLL_CREATE1
++#endif
+ 
+ #include <errno.h>
+ #include <unistd.h>

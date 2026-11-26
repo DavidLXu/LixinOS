@@ -11,7 +11,7 @@
 #include "han.h"
 
 struct outline_page { uint32_t *data; size_t bytes; int tried; };
-static struct outline_page pages[10][256];
+static struct outline_page *pages[10];
 
 static const int16_t *lookup(unsigned code, int style) {
     if (code > 0xffff) return NULL;
@@ -19,6 +19,10 @@ static const int16_t *lookup(unsigned code, int style) {
     if (code >= 0xac00 && code <= 0xd7a3) style = 9;
     else if (han_slot(code) >= 0) style = 8;
     else if (high > 2 && high != 0x20 && high != 0x21) return NULL;
+    if (!pages[style]) {
+        pages[style] = calloc(256, sizeof(*pages[style]));
+        if (!pages[style]) return NULL;
+    }
     struct outline_page *p = &pages[style][high];
     if (!p->tried) {
         p->tried = 1;

@@ -352,7 +352,7 @@ static int build_begin(int id) {
     dirty = full = needs_checkpoint = 0;
     return 1;
 }
-static int scratch_name(const char *name) { return !strncmp(name, "/scratch/", 9); }
+static int scratch_name(const char *name) { return !strncmp(name, "/scratch/", 9) || !strncmp(name,"/tmp/",5); }
 static int build_set(const char *path, const struct file *f) {
     unsigned n = strlen(path), at = lower_bound(&build_staged, path, n);
     int exists = build_equal(&build_staged, at, path, n);
@@ -440,7 +440,7 @@ int disk_checkpoint(void) {
 int scratch_write(const char *path, unsigned offset, const void *data, unsigned n) {
     if (!build_volume || !scratch_name(path))
         return -1;
-    if (!agent_path_allowed(path, 1) || owner >= 0 || !writable || offset > NATIVE_FILE_LIMIT - n)
+    if (!agent_path_allowed(path, 1) || !disk_access(0,path,2) || owner >= 0 || !writable || offset > NATIVE_FILE_LIMIT - n)
         return 0;
     unsigned len = strlen(path), i = lower_bound(&build_live, path, len);
     if (!build_equal(&build_live, i, path, len))

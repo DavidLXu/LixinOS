@@ -1,4 +1,6 @@
 """Play, pause, seek and replay the bundled H.264 clip in the actual desktop."""
+from audio_capture import check_samples
+from disk_image import edit_files
 from launcher_grid import installed_apps, select_icon
 import argparse
 import json
@@ -142,15 +144,27 @@ def main():
     parser.add_argument("--release",default="latest")
     args=parser.parse_args()
     original=HARNESS["serial"]["boot"]
-    def boot(disk,command):
+    def boot(disk,command,**kwargs):
         return original(disk,command+["--release",args.release,"--kernel",args.kernel],
                         prompt=b"LixinOS Bash (C shell)")
     with tempfile.TemporaryDirectory(prefix="video-test-") as tmp:
         disk=Path(tmp)/"test.img"
         subprocess.run(["cp","-c",args.disk,disk],check=True)
-        with RESIZE(),patch.dict(HARNESS["serial"],{"boot":boot}):
+        clip = Path(tmp)/"sound.mp4"
+        capture = Path(tmp)/"video.wav"
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-i", HERE.parent/"User/video/demo.mp4",
+                        "-f", "lavfi", "-i", "sine=frequency=523:sample_rate=48000", "-map", "0:v",
+                        "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-shortest", clip], check=True)
+        package = HERE.parent/"Kernel/target/user-build/video-port/package"
+        install = runpy.run_path(str(HERE.parent/"User/gcc/install.py"))["package_edit"](package, "video")
+        def stage(rows):
+            install(rows)
+            rows[b"/lib/video/demo.mp4"] = bytes(8), clip.read_bytes()
+        edit_files(disk, stage)
+        with patch.dict(os.environ, {"LIXINOS_AUDIO": f"wav,path={capture},out.frequency=48000"}), RESIZE(),patch.dict(HARNESS["serial"],{"boot":boot}):
             HARNESS["test"](exercise,mode="--window",disk=disk)
-    print(f"{args.kernel}: H.264 desktop playback, pause, seek and replay passed")
+        frames = check_samples(capture)
+    print(f"{args.kernel}: H.264/AAC playback, pause, seek and replay passed, {frames} stereo frames")
 
 
 if __name__=="__main__":

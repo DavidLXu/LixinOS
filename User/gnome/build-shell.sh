@@ -21,6 +21,9 @@ export PKG_CONFIG_PATH="$wayland/lib/pkgconfig"
 if ! patch -f -Rs --dry-run -p1 -d "$src" < "$port/shell-static.patch" >/dev/null 2>&1; then
     patch -f -s -p1 -d "$src" < "$port/shell-static.patch"
 fi
+if ! patch -f -Rs --dry-run -p1 -d "$src" < "$port/shell-greeter.patch" >/dev/null 2>&1; then
+    patch -f -s -p1 -d "$src" < "$port/shell-greeter.patch"
+fi
 LIXINOS_GCC_BUILD="$build/runtime" bash "$root/User/gcc/build.sh" rt
 
 options=(-Dprefer_static=true -Dcamera_monitor=false -Dsystemd=false -Dtests=false -Dman=false

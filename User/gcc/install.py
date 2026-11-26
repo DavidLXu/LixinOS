@@ -11,6 +11,20 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[2]/"scripts"))
 from disk_image import edit_files
 
 PACKAGES = {
+    "fonts": ("/bin/fonts", "/etc/fonts/fonts.conf"),
+    "gdm": ("/bin/gdm",),
+    "pam": ("/bin/login", "/bin/passwd"),
+    "wasm3": ("/bin/wasm3",),
+    "cxx-runtime": (),
+    "ibus": ("/bin/ibus-daemon", "/bin/ibus-engine-simple", "/bin/ibus-input", "/bin/ibus-run"),
+    "dynlink": ("/bin/ld-musl", "/lib/ld-musl-aarch64.so.1", "/lib/libc.so"),
+    "cpython-native": ("/bin/python3", "/bin/pip", "/bin/pip3"),
+    "code": ("/bin/code", "/bin/clip"),
+    "writer": ("/bin/writer", "/bin/writer.win3"),
+    "pdfview": ("/bin/pdfview.win3",),
+    "freecad-desktop": ("/bin/freecad", "/bin/startfreecad"),
+    "freecad": ("/bin/freecad-sketch-probe", "/bin/freecad-part.win3"),
+    "simulate": ("/bin/simulate.win3",),
     "mujoco": ("/bin/mujoco",),
     "physics": ("/bin/physics.win3",),
     "video": ("/bin/video.win3",),
@@ -18,11 +32,19 @@ PACKAGES = {
     "codex": ("/bin/codex",),
     "classicube": ("/bin/classicube",),
     "doom": ("/bin/doom",),
+    "nfs2": ("/bin/nfs2",),
+    "ra2": ("/bin/ra2",),
+    "ra2-content": (),
+    "ra2-engine": ("/bin/ra2-engine",),
+    "ra2-recomp-check": ("/bin/ra2-recomp-check",),
+    "ra2-recomp": ("/bin/ra2-recomp",),
+    "yr-recomp": ("/bin/yr-recomp",),
     "2048": ("/bin/2048.win3",),
     "node": ("/bin/node",),
     "node26": ("/bin/node26",),
     "npm": ("/bin/npm", "/bin/npx"),
     "dsh": ("/bin/dsh",),
+    "dsh-gui": ("/bin/dsh-gui.win3",),
     "gcc": ("/bin/gcc", "/bin/as", "/bin/ld"),
     "rust": ("/bin/rustc", "/bin/cargo"),
     "slint-demo": ("/bin/slint-demo", "/bin/slint-editor"),
@@ -44,6 +66,19 @@ PACKAGES = {
     "ristretto": ("/bin/ristretto.win3",),
 }
 
+# Factory launchers installed at boot before native wheels were supported.
+CPYTHON_LAUNCHERS = {
+    "python3": {
+        "07bd3e2c797df9d0f835127208822cbd5868c69b239af1742497df688a03e1eb",
+        "ab09dc3c2e66402ef26563c9b207f7c075ef3a5b7a0e9e5c294cec2f18c473f2",
+        "c3292644a81bd22885cbf06b148e692927c10f5f2943cd82d8943e63a0d3ed5b",
+    },
+    "pip": {
+        "4b46f8bd4935e072ef3e0c2eff4b4eae50f7d330c878df4584fa99fdb882e50d",
+        "332c8371feffabf35ca445013aa20e29bff1b7688a9df28f897d39f9f9582194",
+        "b16e8b7fc8c7aa865a17db1b2bf48d7a236f765a5bc2f662984669631e4a6e4c",
+    },
+}
 
 def package_edit(package, name):
     library = "/lib/" + name
@@ -51,7 +86,8 @@ def package_edit(package, name):
     manifest_path = (library + "/installed.json").encode()
 
     def tool_path(path):
-        return ((path in binaries or path.startswith(library + "/"))
+        return ((path in binaries or path.startswith(library + "/")
+                 or (name == "fonts" and path.startswith("/usr/share/fonts/")))
                 and ".." not in Path(path).parts and str(Path(path)) == path
                 and path.encode() != manifest_path)
 
@@ -72,12 +108,23 @@ def package_edit(package, name):
             stock_desktop = (name == "netsurf" and path == b"/bin/desktop" and
                              digest in {"8a641fa9f380c4a6378ee152c5ee298951aa017412892d228a5bb59d778ef55f",
                                         "c3e66c3d453be6d561d2de1f0e61ec835680b5b22486c8a3a76b9cb0995e01d9"})
-            if path in rows and path != manifest_path and not stock_desktop and (old is None or manifest.get(path.decode()) != digest):
+            launcher = {b"/bin/python3": "python3", b"/bin/pip": "pip", b"/bin/pip3": "pip"}.get(path)
+            stock_python = name == "cpython-native" and digest in CPYTHON_LAUNCHERS.get(launcher, ())
+            # The published GTK gallery image updated its two launchers before
+            # the package installer recorded their new digests.
+            gallery = {
+                b"/bin/gtk3-demo.win3": "cde3998ca60fc426bc501c61ebdf6b2231f719fc8f49ad1b0e374e5899ef73d2",
+                b"/bin/mousepad.win3": "c397492ba6f97121d8e2a74e1d9bfbb44185629cb6a7d052da23f82ef6f53a37",
+            }
+            stock_gtk = name == "gtk3" and path in gallery and digest == gallery[path]
+            if path in rows and path != manifest_path and not (stock_desktop or stock_python or stock_gtk) and (old is None or manifest.get(path.decode()) != digest):
                 raise ValueError(f"local file conflicts with package: {path!r}")
             rows[path] = times[:4]+now,value
         for item in sorted(package.rglob("*")):
             path = "/"+item.relative_to(package).as_posix()
-            if path not in ("/lib",library,"/bin","/tmp") and not tool_path(path):
+            if path not in ("/lib",library,"/bin","/tmp") and not tool_path(path) and not (
+                name == "fonts" and path in ("/etc", "/etc/fonts", "/usr", "/usr/share", "/usr/share/fonts")
+            ):
                 raise ValueError(f"unexpected package path {path}")
             value = None if item.is_dir() else item.read_bytes()
             put(path.encode(),value)

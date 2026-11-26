@@ -50,8 +50,21 @@ case "${NODE_OPENSSL:-0}" in
     *) echo 'NODE_OPENSSL must be 0 or 1' >&2; exit 2 ;;
 esac
 export CPPFLAGS="${CPPFLAGS:-} -D__lixinos__"
-./configure --ninja --fully-static --v8-lite-mode --v8-enable-snapshot-compression \
+v8_flags='--single-threaded --max-old-space-size=32 --max-semi-space-size=1'
+if [ "${NODE_PAGED_VM:-0}" = 1 ]; then
+    if [ "$version" = 26.13.1 ]; then
+        python3 "$port/enable-wasm-interpreter.py" "$PWD"
+        set -- "$@" --experimental-enable-pointer-compression
+        v8_flags="--jitless --wasm-jitless $v8_flags"
+    else
+        set -- "$@" --v8-lite-mode
+    fi
+    export CFLAGS="${CFLAGS:-} -fPIC" CXXFLAGS="${CXXFLAGS:-} -fPIC"
+else
+    set -- "$@" --fully-static --v8-lite-mode
+fi
+./configure --ninja --v8-enable-snapshot-compression \
     "$@" --without-intl --without-sqlite --without-inspector --without-amaro \
     --without-node-snapshot --without-node-code-cache --without-npm \
-    --v8-options='--single-threaded --max-old-space-size=32 --max-semi-space-size=1'
+    --v8-options="$v8_flags"
 ninja -C out/Release -j "${JOBS:-6}" node

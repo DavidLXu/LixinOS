@@ -1,0 +1,94 @@
+--- a/src/predecode.c
++++ b/src/predecode.c
+@@ -8,13 +8,11 @@
+  * (including architecturally-unallocated patterns decode.c happens to accept
+  * leniently) is left as PD_GENERIC, which re-dispatches into exec_a64 — so
+  * behavior for those stays byte-identical by construction. */
+-#include "machine.h"
+-#include "thread.h"
++#include "mmu.h"
+ #include "predecode.h"
+ 
+-__thread PDEnt g_pdcache[PD_SIZE];
+-
+-int g_predecode = 1;   /* cleared by -nopd */
++// The interpreter lock serializes the guest CPUs. Each hit checks the live instruction.
++static PDEnt g_pdcache[PD_SIZE];
+ 
+ #define BIT(i)      ((insn >> (i)) & 1u)
+ #define BITS(hi,lo) ((insn >> (lo)) & ((1u << ((hi) - (lo) + 1)) - 1))
+@@ -544,7 +542,7 @@
+  * nearly every dispatch. pd_run executes instructions back-to-back and
+  * returns to emu_loop only when something rare needs the loop's attention
+  * (recorded exception, pending signal, stop/halt, fetch fault). */
+-void pd_run(CPU *c) {
++bool pd_run(CPU *c) {
+     /* Range default + per-id overrides: the override is the point. */
+ #pragma GCC diagnostic push
+ #pragma GCC diagnostic ignored "-Woverride-init"
+@@ -760,11 +758,9 @@
+ 
+ #define NEXT do { \
+         c->icount++; \
+-        if (UNLIKELY(c->stop | c->halted)) return; \
+-        if (UNLIKELY(g_tls.pend_exc.valid)) return; \
+-        if (UNLIKELY(g_sig_npend)) return; \
++        if (UNLIKELY(c->stop || c->halted || !(c->icount % PD_SLICE))) return false; \
+         c->cur_insn_pc = c->pc; \
+-        if (UNLIKELY(!mem_ifetch(c, c->pc, &insn))) return; \
++        if (UNLIKELY(!mem_ifetch(c, c->pc, &insn))) return false; \
+         c->pc += 4; \
+         e = &g_pdcache[(c->cur_insn_pc >> 2) & PD_MASK]; \
+         if (UNLIKELY(e->insn != insn)) pd_fill(e, insn); \
+@@ -773,13 +769,14 @@
+ 
+     /* Entry: emu_loop has just run the rare-event checks for us. */
+     c->cur_insn_pc = c->pc;
+-    if (UNLIKELY(!mem_ifetch(c, c->pc, &insn))) return;
++    if (UNLIKELY(!mem_ifetch(c, c->pc, &insn))) return false;
+     c->pc += 4;
+     e = &g_pdcache[(c->cur_insn_pc >> 2) & PD_MASK];
+     if (UNLIKELY(e->insn != insn)) pd_fill(e, insn);
+     goto *pd_tab[e->op];
+ 
+ L_GENERIC:
++    if (insn == 0xd4000001) return true;  /* SVC #0: handled by linux-run. */
+     exec_a64(c, insn); NEXT;
+ L_NOP:
+     NEXT;
+--- a/src/predecode.h
++++ b/src/predecode.h
+@@ -38,8 +38,7 @@
+     u64 imm;       /* immediate/offset/mask/4th operand, pre-computed at fill */
+ } PDEnt;
+ 
+-extern __thread PDEnt g_pdcache[PD_SIZE];
+-extern int g_predecode;            /* cleared by -nopd (diagnostic mode) */
++#define PD_SLICE 16384u
+ 
+ enum {
+     PD_GENERIC = 0,   /* everything else: dispatch to exec_a64 */
+@@ -139,10 +138,8 @@
+     PD_NOPS_
+ };
+ 
+-/* Run instructions back-to-back through the decode cache (direct-threaded
+- * dispatch). Returns when the loop must intervene: recorded exception,
+- * pending signal, stop/halt, or an instruction-fetch fault. */
+-void pd_run(CPU *c);
++/* Run until a scheduling boundary, stop or syscall. Return true on SVC. */
++bool pd_run(CPU *c);
+ 
+ /* Classify one instruction word into a PDEnt (dense op id + pre-extracted
+  * operands; PD_GENERIC when unrecognized). Also the JIT frontend's decoder. */
+--- a/src/mmu.h
++++ b/src/mmu.h
+@@ -51,7 +51,7 @@
+     u64  page;   /* VA page base of the cached translation */
+     u8  *host;   /* host pointer to that guest page; NULL = invalid */
+ } FetchCache;
+-extern __thread FetchCache g_fcache;
++extern FetchCache g_fcache;
+ 
+ /* Slow path: walk the table, refresh the fetch cache, read. */
+ bool mem_ifetch_slow(CPU *c, u64 va, u32 *insn_out);

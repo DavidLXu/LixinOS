@@ -5,10 +5,11 @@
 #include "swing-weights.h"
 #include "swing-presets.h"
 #include "mujoco-swing.h"
+#include "view3d.h"
 #include "expression.h"
 
 enum { RUN=1, STEP, RESET, GRAVITY, CLEAR, SEGMENT, ARC, CURVE, HINGE, SLIDER };
-enum { EXAMPLES=11, EX_SINGLE=64, EX_TRIPLE, EX_SWING, EX_ORDER3, EX_ORDER10=EX_ORDER3+7, EX_MUJOCO, EX_CANCEL,
+enum { EXAMPLES=11, EX_SINGLE=64, EX_TRIPLE, EX_SWING, EX_ORDER3, EX_ORDER10=EX_ORDER3+7, EX_MUJOCO, EX_3D, EX_CANCEL,
        POLICIES, POLICY_BACK, POLICY_FIRST=100 };
 enum { SKY=0x1127, GRID=0x21aa, AXIS=0x3410, WHITE=0xf7df, MINT=0x76f4,
        AMBER=0xf5c9, RAIL=0x1949, SELECT=0x2450, GROUND=0xb6be };
@@ -22,6 +23,8 @@ static long last_tick;
 static const SwingPreset *policy;
 static SwingMotors motors;
 static MujocoSwing mujoco;
+static View3D view3;
+static int view3_active,dragged,press_x,press_y,last_x,last_y;
 static double first_balance_time;
 static int upright_steps, selected_order;
 #define PRESET_COUNT ((int)(sizeof swing_presets/sizeof swing_presets[0]))
@@ -44,7 +47,7 @@ static AppControl button(const AppWindow *s,int id) {
 static AppControl example_control(const AppWindow *s,int id) {
     if (id==EXAMPLES) return (AppControl){id,s->width-62,s->height-26,55,24,"示例"};
     static const char *options[]={"单摆","三节倒立摆","强化学习起摆","3 节策略","4 节策略","5 节策略",
-                                  "6 节策略","7 节策略","8 节策略","9 节策略","10 节策略","MuJoCo 三节起摆","取消"};
+                                  "6 节策略","7 节策略","8 节策略","9 节策略","10 节策略","MuJoCo 三节起摆","MuJoCo 3D 视图","取消"};
     int index=id-EX_SINGLE, w=(s->width-24)/2;
     int row=(s->height-42)/7;
     if (row>44) row=44;
@@ -72,11 +75,14 @@ static int policy_controls(AppWindow *s,int x,int y,int paint) {
     return 0;
 }
 static void set_example(const AppWindow *s,int id) {
-    if (id==EX_MUJOCO && !open_mujoco_swing(&mujoco)) {
+    int needs_mujoco=id==EX_MUJOCO || id==EX_3D;
+    if (needs_mujoco && !open_mujoco_swing(&mujoco)) {
         message="MuJoCo 模型加载失败"; dialog=running=0; return;
     }
-    if (id!=EX_MUJOCO) close_mujoco_swing(&mujoco);
-    policy=(id==EX_SWING || id==EX_MUJOCO)?&swing_presets[0]:id>=POLICY_FIRST?&swing_presets[id-POLICY_FIRST]:NULL;
+    if (view3_active) close3d(&view3);
+    view3_active=id==EX_3D && open3d(&view3,mujoco.model,s->width,s->height-HEADER-FOOT);
+    if (!needs_mujoco) close_mujoco_swing(&mujoco);
+    policy=(id==EX_SWING || needs_mujoco)?&swing_presets[0]:id>=POLICY_FIRST?&swing_presets[id-POLICY_FIRST]:NULL;
     first_balance_time=0;
     upright_steps=0;
     if (policy) {
@@ -90,6 +96,7 @@ static void set_example(const AppWindow *s,int id) {
     zoom=fmin(70,fmin(s->width-12,s->height-HEADER-FOOT)/span);
     tool=SEGMENT;
     message=policy ? "点运行，从下垂起摆" : id==EX_TRIPLE ? "三节倒立摆：底部固定铰链，点运行释放" : "单摆：点运行释放";
+    if (id==EX_3D && !view3_active) message="3D 初始化失败，已切换到二维视图";
 }
 static AppControl field_box(const AppWindow *s,int i) {
     return (AppControl){20+i,84,41+i*31,s->width-98,27,""};
@@ -291,9 +298,7 @@ static void draw_dialog(AppWindow *s) {
         label(s,b.x+17,b.y+2,b.w-20,b.name,WHITE);
     }
 }
-static void draw(AppWindow *s) {
-    if (dialog) { draw_dialog(s); return; }
-    app_rect(s,0,0,s->width,s->height,SKY);
+static void draw_planar(AppWindow *s) {
     Vec lo=world(s,0,s->height-FOOT),hi=world(s,s->width,HEADER);
     for (int x=(int)ceil(lo.x);x<=hi.x;++x) stroke(s,vec(x,lo.y),vec(x,hi.y),0,x?GRID:AXIS);
     for (int y=(int)ceil(lo.y);y<=hi.y;++y) stroke(s,vec(lo.x,y),vec(hi.x,y),0,y?GRID:AXIS);
@@ -339,16 +344,26 @@ static void draw(AppWindow *s) {
         marker(s,from,4,WHITE);
     }
     if (tool==SLIDER && phase==2 && mouse_inside) stroke(s,picked[0],mouse_pos,1,AMBER);
-    for (int id=RUN;id<=SLIDER;++id) {
+}
+static void draw(AppWindow *s) {
+    if (dialog) { draw_dialog(s); return; }
+    app_rect(s,0,0,s->width,s->height,SKY);
+    if (view3_active) {
+        if (!draw3d(&view3,mujoco.model,mujoco.data,s->pixels+HEADER*s->width,s->width,s->height-HEADER-FOOT))
+            message="3D 绘制失败";
+        label(s,10,44,s->width-20,"拖动旋转   滚轮缩放   点击连杆查看状态",MINT);
+    } else draw_planar(s);
+    for (int id=RUN;id<=(view3_active?GRAVITY:SLIDER);++id) {
         AppControl b=button(s,id);
-        int active=id==tool || (id==RUN && running) || (id==CLEAR && confirm_clear);
+        if (view3_active && id==GRAVITY) b.name="视角复位";
+        int active=(!view3_active && id==tool) || (id==RUN && running) || (id==CLEAR && confirm_clear);
         app_rect(s,b.x,b.y,b.w,b.h,active?SELECT:RAIL);
         int width=(int)strlen(b.name)/3*16;
         label(s,b.x+(b.w>width?(b.w-width)/2:1),b.y+5,b.w-2,b.name,active?MINT:WHITE);
     }
     char buf[110];
     if (mujoco.data && policy)
-        snprintf(buf,sizeof buf,"MuJoCo %s   3 links   %.2f s",mj_versionString(),scene.time);
+        snprintf(buf,sizeof buf,"MuJoCo %s   3 links   %.3f s",mj_versionString(),scene.time);
     else if (policy && policy->seed_number)
         snprintf(buf,sizeof buf,"%d 节  种子 %d  %d 轮  测试 %d/32  %.2f s",
                  policy->order,policy->seed_number,policy->generations,policy->test_successes,scene.time);
@@ -371,6 +386,12 @@ static void draw(AppWindow *s) {
                  policy->order,running?"运行":"暂停",state,motors.torque[0]);
         status=buf;
     }
+    if (view3_active && view3.selected>0) {
+        Link *l=&scene.links[view3.selected-1];
+        snprintf(buf,sizeof buf,"杆 %d   绝对角 %.1f deg   角速度 %.2f rad/s",
+                 view3.selected,l->angle*180/swing_pi,l->omega);
+        status=buf;
+    }
     label(s,10,s->height-24,examples.x-15,status,WHITE);
     app_rect(s,examples.x,examples.y,examples.w,examples.h,SELECT);
     label(s,examples.x+10,examples.y,examples.w-12,examples.name,MINT);
@@ -388,7 +409,7 @@ static int control_hit(AppWindow *s,int x,int y) {
         for (int i=0;i<2;++i) if (app_control_hit(dialog_button(s,i),x,y)) return 30+i;
         return 0;
     }
-    for (int i=RUN;i<=SLIDER;++i) if (app_control_hit(button(s,i),x,y)) return i;
+    for (int i=RUN;i<=(view3_active?GRAVITY:SLIDER);++i) if (app_control_hit(button(s,i),x,y)) return i;
     if (app_control_hit(example_control(s,EXAMPLES),x,y)) return EXAMPLES;
     return canvas(s,x,y)?40:0;
 }
@@ -419,6 +440,10 @@ static int event(AppWindow *s,WindowEvent e) {
     } else if (e.type==WINDOW_CLIENT_PASTE && dialog && dialog!=EXAMPLES && dialog!=POLICIES) {
         changed=app_field_paste(s,&edits[field_index],fields[field_index],sizeof fields[0],e.value);
     } else if (e.type==WINDOW_CLIENT_WHEEL && !dialog && canvas(s,e.x,e.y)) {
+        if (view3_active) {
+            view3.camera.distance=fmax(.8,fmin(18,view3.camera.distance*(e.value>0?.85:1/.85)));
+            return 1;
+        }
         Vec fixed=world(s,e.x,e.y);
         zoom=fmin(180,fmax(2,zoom*(e.value>0?1.2:1/1.2)));
         camera=add(camera,sub(fixed,world(s,e.x,e.y))); changed=1;
@@ -426,7 +451,24 @@ static int event(AppWindow *s,WindowEvent e) {
         int mx=e.x,my=e.y; mouse_inside=canvas(s,mx,my);
         mouse_pos=world(s,mx,my);
         int hit=control_hit(s,mx,my);
-        if (e.value && !down) { press_id=hit; press_pos=mouse_pos; down=1; }
+        if (e.value && !down) {
+            press_id=hit; press_pos=mouse_pos; down=1; dragged=0;
+            press_x=last_x=mx; press_y=last_y=my;
+        }
+        if (view3_active && !dialog && down && press_id==40) {
+            if (mx<0 || my<0) {
+                dragged=1; if (!e.value) down=0; return 0;
+            }
+            if (abs(mx-press_x)+abs(my-press_y)>3) dragged=1;
+            if (dragged) {
+                double height=s->height-HEADER-FOOT;
+                mjv_moveCamera(mujoco.model,mjMOUSE_ROTATE_H,(last_x-mx)/height,(last_y-my)/height,&view3.camera);
+                last_x=mx; last_y=my;
+            } else if (!e.value && hit==40)
+                view3.selected=pick3d(&view3,mujoco.model,mujoco.data,mx,my-HEADER);
+            if (!e.value) down=0;
+            return 1;
+        }
         if (!e.value && down) {
             down=0;
             if (hit && hit==press_id) {
@@ -439,13 +481,14 @@ static int event(AppWindow *s,WindowEvent e) {
                 else if (hit>=EX_ORDER3 && hit<=EX_ORDER10) {
                     selected_order=3+hit-EX_ORDER3; dialog=POLICIES;
                 } else if (hit==POLICY_BACK) dialog=EXAMPLES;
-                else if (hit==EX_MUJOCO || (hit>=EX_SINGLE && hit<=EX_SWING) ||
+                else if (hit==EX_MUJOCO || hit==EX_3D || (hit>=EX_SINGLE && hit<=EX_SWING) ||
                          (hit>=POLICY_FIRST && hit<POLICY_FIRST+PRESET_COUNT)) set_example(s,hit);
                 else if (hit>=30) {
                     if (hit==30) finish_dialog(); else { dialog=phase=0; message=NULL; }
                 } else if (hit>=20) {
                     field_index=hit-20; ui_text_begin(&edits[field_index],fields[field_index],1);
-                } else tool_action(hit);
+                } else if (view3_active && hit==GRAVITY) home3d(&view3);
+                else tool_action(hit);
             }
             changed=1;
         } else if (!dialog && !running && mouse_inside && (phase || (down && press_id==40))) changed=1;
@@ -457,6 +500,7 @@ int main(void) {
     pendulum_example(&scene,TRIPLE_INVERTED);
     message="三节倒立摆：底部固定铰链，点运行释放";
     int result=app_run3(event,draw);
+    if (view3_active) close3d(&view3);
     close_mujoco_swing(&mujoco);
     return result;
 }

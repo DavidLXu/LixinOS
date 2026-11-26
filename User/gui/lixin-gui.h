@@ -63,12 +63,18 @@ static inline int lx_gui_pointer(struct lx_pointer *pointer) {
     return lx_gui_decode_pointer(pointer, lx_canvas_pointer());
 }
 
-/* Menlo atlas shared with the system desktop. Load once per app. */
+#ifdef __TINYC__
+#include "/src/gui/cell-font.h"
+#else
+#include "cell-font.h"
+#endif
+/* Fixed-cell canvas text, with the system console face and a wide Han fallback. */
 #define LX_GUI_CHAR_W 9
 #define LX_GUI_CHAR_H 22
 struct lx_font { unsigned char alpha[95 * 18 * LX_GUI_CHAR_H]; };
 
 static inline int lx_gui_font(struct lx_font *font) {
+    if (lx_cell_face(font->alpha) == 0) return 0;
     int fd = lx_open("/src/gui/menlo.gray");
     if (fd < 0) return -1;
     unsigned n = 0;
@@ -84,19 +90,30 @@ static inline int lx_gui_font(struct lx_font *font) {
 static inline void lx_gui_text(struct lx_canvas *canvas, const struct lx_font *font,
                                unsigned x, unsigned y, unsigned cells, const char *text,
                                unsigned color) {
-    for (; cells && *text && x + LX_GUI_CHAR_W <= canvas->width; --cells, x += LX_GUI_CHAR_W) {
-        unsigned char ch = *text++;
-        if (ch < 32 || ch >= 127) ch = '?';
+    while (cells && *text) {
+        unsigned code = utf8_next(&text);
+        int slot = han_slot(code);
+        unsigned advance = slot >= 0 ? 2 : 1;
+        unsigned width = advance * LX_GUI_CHAR_W;
+        if (advance > cells || x >= canvas->width || width > canvas->width - x) break;
+        const unsigned char *bits = slot >= 0 ? lx_gui_han_bitmap(slot) : 0;
+        unsigned ch = code >= 32 && code < 127 ? code : '?';
         const unsigned char *glyph = font->alpha + (ch - 32) * 18 * LX_GUI_CHAR_H;
         for (unsigned row = 0; row < LX_GUI_CHAR_H && y + row < canvas->height; ++row) {
-            for (unsigned col = 0; col < LX_GUI_CHAR_W; ++col) {
+            for (unsigned col = 0; col < width; ++col) {
+                unsigned a = col < LX_GUI_CHAR_W ? glyph[row * 18 + col] : 0;
+                if (bits) {
+                    a = row >= 3 && row < 19 && col >= 1 && col < 17 &&
+                        (bits[(row-3)*2+(col-1)/8] & (128u >> ((col-1)%8))) ? 255 : 0;
+                }
                 unsigned *pixel = canvas->pixels + (y + row) * canvas->width + x + col;
-                unsigned a = glyph[row * 18 + col];
                 unsigned rb = (((*pixel & 0xff00ff) * (256 - a) + (color & 0xff00ff) * a) >> 8) & 0xff00ff;
                 unsigned g = (((*pixel & 0xff00) * (256 - a) + (color & 0xff00) * a) >> 8) & 0xff00;
                 *pixel = rb | g;
             }
         }
+        cells -= advance;
+        x += width;
     }
 }
 
@@ -110,7 +127,12 @@ static inline int lx_gui_hit(const struct lx_button *button, const struct lx_poi
 static inline void lx_gui_button(struct lx_canvas *canvas, const struct lx_font *font,
                                  const struct lx_button *button, unsigned fill, unsigned ink) {
     unsigned n = 0;
-    while (n < button->w / LX_GUI_CHAR_W && button->label[n]) ++n;
+    const char *p = button->label;
+    while (*p) {
+        unsigned step = han_slot(utf8_next(&p)) >= 0 ? 2 : 1;
+        if (n + step > button->w / LX_GUI_CHAR_W) break;
+        n += step;
+    }
     lx_gui_rect(canvas, button->x, button->y, button->w, button->h, fill);
     lx_gui_text(canvas, font, button->x + (button->w - n * LX_GUI_CHAR_W) / 2,
                 button->y + (button->h - LX_GUI_CHAR_H) / 2, n, button->label, ink);

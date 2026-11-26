@@ -1,0 +1,29 @@
+# Debian modules loaded at runtime by the WeChat Wayland client.
+9fa889400fcee4b92c8f4a2fafbb7f2cd33444d9ec1665a71002ab67c06114bb pool/main/a/alsa-lib/libasound2_1.2.8-1+b1_arm64.deb libasound.so.2=usr/lib/aarch64-linux-gnu/libasound.so.2.0.0
+338f78e2a140ed4ffca36d4240a7fc6f7867999bea000762a0c1b3924245a868 pool/main/f/flac/libflac12_1.4.2+ds-2_arm64.deb libFLAC.so.12=usr/lib/aarch64-linux-gnu/libFLAC.so.12.0.0
+4259ab5810ec52b03344e8c8fbcad330561ad6758f35f07233af3224d2824547 pool/main/l/lame/libmp3lame0_3.100-6_arm64.deb libmp3lame.so.0=usr/lib/aarch64-linux-gnu/libmp3lame.so.0.0.0
+30ec77ed3695fc09863427bf30e27318b74909089144ac24db17c3ab1f184a62 pool/main/liba/libasyncns/libasyncns0_0.8-6+b3_arm64.deb libasyncns.so.0=usr/lib/aarch64-linux-gnu/libasyncns.so.0.3.1
+ef00f132ddd268ee67d756998723ee18543db27ab34930c0a9f1cff75cf55382 pool/main/libb/libbsd/libbsd0_0.11.7-2_arm64.deb libbsd.so.0=usr/lib/aarch64-linux-gnu/libbsd.so.0.11.7
+707097a275155c600e2e9251c4ee7cdfdb2d8f50a678a850a2526a7bc9664166 pool/main/libg/libglvnd/libegl1_1.6.0-1_arm64.deb libEGL.so.1=usr/lib/aarch64-linux-gnu/libEGL.so.1.1.0
+f4043ab47f52325973d2b608514b3469b055b65c744861c7f378755a32e799d6 pool/main/libg/libglvnd/libgl1_1.6.0-1_arm64.deb libGL.so.1=usr/lib/aarch64-linux-gnu/libGL.so.1.7.0
+d5063205fab5322ee686f33f87c6315b3fcd1335ea4e7bc8202b48ed4f9c9e83 pool/main/libg/libglvnd/libglvnd0_1.6.0-1_arm64.deb libGLdispatch.so.0=usr/lib/aarch64-linux-gnu/libGLdispatch.so.0.0.0
+523f9b71f75e48ae605d8ef298a4b03ade26ade9a808a85329a3bd82a54b9b0d pool/main/libg/libglvnd/libglx0_1.6.0-1_arm64.deb libGLX.so.0=usr/lib/aarch64-linux-gnu/libGLX.so.0.0.0
+99a8c7dd591fae9fb37d8bf8dfdffa850e207fa405b3198c5b24711a5f972381 pool/main/libm/libmd/libmd0_1.0.4-2_arm64.deb libmd.so.0=usr/lib/aarch64-linux-gnu/libmd.so.0.0.5
+1a3e6c2a934a4099dcd982785d1563212fc6ad20f021a6f06aa0d6e6582416d3 pool/main/libo/libogg/libogg0_1.3.5-3_arm64.deb libogg.so.0=usr/lib/aarch64-linux-gnu/libogg.so.0.8.5
+9113167979c64bae0a73d2ee0740e662b25bb45b2f76e4745ea27db9f43f7b24 pool/main/libs/libsndfile/libsndfile1_1.2.0-1+deb12u1_arm64.deb libsndfile.so.1=usr/lib/aarch64-linux-gnu/libsndfile.so.1.0.35
+2f902ae456bcada7b0d494d7bd7c994feb81c4158209d8a12c0b2d9e255edda7 pool/main/libv/libvorbis/libvorbis0a_1.3.7-1_arm64.deb libvorbis.so.0=usr/lib/aarch64-linux-gnu/libvorbis.so.0.4.9
+f1089e220c81e267caec859bf2e440bb78ed9f318bbb51cfd6c85d35bf80144b pool/main/libv/libvorbis/libvorbisenc2_1.3.7-1_arm64.deb libvorbisenc.so.2=usr/lib/aarch64-linux-gnu/libvorbisenc.so.2.0.12
+d1d533e983582282a9ea82c87ac5ce715a9b67bd6d1acbd2439a11c63c36549b pool/main/libx/libx11/libx11-6_1.8.4-2+deb12u2_arm64.deb libX11.so.6=usr/lib/aarch64-linux-gnu/libX11.so.6.4.0
+21c7e6f19909bb1e02bb3c2089789791858c54d37e86cef9d7872782c1cb711e pool/main/libx/libx11/libx11-xcb1_1.8.4-2+deb12u2_arm64.deb libX11-xcb.so.1=usr/lib/aarch64-linux-gnu/libX11-xcb.so.1.0.0
+36c2bf400641a80521093771dc2562c903df4065f9eb03add50d90564337ea6c pool/main/libx/libxau/libxau6_1.0.9-1_arm64.deb libXau.so.6=usr/lib/aarch64-linux-gnu/libXau.so.6.0.0
+041d9a68415c3ccf3ce8f4f8b88e4bbfb5dc1f0d97013c6ef8423e620ea50f84 pool/main/libx/libxcb/libxcb1_1.15-1_arm64.deb libxcb.so.1=usr/lib/aarch64-linux-gnu/libxcb.so.1.1.0
+e92569ac33247261aa09adfadc34ced3994ac301cf8b58de415a2d5dbf15ccfc pool/main/libx/libxdmcp/libxdmcp6_1.1.2-3_arm64.deb libXdmcp.so.6=usr/lib/aarch64-linux-gnu/libXdmcp.so.6.0.0
+ec518d8a19796a399ab95e7bc4dfbb6bd2ed8e151f77b222df26208db412d852 pool/main/libx/libxkbcommon/libxkbcommon0_1.5.0-1_arm64.deb libxkbcommon.so.0=usr/lib/aarch64-linux-gnu/libxkbcommon.so.0.0.0
+a4348cc2939baabb498158c94229941d09fc42070af765dc45ef9b26eab727d2 pool/main/m/mpg123/libmpg123-0_1.31.2-1+deb12u1_arm64.deb libmpg123.so.0=usr/lib/aarch64-linux-gnu/libmpg123.so.0.47.0
+2e5af2fc3d1015674a674b48149a342f1922d74c82f16c0cdc2d6a6bee27f154 pool/main/n/nss/libnss3_3.87.1-1+deb12u2_arm64.deb libfreebl3.so=usr/lib/aarch64-linux-gnu/libfreebl3.so libfreeblpriv3.so=usr/lib/aarch64-linux-gnu/libfreeblpriv3.so libnssckbi.so=usr/lib/aarch64-linux-gnu/libnssckbi.so libnssdbm3.so=usr/lib/aarch64-linux-gnu/libnssdbm3.so libsoftokn3.so=usr/lib/aarch64-linux-gnu/libsoftokn3.so libfreebl3.chk=usr/lib/aarch64-linux-gnu/libfreebl3.chk libfreeblpriv3.chk=usr/lib/aarch64-linux-gnu/libfreeblpriv3.chk libnssdbm3.chk=usr/lib/aarch64-linux-gnu/libnssdbm3.chk libsoftokn3.chk=usr/lib/aarch64-linux-gnu/libsoftokn3.chk
+a7efb06da15cc7f1ffff62bfdd77ba43f2a2065b8b59185ad1d14031c5a9e354 pool/main/o/opus/libopus0_1.3.1-3_arm64.deb libopus.so.0=usr/lib/aarch64-linux-gnu/libopus.so.0.8.0
+26f17e3457c5fce0104a6b2f0efb75a3256b24b32ca7cfda6266373758a930cb pool/main/p/pulseaudio/libpulse0_16.1+dfsg1-2+b1_arm64.deb libpulse.so.0=usr/lib/aarch64-linux-gnu/libpulse.so.0.24.2 libpulsecommon-16.1.so=usr/lib/aarch64-linux-gnu/pulseaudio/libpulsecommon-16.1.so
+a690f7f2aa6435bd1fd7cbbd2216acb9acbb8c48c9721f2c195766375439eb13 pool/main/s/sqlite3/libsqlite3-0_3.40.1-2+deb12u2_arm64.deb libsqlite3.so.0=usr/lib/aarch64-linux-gnu/libsqlite3.so.0.8.6
+ae390cc04c2eb1de90b9a6373505b22c730ada5e72daa50c507b7f99c12faf06 pool/main/w/wayland/libwayland-client0_1.21.0-1_arm64.deb libwayland-client.so.0=usr/lib/aarch64-linux-gnu/libwayland-client.so.0.21.0
+8c8d1a3942bc3fc9dd3ea7c679c1a314e59cdaaa700883d54d1bb3ec89db256b pool/main/w/wayland/libwayland-cursor0_1.21.0-1_arm64.deb libwayland-cursor.so.0=usr/lib/aarch64-linux-gnu/libwayland-cursor.so.0.21.0
+c08124a4d9af24f058b45c88867a84697882e755ea94965795d152fe26fe57c9 pool/main/w/wayland/libwayland-egl1_1.21.0-1_arm64.deb libwayland-egl.so.1=usr/lib/aarch64-linux-gnu/libwayland-egl.so.1.21.0

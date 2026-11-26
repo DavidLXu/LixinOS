@@ -1,0 +1,51 @@
+--- a/sal/osl/unx/file.cxx
++++ b/sal/osl/unx/file.cxx
+@@ -305,6 +305,24 @@
+     return osl_File_E_None;
+ }
+ 
++#ifdef __lixinos__
++// A guest syscall can transfer only one mailbox (4096 bytes) at a time.
++static ssize_t guestFileTransfer(int fd, void *data, size_t size, off_t offset, bool writing)
++{
++    size_t done = 0;
++    while (done < size) {
++        char *buf = static_cast<char *>(data) + done;
++        ssize_t n = writing ? ::pwrite(fd, buf, size - done, offset + done)
++                            : ::pread(fd, buf, size - done, offset + done);
++        if (n < 0 && errno == EINTR) continue;
++        if (n < 0) return -1;
++        if (n == 0) break;
++        done += n;
++    }
++    return done;
++}
++#endif
++
+ oslFileError FileHandle_Impl::readAt(
+     off_t        nOffset,
+     void *       pBuffer,
+@@ -339,7 +357,11 @@
+         return osl_File_E_None;
+     }
+ 
++#ifdef __lixinos__
++    ssize_t nBytes = guestFileTransfer(m_fd, pBuffer, nBytesRequested, nOffset, false);
++#else
+     ssize_t nBytes = ::pread(m_fd, pBuffer, nBytesRequested, nOffset);
++#endif
+     if ((nBytes == -1) && (errno == EOVERFLOW))
+     {
+         /* Some 'pread()'s fail with EOVERFLOW when reading at (or past)
+@@ -371,7 +393,11 @@
+     if (!(m_state & State::Writeable))
+         return osl_File_E_BADF;
+ 
++#ifdef __lixinos__
++    ssize_t nBytes = guestFileTransfer(m_fd, const_cast<void *>(pBuffer), nBytesToWrite, nOffset, true);
++#else
+     ssize_t nBytes = ::pwrite(m_fd, pBuffer, nBytesToWrite, nOffset);
++#endif
+     if (nBytes == -1)
+         return oslTranslateFileError(errno);
+ 

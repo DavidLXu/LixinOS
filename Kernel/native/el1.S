@@ -47,7 +47,7 @@ enable_mmu:
 .global sync_image
 sync_image:
     dsb sy
-    TLBI_ALL
+    .long 0xd508831f // tlbi vmalle1is
     dsb sy
     IC_ALL
     dsb sy
@@ -70,6 +70,57 @@ enter_el0:
     MSR(ELR,9)
     mov x9,#0x44400000
     MSR(USR_SP,9)
+    mov x9,#0x340
+    MSR(SPSR,9)
+    b smp_leave_user
+
+.global enter_thread
+enter_thread:
+    stp x19,x20,[sp,#-16]!
+    stp x21,x22,[sp,#-16]!
+    stp x23,x24,[sp,#-16]!
+    stp x25,x26,[sp,#-16]!
+    stp x27,x28,[sp,#-16]!
+    stp x29,x30,[sp,#-16]!
+    stp d8,d9,[sp,#-16]!
+    stp d10,d11,[sp,#-16]!
+    stp d12,d13,[sp,#-16]!
+    stp d14,d15,[sp,#-16]!
+    MSR(ELR,0)
+    MSR(USR_SP,1)
+    MSR(SYSREG(3,3,13,0,2),2)
+    bl kt_init_fp
+    mov x0,x3
+    mov x1,xzr
+    mov x2,xzr
+    mov x3,xzr
+    mov x4,xzr
+    mov x5,xzr
+    mov x6,xzr
+    mov x7,xzr
+    mov x8,xzr
+    mov x9,xzr
+    mov x10,xzr
+    mov x11,xzr
+    mov x12,xzr
+    mov x13,xzr
+    mov x14,xzr
+    mov x15,xzr
+    mov x16,xzr
+    mov x17,xzr
+    mov x18,xzr
+    mov x19,xzr
+    mov x20,xzr
+    mov x21,xzr
+    mov x22,xzr
+    mov x23,xzr
+    mov x24,xzr
+    mov x25,xzr
+    mov x26,xzr
+    mov x27,xzr
+    mov x28,xzr
+    mov x29,xzr
+    mov x30,xzr
     mov x9,#0x340
     MSR(SPSR,9)
     b smp_leave_user
@@ -98,7 +149,7 @@ user_sync:
     MRS(9,ESR)
     lsr x9,x9,#26
     .long 0xf100553f // cmp x9,#0x15
-    bne bad_user
+    bne native_vm_fault
     .long 0xf100091f // cmp x8,#2
     beq finish_user
     .long 0xf100811f // cmp x8,#32
@@ -170,7 +221,18 @@ interrupted_user:
 stopped_user:
     mov x0,#137
     b finish_user
+native_vm_fault:
+    ldp x9,x30,[sp],#16
+    stp x30,xzr,[sp,#-16]!
+    bl vm_retry_user
+    ldp x30,xzr,[sp],#16
+    stp x9,x30,[sp,#-16]!
 bad_user:
+    MRS(0,ESR)
+    MRS(1,ELR)
+    MRS(2,SYSREG(3,0,6,0,0))
+    mov x3,x30
+    bl report_user_fault
     mov x0,#255
     b finish_user
 spawn_user:

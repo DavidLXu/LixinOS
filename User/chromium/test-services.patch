@@ -1,0 +1,289 @@
+--- a/content/shell/BUILD.gn
++++ b/content/shell/BUILD.gn
+@@ -228,10 +228,6 @@
+     "browser/shell_speech_recognition_manager_delegate.h",
+     "browser/shell_web_contents_view_delegate.h",
+     "browser/shell_web_contents_view_delegate_creator.h",
+-    "common/main_frame_counter_test_impl.cc",
+-    "common/main_frame_counter_test_impl.h",
+-    "common/power_monitor_test_impl.cc",
+-    "common/power_monitor_test_impl.h",
+     "common/shell_content_client.cc",
+     "common/shell_content_client.h",
+     "common/shell_origin_trial_policy.cc",
+@@ -242,14 +238,8 @@
+     "common/shell_switches.h",
+     "gpu/shell_content_gpu_client.cc",
+     "gpu/shell_content_gpu_client.h",
+-    "renderer/memory_coordinator/memory_coordinator_test_impl.cc",
+-    "renderer/memory_coordinator/memory_coordinator_test_impl.h",
+-    "renderer/render_frame_test_helper.cc",
+-    "renderer/render_frame_test_helper.h",
+     "renderer/shell_content_renderer_client.cc",
+     "renderer/shell_content_renderer_client.h",
+-    "renderer/shell_render_frame_observer.cc",
+-    "renderer/shell_render_frame_observer.h",
+     "utility/shell_content_utility_client.cc",
+     "utility/shell_content_utility_client.h",
+   ]
+@@ -337,13 +327,8 @@
+     "//services/network:network_service",
+   ]
+   deps = [
+-    ":content_browsertests_mojom",
+     ":protocol_sources",
+     ":resources",
+-    ":rust_test_mojom",
+-    ":rust_test_mojom_js",
+-    ":rust_test_service_ffi",
+-    ":shell_controller_mojom",
+     "//base",
+     "//base:base_static",
+     "//components/cdm/renderer",
+@@ -362,7 +347,6 @@
+     "//components/performance_manager",
+     "//components/permissions",
+     "//components/prefs",
+-    "//components/services/storage/test_api",
+     "//components/surface_embed/renderer",
+     "//components/url_formatter",
+     "//components/variations/service",
+@@ -370,17 +354,13 @@
+     "//content:content_resources",
+     "//content/common:main_frame_counter",
+     "//content/public/common",
+-    "//content/test:content_test_mojo_bindings",
+     "//device/bluetooth",
+     "//media",
+     "//media/mojo:buildflags",
+     "//media/mojo/services",
+     "//net",
+     "//net:net_resources",
+-    "//services/device/public/cpp:test_support",
+     "//services/network/public/cpp",
+-    "//services/test/echo:lib",
+-    "//services/test/echo/public/mojom",
+     "//third_party/blink/public:blink",
+     "//third_party/blink/public:image_resources",
+     "//third_party/blink/public:resources",
+@@ -409,7 +389,31 @@
+     ]
+     deps += [ ":web_test_buildflags" ]
+   } else {
+-    deps += [ "//content/test:test_support" ]
++    sources += [
++      "common/main_frame_counter_test_impl.cc",
++      "common/main_frame_counter_test_impl.h",
++      "common/power_monitor_test_impl.cc",
++      "common/power_monitor_test_impl.h",
++      "renderer/memory_coordinator/memory_coordinator_test_impl.cc",
++      "renderer/memory_coordinator/memory_coordinator_test_impl.h",
++      "renderer/render_frame_test_helper.cc",
++      "renderer/render_frame_test_helper.h",
++      "renderer/shell_render_frame_observer.cc",
++      "renderer/shell_render_frame_observer.h",
++    ]
++    deps += [
++      "//components/services/storage/test_api",
++      "//content/test:content_test_mojo_bindings",
++      "//content/test:test_support",
++      "//services/device/public/cpp:test_support",
++      "//services/test/echo/public/mojom",
++      "//services/test/echo:lib",
++      ":content_browsertests_mojom",
++      ":rust_test_mojom",
++      ":rust_test_mojom_js",
++      ":rust_test_service_ffi",
++      ":shell_controller_mojom",
++    ]
+   }
+ 
+   if (is_fuchsia) {
+--- a/content/shell/browser/shell_content_browser_client.cc
++++ b/content/shell/browser/shell_content_browser_client.cc
+@@ -64,15 +64,15 @@
+ #include "content/shell/web_test_buildflags.h"
+ #if !BUILDFLAG(SHELL_MINIMAL)
+ #include "content/public/test/setup_field_trials.h"
+-#endif
+ #include "content/shell/browser/rust_test_service_ffi.rs.h"
++#include "content/shell/common/rust_test.test-mojom.h"
++#include "content/shell/common/shell_controller.test-mojom.h"
++#endif
+ #include "content/shell/browser/shell.h"
+ #include "content/shell/browser/shell_browser_context.h"
+ #include "content/shell/browser/shell_browser_main_parts.h"
+ #include "content/shell/browser/shell_devtools_manager_delegate.h"
+ #include "content/shell/browser/shell_web_contents_view_delegate_creator.h"
+-#include "content/shell/common/rust_test.test-mojom.h"
+-#include "content/shell/common/shell_controller.test-mojom.h"
+ #include "content/shell/common/shell_paths.h"
+ #include "content/shell/common/shell_switches.h"
+ #include "media/mojo/buildflags.h"
+@@ -171,6 +171,7 @@
+ }
+ #endif
+ 
++#if !BUILDFLAG(SHELL_MINIMAL)
+ class ShellControllerImpl : public mojom::ShellController {
+  public:
+   ShellControllerImpl() = default;
+@@ -206,6 +207,7 @@
+       receiver.PassPipe());
+   content::rust_test::BindRustTestService(std::move(pipe));
+ }
++#endif
+ 
+ void BindNetworkHintsHandler(
+     content::RenderFrameHost* frame_host,
+@@ -623,8 +625,10 @@
+       ->GetBinders()
+       .ExposeInterfacesToRenderFrame(map);
+   map->Add<network_hints::mojom::NetworkHintsHandler>(&BindNetworkHintsHandler);
++#if !BUILDFLAG(SHELL_MINIMAL)
+   map->Add<content::rust_test::mojom::RustTestService>(
+       base::BindRepeating(&BindRustTestServiceReceiver));
++#endif
+ #if BUILDFLAG(IS_WIN)
+   map->Add<media::mojom::MediaFoundationPreferences>(
+       &BindMediaFoundationPreferences);
+@@ -811,12 +815,14 @@
+ 
+ void ShellContentBrowserClient::BindBrowserControlInterface(
+     mojo::ScopedMessagePipeHandle pipe) {
++#if !BUILDFLAG(SHELL_MINIMAL)
+   if (!pipe.is_valid()) {
+     return;
+   }
+   mojo::MakeSelfOwnedReceiver(
+       std::make_unique<ShellControllerImpl>(),
+       mojo::PendingReceiver<mojom::ShellController>(std::move(pipe)));
++#endif
+ }
+ 
+ void ShellContentBrowserClient::set_browser_main_parts(
+--- a/content/shell/renderer/shell_content_renderer_client.cc
++++ b/content/shell/renderer/shell_content_renderer_client.cc
+@@ -27,12 +27,16 @@
+ #include "content/public/common/web_identity.h"
+ #include "content/public/renderer/render_frame.h"
+ #include "content/public/renderer/render_thread.h"
++#include "content/shell/common/shell_switches.h"
++#include "content/shell/web_test_buildflags.h"
++#if !BUILDFLAG(SHELL_MINIMAL)
+ #include "content/public/test/test_service.mojom.h"
+ #include "content/shell/common/main_frame_counter_test_impl.h"
+ #include "content/shell/common/power_monitor_test_impl.h"
+-#include "content/shell/common/shell_switches.h"
+ #include "content/shell/renderer/memory_coordinator/memory_coordinator_test_impl.h"
+ #include "content/shell/renderer/shell_render_frame_observer.h"
++#include "third_party/blink/public/web/web_testing_support.h"
++#endif
+ #include "mojo/public/cpp/bindings/binder_map.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+ #include "mojo/public/cpp/bindings/receiver.h"
+@@ -43,7 +47,6 @@
+ #include "third_party/blink/public/platform/web_url_error.h"
+ #include "third_party/blink/public/web/modules/credentialmanagement/throttle_helper.h"
+ #include "third_party/blink/public/web/web_local_frame.h"
+-#include "third_party/blink/public/web/web_testing_support.h"
+ #include "third_party/blink/public/web/web_view.h"
+ #include "v8/include/v8-initialization.h"
+ #include "v8/include/v8.h"
+@@ -64,6 +67,7 @@
+ 
+ namespace {
+ 
++#if !BUILDFLAG(SHELL_MINIMAL)
+ // A test service which can be driven by browser tests for various reasons.
+ class TestRendererServiceImpl : public mojom::TestService {
+  public:
+@@ -167,6 +171,7 @@
+ 
+   mojo::Receiver<mojom::TestService> receiver_;
+ };
++#endif
+ 
+ class ShellContentRendererUrlLoaderThrottleProvider
+     : public blink::URLLoaderThrottleProvider {
+@@ -228,11 +233,13 @@
+   scoped_refptr<base::SequencedTaskRunner> main_thread_task_runner_;
+ };
+ 
++#if !BUILDFLAG(SHELL_MINIMAL)
+ void CreateRendererTestService(
+     mojo::PendingReceiver<mojom::TestService> receiver) {
+   // Owns itself.
+   new TestRendererServiceImpl(std::move(receiver));
+ }
++#endif
+ 
+ }  // namespace
+ 
+@@ -301,6 +308,7 @@
+ 
+ void ShellContentRendererClient::ExposeInterfacesToBrowser(
+     mojo::BinderMap* binders) {
++#if !BUILDFLAG(SHELL_MINIMAL)
+   binders->Add<mojom::TestService>(
+       &CreateRendererTestService,
+       base::SingleThreadTaskRunner::GetCurrentDefault());
+@@ -313,6 +321,7 @@
+   binders->Add<mojom::MainFrameCounterTest>(
+       &MainFrameCounterTestImpl::Bind,
+       base::SingleThreadTaskRunner::GetCurrentDefault());
++#endif
+   binders->Add<web_cache::mojom::WebCache>(
+       base::BindRepeating(&web_cache::WebCacheImpl::BindReceiver,
+                           base::Unretained(web_cache_impl_.get())),
+@@ -320,10 +329,12 @@
+ }
+ 
+ void ShellContentRendererClient::RenderFrameCreated(RenderFrame* render_frame) {
++#if !BUILDFLAG(SHELL_MINIMAL)
+   // TODO(danakj): The ShellRenderFrameObserver is doing stuff only for
+   // browser tests. If we only create that for browser tests then the override
+   // of this method in WebTestContentRendererClient would not be needed.
+   new ShellRenderFrameObserver(render_frame);
++#endif
+ }
+ 
+ bool ShellContentRendererClient::OverrideCreatePlugin(
+@@ -383,10 +394,12 @@
+ 
+ void ShellContentRendererClient::DidInitializeWorkerContextOnWorkerThread(
+     v8::Local<v8::Context> context) {
++#if !BUILDFLAG(SHELL_MINIMAL)
+   if (base::CommandLine::ForCurrentProcess()->HasSwitch(
+           switches::kExposeInternalsForTesting)) {
+     blink::WebTestingSupport::InjectInternalsObject(context);
+   }
++#endif
+ }
+ 
+ std::unique_ptr<blink::URLLoaderThrottleProvider>
+--- a/content/shell/gpu/shell_content_gpu_client.cc
++++ b/content/shell/gpu/shell_content_gpu_client.cc
+@@ -6,7 +6,10 @@
+ 
+ #include "base/functional/bind.h"
+ #include "base/task/single_thread_task_runner.h"
++#include "content/shell/web_test_buildflags.h"
++#if !BUILDFLAG(SHELL_MINIMAL)
+ #include "content/shell/common/power_monitor_test_impl.h"
++#endif
+ #include "mojo/public/cpp/bindings/binder_map.h"
+ #include "mojo/public/cpp/bindings/self_owned_receiver.h"
+ 
+@@ -21,9 +24,11 @@
+     const gpu::GpuPreferences& gpu_preferences,
+     const gpu::GpuDriverBugWorkarounds& gpu_workarounds,
+     mojo::BinderMap* binders) {
++#if !BUILDFLAG(SHELL_MINIMAL)
+   binders->Add<mojom::PowerMonitorTest>(
+       &PowerMonitorTestImpl::MakeSelfOwnedReceiver,
+       base::SingleThreadTaskRunner::GetCurrentDefault());
++#endif
+ }
+ 
+ }  // namespace content

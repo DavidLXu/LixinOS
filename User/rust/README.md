@@ -42,7 +42,7 @@ The tests compile a project with a local library dependency and a build script, 
 
 ## Native compiler and Cargo build
 
-The Rust and TCC kernels can mount a dedicated `LIXBLD01` build volume. The launcher assigns 12 GiB of guest RAM to Rust and 24 GiB to TCC. The sparse image contains two alternating 4 GiB
+The Rust and TCC kernels can mount a dedicated `LIXBLD01` build volume. The launcher assigns 6 GiB of guest RAM to Rust and 24 GiB to TCC. The sparse image contains two alternating 4 GiB
 snapshot slots. The active filesystem holds up to 4 GiB less its 512-byte slot header, including record overhead. The maximum file size is 512 MiB. Changes under
 `/scratch` are written back at normal shutdown or when a persistent file is
 committed. A forced VM exit discards changes since the last checkpoint.

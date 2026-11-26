@@ -1650,3 +1650,12 @@
  #if (defined(_WIN32) || defined(__riscos__) || defined(__HAIKU__) || defined(__BEOS__) || defined(__amigaos4__) || defined(__AMIGA__) || defined(__MINT__))
  #undef HAVE_MMAP
  #endif
+--- a/netsurf/desktop/knockout.c
++++ b/netsurf/desktop/knockout.c
+@@ -83,3 +83,3 @@
+-#define KNOCKOUT_ENTRIES 3072	/* 40 bytes each */
+-#define KNOCKOUT_BOXES 768	/* 28 bytes each */
+-#define KNOCKOUT_POLYGONS 3072	/* 4 bytes each */
++#define KNOCKOUT_ENTRIES 256	/* 40 bytes each */
++#define KNOCKOUT_BOXES 64	/* 28 bytes each */
++#define KNOCKOUT_POLYGONS 512	/* 4 bytes each */

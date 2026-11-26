@@ -1,0 +1,13 @@
+--- a/external/argon2/ExternalProject_argon2.mk
++++ b/external/argon2/ExternalProject_argon2.mk
+@@ -43,8 +43,9 @@
+ 	$(call gb_Trace_StartRange,argon2,EXTERNAL)
+ 	$(call gb_ExternalProject_run,build,\
+ 		CFLAGS="$(CFLAGS) $(if $(filter-out WNT MACOSX,$(OS)),-fvisibility=hidden) -fPIC" \
+-		MAKEFLAGS= $(MAKE) \
++		MAKEFLAGS= $(MAKE) $(if $(DISABLE_DYNLOADING),libargon2.a) \
+ 			OPTTARGET=$(if $(filter X86_64,$(CPUNAME)),x86-64,forcefail) \
++		$(if $(DISABLE_DYNLOADING),&& $(AR) rcs libargon2.a src/argon2.o src/core.o src/blake2/blake2b.o src/thread.o src/encoding.o src/ref.o) \
+ 		$(if $(CROSS_COMPILING),,&& $(MAKE) test) \
+ 	)
+ 	$(call gb_Trace_EndRange,argon2,EXTERNAL)

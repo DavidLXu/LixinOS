@@ -577,11 +577,20 @@ static int read_key(Session *s) {
 static Session *login_session(int id,const char *cwd) {
     Session *s=new_session(id,cwd);
     const char *home="/home/lixin";
-    if (lx_stat(home)!=LX_DIR) return s;
+    if (lx_stat("/etc/passwd")>=0 && lx_console_call(64,0)==1 &&
+        lx_console_call(64,1)==0) {
+        unsigned uid=((unsigned *)MAIL)[1];
+        home=uid==0 ? "/root" : value(s,"HOME");
+        if (!*home && uid==1000) home="/home/lixin";
+    }
+    if (*home!='/' || strlen(home)>LINE-10 || lx_stat(home)!=LX_DIR) return s;
+    char profile[LINE+1];
+    snprintf(profile,sizeof(profile),"%s/.profile",home);
     char *dir=query(CHDIR,0,home);
     if (!dir) return s;
-    strcpy(s->cwd,dir); assign(s,"HOME",home);
-    int fd=lx_open("/home/lixin/.profile");
+    strcpy(s->cwd,dir);
+    if (!equal(value(s,"HOME"),home)) assign(s,"HOME",home);
+    int fd=lx_open(profile);
     if (fd<0) return s;
     char block[256],line[LINE+1];
     int used=0,number=0,n;
@@ -703,10 +712,13 @@ int main(int argc,char **argv) {
         if (result<0) { printf("shell: %s\n",error); return 1; }
         return status;
     }
-    if (argc!=1 || !lx_stdout_is_terminal()) {
+    int launch=argc==3 && equal(argv[1],"--launch") && strlen(argv[2])<=LINE;
+    if ((!launch && argc!=1) || !lx_stdout_is_terminal()) {
         lx_error("Bash requires an interactive terminal\n");
         return 1;
     }
+    char startup[LINE+1];
+    if (launch) strcpy(startup,argv[2]);
     unsigned flags=lx_start_flags();
     char *cwd=query(CHDIR,0,".");
     lx_console_call(57,0); /* The interactive line editor handles its own Ctrl+C. */
@@ -731,6 +743,12 @@ int main(int argc,char **argv) {
         puts("  ARM64 / QEMU virt   Disk mounted\n  help  Commands     htop  System monitor     shutdown  Power off\n");
     }
     if (flags&2) puts(shell_identity);
+    if (launch) {
+        prompt(initial);
+        puts(startup);
+        strcpy(initial->line,startup);
+        if (command(active)>0) return initial->status;
+    }
     prompt(initial);
     for (;;) {
         if (flags&4) {

@@ -1,0 +1,20 @@
+--- a/bus/main.c
++++ b/bus/main.c
+@@ -346,6 +346,9 @@
+     }
+ 
+     if (!daemonize) {
++        /* The LixinOS console shell can itself be PID 1. Its session
++         * launcher explicitly owns and stops the daemon and engine. */
++#ifndef __lixinos__
+         if (getppid () == 1) {
+             g_warning ("The parent process died.");
+             exit_and_free_context (EXIT_SUCCESS, context);
+@@ -387,6 +390,7 @@
+             g_unix_signal_add (SIGUSR1, (GSourceFunc)_on_sigusr1, NULL);
+ #endif
+ #endif
++#endif
+     }
+     bus_server_run ();
+     g_option_context_free (context);

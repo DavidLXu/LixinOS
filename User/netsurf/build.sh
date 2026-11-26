@@ -124,8 +124,8 @@ rt="${LIXINOS_GCC_BUILD:-$root/Kernel/target/gcc-port}/rt"
 bash "$root/User/gcc/build.sh" rt
 aarch64-none-elf-objcopy --redefine-sym _start=lx_musl_start "$musl/sysroot/lib/crt1.o" "$build/crt1.o"
 "$musl/cc" -Os -ffreestanding -fno-builtin -DLX_APPLICATION -D_start=lx_app_start -I"$root/User/gcc" -c "$root/User/cpython/loader.c" -o "$build/crt0.o"
-# Keep jump tables and constants in the guest data bank, leaving text for code.
-sed -e 's|\*(.rodata\*)||' -e 's|\*(.data\*)|*(.rodata*) *(.data*)|' \
+# Keep the desktop in the small image so terminal sessions can resume it.
+sed -e 's|\*(.rodata\*) \*(.eh_frame\*)||' -e 's|\*(.data\*)|*(.rodata*) *(.eh_frame*) *(.data*)|' \
     "$root/User/gcc/application.ld" > "$build/browser.ld"
 cat > "$build/Makefile.config" <<EOF
 override NETSURF_LOG_LEVEL := WARNING
@@ -139,7 +139,7 @@ override NETSURF_FB_FRONTEND := lixin
 override NETSURF_FB_RESPATH := /lib/netsurf
 override NETSURF_HOMEPAGE := file:///lib/netsurf/welcome.html
 CFLAGS += -I$port -D_GNU_SOURCE -Oz -flto=auto -ffunction-sections -fdata-sections
-LDFLAGS += -flto=auto -Oz -static -nostartfiles -Wl,--gc-sections,-z,max-page-size=4096,--build-id=none,-T,$build/browser.ld $build/start.o $build/crt0.o $build/crt1.o -Wl,--start-group
+LDFLAGS += -flto=auto -Oz -static -nostartfiles -Wl,-Map,$build/browser.map,--gc-sections,-z,max-page-size=4096,--build-id=none,-T,$build/browser.ld $build/start.o $build/crt0.o $build/crt1.o -Wl,--start-group
 EOF
 cmp -s "$build/Makefile.config" "$src/netsurf/Makefile.config" || cp "$build/Makefile.config" "$src/netsurf/Makefile.config"
 patch_id=$(shasum -a 256 "$port/lixinos.patch" | cut -d' ' -f1)
@@ -151,7 +151,7 @@ obj="$src/netsurf/build/LixinOS-framebuffer"
 inc=(-I"$hb/src" -I"$build" -I"$port" -I"$root/User" -I"$src/netsurf" -I"$src/netsurf/include" -I"$prefix/include" -I"$obj"
      -I"$cache/links-port" -I"$cache/bearssl-0.6/inc")
 "$musl/cc" -c "$port/start.S" -o "$build/start.o"
-sources=("$root/User/gui/han-font.c" "$port/http.c" "$port/han.c" "$port/scalable.c" "$port/svg.c" "$port/root_lengths.c" "$root/User/desktop/desktop.c" "$root/User/links/load.c"
+sources=("$root/User/gui/han-font.c" "$port/http.c" "$port/desktop-image.c" "$port/han.c" "$port/scalable.c" "$port/svg.c" "$port/root_lengths.c" "$root/User/desktop/desktop.c" "$root/User/links/load.c"
          "$root/User/links/tls.c" "$root/User/links/cookies.c" "$root/User/tcc/api.c")
 objects=()
 for file in "${sources[@]}"; do
@@ -161,12 +161,18 @@ for file in "${sources[@]}"; do
 done
 make SHELL=/bin/bash -j8 -C "$src/netsurf" -f Makefile -f "$port/target.mk" GBFLAGS= TARGET=framebuffer HOST=LixinOS CC="$musl/cc" \
     BUILD_LIBPNG_CFLAGS="$host_png_cflags" BUILD_LIBPNG_LDFLAGS="$host_png_libs" \
-    PORT_OBJECTS="${objects[*]} $cache/desktop-font.o" \
+    PORT_OBJECTS="${objects[*]}" \
     PORT_LIBS="$hb/guest.o $prefix/lib/libplutosvg.a $prefix/lib/libplutovg.a $cache/bearssl-0.6/arm/libbearssl.a $rt/liblx.a -lc -lm -lgcc"
 package="$build/package"
 res="$src/netsurf/frontends/framebuffer/res"
 mkdir -p "$package/lib/netsurf/fonts" "$package/bin" "$package/lib/netsurf/licenses"
+# Extract the same little-endian table embedded by the smaller standalone desktop.
+aarch64-none-elf-gcc -O0 -fdata-sections -x c -c "$root/User/desktop/launcher-pinyin.h" -o "$build/pinyin.o"
+aarch64-none-elf-objcopy --dump-section ".rodata.launcher_dictionary=$package/lib/netsurf/launcher-pinyin" "$build/pinyin.o"
 cp "$build"/NotoSans{,Arabic,Hebrew,Devanagari,Tamil}.ttf "$package/lib/netsurf/fonts/"
+python3 "$root/User/desktop/launcher-icons.py" "$package/lib/netsurf/launcher-icons.bin"
+cp "$root/User/desktop/icons/COPYING" "$package/lib/netsurf/licenses/Papirus"
+cp "$root/User/desktop/icons/FLUENT-LICENSE" "$package/lib/netsurf/licenses/Fluent-Emoji"
 cp "$hb/COPYING" "$package/lib/netsurf/licenses/HarfBuzz"
 cp "$build/noto-OFL.txt" "$package/lib/netsurf/licenses/Noto"
 swift "$root/User/desktop/outlines.swift" "$package/lib/netsurf/outlines"

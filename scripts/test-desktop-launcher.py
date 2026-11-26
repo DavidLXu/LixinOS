@@ -78,6 +78,13 @@ def exercise(guest, control, directory, screenshot):
     wait(x,142,"e48c32")
     if screenshot:
         subprocess.run(["sips","-s","format","png",frame,"--out",screenshot],check=True)
+    for query in ("计算器","Ji Suan Qi","jsq","calculator"):
+        guest.send(b"\x15"+query.encode())
+        wait(x,142,"378679")
+    guest.send(b"\x15no-such-app-zz\r")
+    wait(2,2,"203f51")
+    guest.send(b"\x15")
+    wait(x,142,"e48c32")
     point(x,240)
     button("wheel-down",True)
     button("wheel-down",False)
@@ -93,6 +100,32 @@ def exercise(guest, control, directory, screenshot):
     click(120,77)           # System filter resets the scroll offset.
     wait(x,142,"e48c32")
     click(52,77)
+    # Launch a REPL, then use the shell in the same tab after the REPL exits.
+    def open_program(name):
+        select_icon(click,qmp,W,H,names.index(name)+6,len(names)+6)
+    # All categories exist on this fixture, including Other (the zz clients).
+    click(24+6*66+30,77)
+    catalog = (HERE.parent/"User/desktop/launcher-programs.def").read_bytes().splitlines()
+    terminal_files = {line.split(b'"')[1] for line in catalog if b", GROUP_TERMINAL," in line}
+    terminal_apps = [name for name in names if name in terminal_files]
+    select_icon(click,qmp,W,H,terminal_apps.index(b"python3"),len(terminal_apps))
+    guest.until(b">>> ",timeout=60)
+    guest.expect(b"print(6 * 7)\r", b">>> ", b"42")
+    guest.send(b"raise SystemExit\r")
+    guest.until(b"$ ", timeout=45)
+    guest.expect(b"echo terminal-still-open\r", b"$ ", b"\nterminal-still-open\n")
+    guest.send(b"exit\r")
+    wait(2,2,"281e2b")
+    click(36,dock_y)
+    wait(2,2,"203f51")
+    # Paint owns the main canvas. Quitting it must restore Desktop directly.
+    click(52,77)  # Reopen All after using the terminal filter.
+    open_program(b"paint")
+    guest.until(b"Wheel: width",timeout=60)
+    guest.send(b"q")
+    wait(2,2,"281e2b")
+    click(36,dock_y)
+    wait(2,2,"203f51")
     select_icon(click,qmp,W,H,names.index(b"zz-launcher.win")+6,len(names)+6)
     left, top = 76+(W-76-360)//2,(H-246)//2
     wait(left+360-19,top+11,"f1d6cc")

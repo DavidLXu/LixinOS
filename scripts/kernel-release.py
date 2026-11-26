@@ -145,9 +145,8 @@ def build(tree, output, disk, tag):
 def publish(temp, guest_disk):
     now = datetime.now().astimezone()
     prefix = f"kernel-{now.date()}."
-    nums = [int(tag[len(prefix):]) for tag in git("tag", "--list", prefix + "*").splitlines()
-            if re.fullmatch(TAG_PATTERN, tag)]
-    tag = prefix + str(max(nums, default=0) + 1)
+    previous = latest_tag(prefix)
+    tag = prefix + str(int(previous[len(prefix):]) + 1 if previous else 1)
     print(f"Building {tag}", flush=True)
     tree = temp / "src"
     tree.mkdir()
@@ -197,7 +196,7 @@ def _tag_key(tag):
     return (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))) if m else None
 
 
-def latest_tag():
+def latest_tag(prefix="kernel-"):
     gdir = _git_dir()
     if gdir is None:
         return ""
@@ -211,7 +210,7 @@ def latest_tag():
     if tags_dir.is_dir():
         for entry in tags_dir.iterdir():
             key = _tag_key(entry.name)
-            if key is not None:
+            if key is not None and entry.name.startswith(prefix):
                 tags.append((key, entry.name))
     packed = common / "packed-refs"
     if packed.is_file():
@@ -222,11 +221,11 @@ def latest_tag():
             if len(parts) == 2 and parts[1].startswith("refs/tags/"):
                 name = parts[1][len("refs/tags/"):]
                 key = _tag_key(name)
-                if key is not None:
+                if key is not None and name.startswith(prefix):
                     tags.append((key, name))
     if tags:
         return max(tags)[1]
-    git_tags = git("tag", "-l", "--sort=-version:refname", "kernel-*").splitlines()
+    git_tags = git("tag", "-l", "--sort=-version:refname", prefix + "*").splitlines()
     return next((tag for tag in git_tags if re.fullmatch(TAG_PATTERN, tag)), "")
 
 

@@ -9,6 +9,7 @@ mod agent_tools;
 #[cfg(feature = "retina")]
 mod clipboard;
 mod disk;
+mod permissions;
 mod foreground;
 mod fs_batch;
 #[cfg(feature = "retina")]
@@ -214,7 +215,21 @@ fn read_timed_byte(milliseconds: u64) -> Option<u8> {
 
 #[unsafe(no_mangle)]
 extern "C" fn console_io(value: u64, operation: u64) -> u64 {
-    let result = console_service(value, operation);
+    unsafe extern "C" {
+        fn kt_call(request: u64) -> u64;
+        fn kt_service_enter();
+        fn kt_service_leave();
+    }
+    let result = if operation == 61 {
+        if crate::utility::smp_clock_allowed() != 0 { unsafe { kt_call(value) } } else { u64::MAX }
+    } else if matches!(operation, 38 | 43) {
+        console_service(value, operation)
+    } else {
+        unsafe { kt_service_enter(); }
+        let result = console_service(value, operation);
+        unsafe { kt_service_leave(); }
+        result
+    };
     match scheduler::stopped() {
         130 => (-4095i64) as u64,
         137 => (-4094i64) as u64,

@@ -21,7 +21,9 @@ loading the larger executable on the ordinary working disk.
 The first version hosts an application's windows inside one desktop window.
 Large dialogs are scaled to fit the available area. GLib reads private
 file mappings into memory for GSettings and other file-backed resources.
-Dynamic GTK modules, native input methods, OpenGL acceleration, printing,
+Run `ibus-run desktop` to start the IBus session for GTK applications.
+The built-in GTK IBus module supports Compose with F12 as the compose key.
+Dynamic GTK modules, OpenGL acceleration, printing,
 and desktop-wide clipboard ownership require further integration.
 
 ## Build and install

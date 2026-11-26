@@ -1,0 +1,23 @@
+--- a/src/Gui/Application.cpp
++++ b/src/Gui/Application.cpp
+@@ -151,6 +151,10 @@
+ # include <tracy/Tracy.hpp>
+ #endif
+ 
++#ifdef __lixinos__
++extern void lxInstallPinyin(QApplication *) __attribute__((weak));
++#endif
++
+ using namespace Gui;
+ using namespace Gui::DockWnd;
+ using namespace std;
+@@ -2562,6 +2566,9 @@
+ 
+     int argc = App::Application::GetARGC();
+     GUISingleApplication mainApp(argc, App::Application::GetARGV());
++#ifdef __lixinos__
++    if (::lxInstallPinyin) ::lxInstallPinyin(&mainApp);
++#endif
+ 
+ #if (COIN_MAJOR_VERSION * 100 + COIN_MINOR_VERSION * 10 + COIN_MICRO_VERSION < 406) \
+     && (defined(FC_OS_LINUX) || defined(FC_OS_BSD))

@@ -125,7 +125,7 @@ meson_library() {
 glib="$build/glib-2.86.0"
 bash "$port/build-ffi.sh"
 install -m 644 "$port/gmodule-lixinos.c" "$port/static-modules.h" "$glib/gmodule/"
-for diff in "$root/User/gtk3/glib.patch" "$port/glib-lixinos.patch"; do
+for diff in "$root/User/gtk3/glib.patch" "$port/glib-lixinos.patch" "$port/glib-pollable.patch"; do
     if ! patch -f -Rs --dry-run -p1 -d "$glib" < "$diff" >/dev/null 2>&1; then
         patch -f -s -p1 -d "$glib" < "$diff"
     fi

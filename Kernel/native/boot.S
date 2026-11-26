@@ -17,5 +17,5 @@ power_off:
     ret
 .bss
 .balign 16
-    .skip 131072
+    .skip 65536
 boot_stack_top:

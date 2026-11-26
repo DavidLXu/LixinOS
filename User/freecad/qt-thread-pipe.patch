@@ -1,0 +1,11 @@
+--- a/src/corelib/kernel/qeventdispatcher_unix.cpp
++++ b/src/corelib/kernel/qeventdispatcher_unix.cpp
+@@ -20,7 +20,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
+-#if __has_include(<sys/eventfd.h>)
++#if __has_include(<sys/eventfd.h>) && !defined(__lixinos__)
+ #  include <sys/eventfd.h>
+ static constexpr bool UsingEventfd = true;
+ #else

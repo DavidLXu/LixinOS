@@ -1,0 +1,13 @@
+--- a/meson.build
++++ b/meson.build
+@@ -450,9 +450,9 @@
+   subdir('ui')
+ endif
+ if cc.get_define('__lixinos__') == ''
+   subdir('tools')
+-  subdir('bus')
+ endif
++subdir('bus')
+ if get_option('setup')
+   subdir('setup')
+ endif

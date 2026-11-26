@@ -1,0 +1,20 @@
+--- a/src/Standard/Standard_StackTrace.cxx
++++ b/src/Standard/Standard_StackTrace.cxx
+@@ -27,7 +27,7 @@
+   #include <emscripten/emscripten.h>
+ #elif defined(__ANDROID__)
+ // #include <unwind.h>
+-#elif defined(__QNX__)
++#elif defined(__QNX__) || defined(__lixinos__)
+ // #include <backtrace.h> // requires linking to libbacktrace
+ #elif !defined(_WIN32) && !(defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE)
+   #include <execinfo.h>
+@@ -205,7 +205,7 @@
+ #elif defined(__ANDROID__)
+   Message::SendTrace("Standard::StackTrace() is not implemented for this platform");
+   return false;
+-#elif defined(__QNX__)
++#elif defined(__QNX__) || defined(__lixinos__)
+   // bt_get_backtrace()
+   Message::SendTrace("Standard::StackTrace() is not implemented for this platform");
+   return false;

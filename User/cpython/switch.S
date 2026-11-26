@@ -29,3 +29,8 @@ lx_switch:
     ldp x27,x28,[x1,#64]
     ldp x29,x30,[x1,#80]
     ret
+
+.global lx_exit_on_stack
+lx_exit_on_stack:
+    mov sp,x2
+    b lx_finish_native_thread

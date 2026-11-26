@@ -1,0 +1,32 @@
+--- a/mtk/mtk/mtk-anonymous-file.c
++++ b/mtk/mtk/mtk-anonymous-file.c
+@@ -311,14 +311,19 @@
+   if (file->size == 0)
+     return fd;
+ 
++#ifdef __lixinos__
++  /* The source is read-only. Guest shared fds support shared maps. */
++  src = mmap (NULL, file->size, PROT_READ, MAP_SHARED, file->fd, 0);
++#else
+   src = mmap (NULL, file->size, PROT_READ, MAP_PRIVATE, file->fd, 0);
++#endif
+   if (src == MAP_FAILED)
+     {
+       close (fd);
+       return -1;
+     }
+ 
+-  dst = mmap (NULL, file->size, PROT_WRITE, MAP_SHARED, fd, 0);
++  dst = mmap (NULL, file->size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+   if (dst == MAP_FAILED)
+     {
+       close (fd);
+@@ -346,7 +351,7 @@
+ void
+ mtk_anonymous_file_close_fd (int fd)
+ {
+-#if defined(HAVE_MEMFD_CREATE)
++#if defined(HAVE_MEMFD_CREATE) && !defined(__lixinos__)
+   int seals;
+ 
+   seals = fcntl (fd, F_GET_SEALS);

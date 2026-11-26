@@ -18,8 +18,8 @@ unsafe extern "C" {
     fn smp_revoke_clock(cpu: u32);
     fn swap_stack(save: *mut usize, resume: usize, fresh_top: usize);
 }
-pub const CAPACITY: usize = 16;
-const STACK_BYTES: usize = 128 * 1024;
+pub const CAPACITY: usize = 64;
+const STACK_BYTES: usize = 64 * 1024;
 type ExitStatus = Result<u8, &'static str>;
 type Entry = Box<dyn FnOnce() -> ExitStatus>;
 #[derive(Clone, Copy, PartialEq)]
@@ -39,6 +39,7 @@ struct Task {
     pid: usize,
     pane: usize,
     parent: usize,
+    thread: bool,
     job: bool,
     watching: bool,
     stop: u8,
@@ -59,6 +60,7 @@ impl Task {
         pid: 0,
         pane: 0,
         parent: 0,
+        thread: false,
         job: false,
         watching: false,
         stop: 0,
@@ -219,8 +221,13 @@ pub fn terminal_id() -> usize {
 pub fn background() -> bool {
     task(active()).background
 }
+pub fn query_pid(value: u64) -> u64 {
+    if value == 0 { return pid() as u64; }
+    if value == u64::MAX { return task(crate::user::bank()).parent as u64; }
+    if (0..CAPACITY).any(|i| !task(i).thread && task(i).state != State::Free && task(i).pid as u64 == value) { value } else { 0 }
+}
 pub fn pid() -> usize {
-    task(active()).pid
+    task(crate::user::bank()).pid
 }
 pub fn ticks() -> u64 {
     unsafe { task(active()).ticks + crate::monitor::ticks().wrapping_sub(LAST_SWITCH[core_id()]) }
@@ -228,14 +235,12 @@ pub fn ticks() -> u64 {
 pub(crate) fn uptime_ticks() -> u64 {
     crate::monitor::ticks().wrapping_sub(unsafe { START_TICKS })
 }
-#[cfg(feature = "retina")]
-pub fn stack_bounds() -> (usize, usize) {
-    let stack = &task(active()).stack;
-    let base = stack.as_ptr() as usize;
-    (base, base + stack.len() * 16)
-}
 pub fn spawn(entry: Entry, pane: usize) -> Result<usize, &'static str> {
-    let slot = (1..CAPACITY)
+    spawn_task(entry, pane, false)
+}
+fn spawn_task(entry: Entry, pane: usize, thread: bool) -> Result<usize, &'static str> {
+    let slots = if thread { crate::user::BANKS..CAPACITY } else { 1..crate::user::BANKS };
+    let slot = slots.into_iter()
         .find(|&i| task(i).state == State::Free)
         .ok_or("process table full")?;
     let mut stack = alloc::vec::Vec::new();
@@ -248,7 +253,9 @@ pub fn spawn(entry: Entry, pane: usize) -> Result<usize, &'static str> {
         NEXT_PID = id.checked_add(1).ok_or("PID limit")?;
         id
     };
-    crate::user::setup_bank(slot)?;
+    if !thread { crate::user::setup_bank(slot)?; }
+    unsafe extern "C" { fn id_inherit(child: u32, parent: u32); }
+    unsafe { id_inherit(slot as u32,crate::user::bank() as u32); }
     *task(slot) = Task {
         state: State::Ready,
         core: choose_core(),
@@ -265,11 +272,58 @@ pub fn spawn(entry: Entry, pane: usize) -> Result<usize, &'static str> {
         },
         stack,
         entry: Some(entry),
+        thread,
         ..Task::EMPTY
     };
     runnable(slot);
     Ok(pid)
 }
+unsafe extern "C" {
+    fn kt_run(slot: u32) -> i64;
+    pub(crate) fn kt_owner(slot: u32) -> u32;
+}
+#[unsafe(no_mangle)]
+extern "C" fn kt_slot() -> u32 { active() as u32 }
+#[unsafe(no_mangle)]
+extern "C" fn kt_new() -> i64 {
+    let owner = crate::user::bank();
+    let Ok(tid) = spawn_task(Box::new(|| { unsafe { kt_run(active() as u32); } Ok(0) }), pane(), true) else { return -1; };
+    let slot = (1..CAPACITY).find(|&i| task(i).pid == tid).unwrap();
+    let mut load = [0usize; 2];
+    load[task(owner).core] = 1;
+    for i in 1..CAPACITY {
+        if i != slot && task(i).thread && unsafe { kt_owner(i as u32) } as usize == owner { load[task(i).core] += 1; }
+    }
+    task(slot).core = usize::from(unsafe { smp_cpus() } == 2 && load[1] < load[0]);
+    task(slot).parent = task(owner).pid;
+    slot as i64
+}
+#[unsafe(no_mangle)]
+extern "C" fn kt_id(slot: u32) -> i64 { task(slot as usize).pid as i64 }
+#[unsafe(no_mangle)]
+extern "C" fn kt_park(ticks: u64) { block(State::Sleeping(ticks)); }
+#[unsafe(no_mangle)]
+extern "C" fn kt_unpark(slot: u32) { unblock_slot(slot as usize); }
+fn unblock_slot(i: usize) {
+    let waiters = unsafe { &mut *addr_of_mut!(WAITERS) };
+    if let Some(n) = waiters.iter().position(|&slot| slot == i) {
+        waiters.swap_remove(n);
+        runnable(i);
+    }
+}
+#[unsafe(no_mangle)]
+extern "C" fn kt_stop(slot: u32) {
+    let i = slot as usize;
+    let cpu = task(i).core;
+    if unsafe { ACTIVE[cpu] } == i { unsafe { smp_revoke_clock(cpu as u32); } }
+    task(i).stop = 137;
+    unblock_slot(i);
+}
+#[unsafe(no_mangle)]
+extern "C" fn kt_stopped() -> i32 { stopped() as i32 }
+#[unsafe(no_mangle)]
+extern "C" fn kt_sleep(ms: u32) { if ms == 0 { schedule(); } else { sleep_ms(ms as u64); } }
+
 pub fn init() {
     for c in 0..2 {
         let idle = task(CAPACITY+c);
@@ -358,7 +412,7 @@ extern "C" fn smp_timer_irq(_frame: *mut u8) {
 // on the new stack releases both allocations, even before its parent waits.
 fn collect_retired() {
     if let Some(slot) = unsafe { (&mut *addr_of_mut!(RETIRED)).take() } {
-        crate::user::free_space(slot);
+        if slot < crate::user::BANKS { crate::user::free_space(slot); }
         task(slot).stack = Vec::new();
     }
 }
@@ -372,8 +426,8 @@ extern "C" fn start_task() -> ! {
 }
 pub fn finish(status: ExitStatus) -> ! {
     let slot = active();
-    crate::user::release_image();
-    let id = pid();
+    if task(slot).thread { task(slot).parent = 0; } else { crate::user::release_image(); }
+    let id = task(slot).pid;
     notify(|s| s == State::Waiting(id) || matches!(s, State::Foreground(child, _) if child == id));
     for i in 0..CAPACITY {
         if task(i).parent == id {
@@ -387,7 +441,7 @@ pub fn finish(status: ExitStatus) -> ! {
 }
 
 pub fn job(pid: usize) {
-    if let Some(i) = (1..CAPACITY).find(|&i| task(i).pid == pid && task(i).parent == self::pid()) {
+    if let Some(i) = (1..CAPACITY).find(|&i| !task(i).thread && task(i).pid == pid && task(i).parent == self::pid()) {
         task(i).job = true;
     }
 }
@@ -413,7 +467,7 @@ fn stop_tree(slot: usize, status: u8) {
 }
 
 pub fn stop_child(pid: usize) -> bool {
-    if let Some(i) = (1..CAPACITY).find(|&i| task(i).pid == pid && task(i).parent == self::pid()) {
+    if let Some(i) = (1..CAPACITY).find(|&i| !task(i).thread && task(i).pid == pid && task(i).parent == self::pid()) {
         stop_tree(i, 137);
         true
     } else { false }
@@ -462,7 +516,7 @@ fn foreground_input(child: usize) -> bool {
 pub fn wait(pid: usize) -> Result<u8, &'static str> {
     let parent = self::pid();
     let slot = (1..CAPACITY)
-        .find(|&i| task(i).pid == pid && task(i).parent == parent && task(i).state != State::Free)
+        .find(|&i| !task(i).thread && task(i).pid == pid && task(i).parent == parent && task(i).state != State::Free)
         .ok_or("not a child process")?;
     loop {
         if let State::Exited(status) = task(slot).state {
@@ -483,7 +537,7 @@ pub fn wait(pid: usize) -> Result<u8, &'static str> {
 
 pub(crate) fn try_wait(pid: usize) -> Option<ExitStatus> {
     let parent = self::pid();
-    let slot = (1..CAPACITY).find(|&i| task(i).pid == pid && task(i).parent == parent)?;
+    let slot = (1..CAPACITY).find(|&i| !task(i).thread && task(i).pid == pid && task(i).parent == parent)?;
     if let State::Exited(status) = task(slot).state {
         *task(slot) = Task::EMPTY;
         return Some(status);
@@ -505,7 +559,7 @@ pub fn wake(channel: usize) {
     notify(|s| s == State::Channel(channel));
 }
 pub fn detach(pid: usize) {
-    if let Some(slot) = (1..CAPACITY).find(|&i| task(i).pid == pid && task(i).parent == self::pid())
+    if let Some(slot) = (1..CAPACITY).find(|&i| !task(i).thread && task(i).pid == pid && task(i).parent == self::pid())
     {
         task(slot).parent = 0;
         task(slot).background = true;
@@ -545,7 +599,7 @@ pub fn schedule() {
         }
         ACTIVE[cpu] = new;
         smp_bind_kernel();
-        crate::user::select_bank(if new < CAPACITY { new } else { 0 });
+        crate::user::select_bank(if new < CAPACITY { kt_owner(new as u32) as usize } else { 0 });
         let stack = &task(new).stack;
         let top = stack.as_ptr() as usize + stack.len() * 16;
         swap_stack(addr_of_mut!(task(old).sp), task(new).sp, top);

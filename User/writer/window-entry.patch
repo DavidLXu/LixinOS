@@ -1,0 +1,22 @@
+--- a/desktop/source/app/main.c
++++ b/desktop/source/app/main.c
+@@ -46,8 +46,19 @@
+ #endif
+ #endif // NOTEST_xmlCleanupParser
+ 
++#ifdef __lixinos__
++extern void writer_environment(void);
++extern int writer_window(int argc, char **argv);
++SAL_IMPLEMENT_MAIN_WITH_ARGS(argc, argv)
++#else
+ SAL_IMPLEMENT_MAIN()
++#endif
+ {
++#ifdef __lixinos__
++    writer_environment();
++    if (argc == 1 || (argc > 1 && argv[1][0] != '-'))
++        return writer_window(argc, argv);
++#endif
+     int ret = soffice_main();
+ #ifndef NOTEST_xmlCleanupParser
+ #ifdef DBG_UTIL

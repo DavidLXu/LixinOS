@@ -5,8 +5,16 @@ LixinOS 已能在 QEMU 图形终端原生运行 GNOME Shell 49.0。进入图形�
 `desktop` 或 `startxfce4`。三种会话可装在同一块盘上。
 
 当前图形栈使用 Mutter 49.0、GJS 1.86.0 和 Mesa 24.3.4。图形启动器默认优先选择 VirGL，
-Mutter 通过 VirtIO GPU 合成桌面。回退到 ramfb 时使用 softpipe。GNOME Shell
-的音频服务、IBus 输入法守护进程和完整的 GDM 图形登录待接入。
+Mutter 通过 VirtIO GPU 合成桌面。回退到 ramfb 时使用 softpipe。Doom 和视频播放器使用 VirtIO 音频输出。
+GNOME 面板的 PulseAudio 音量控制仍需要独立的音频服务。
+
+在系统控制台用 `passwd lixin` 设置普通账户密码，运行 `gdm` 打开 GNOME 图形登录。
+`gdm --console` 提供同一认证后端的文本界面。单座席后端使用 GDM 49 的 D-Bus 接口、
+Linux-PAM 和内核对端凭据。登录后的桌面以普通用户身份运行。
+
+装有 IBus 时，`startgnome` 会启动当前用户的守护进程和 Compose 引擎。
+运行 `ibus-run desktop` 可在原生桌面的 GTK 3 应用中使用同一输入服务。
+在 GTK 输入框依次按 F12、单引号和 e 可输入 é。
 
 ## 已验证的用户态基础
 

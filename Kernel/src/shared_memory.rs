@@ -5,7 +5,7 @@ use core::{cell::RefCell, ptr::NonNull};
 
 pub(crate) const PAGE: usize = 4096;
 pub(crate) const LIMIT: usize = 16 << 20;
-pub(crate) const MAPS: usize = 16;
+pub(crate) const APERTURE: usize = crate::GIB;
 pub(crate) const RIGHTS: usize = 8;
 pub(crate) const MARKERS: usize = 16;
 pub(crate) const CONTROL: usize = 4096 - (2 + RIGHTS) * 4;

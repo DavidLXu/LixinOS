@@ -23,6 +23,9 @@ src="$build/$name"
 if ! patch -f -Rs --dry-run -d "$src" -p1 < "$port/dbus.patch" >/dev/null 2>&1; then
     patch --batch -s -d "$src" -p1 < "$port/dbus.patch"
 fi
+if ! patch -f -Rs --dry-run -d "$src" -p1 < "$port/fd-limit.patch" >/dev/null 2>&1; then
+    patch --batch -s -d "$src" -p1 < "$port/fd-limit.patch"
+fi
 [[ -f "$gtk/sysroot/lib/libexpat.a" ]] || bash "$root/User/gtk3/build.sh"
 cross=("$cache"/arm-gnu-toolchain-*-aarch64-none-elf)
 export PATH="$gtk/tools/bin:${cross[0]}/bin:$PATH"
@@ -41,6 +44,13 @@ cmake -S "$src" -B "$stage" -G Ninja \
     -DDBUS_RELOCATABLE=OFF -DDBUS_ENABLE_VERBOSE_MODE=OFF -DENABLE_TRADITIONAL_ACTIVATION=OFF \
     -DEXPAT_INCLUDE_DIR="$gtk/sysroot/include" -DEXPAT_LIBRARY="$gtk/sysroot/lib/libexpat.a"
 cmake --build "$stage" --parallel "${JOBS:-8}" --target dbus-daemon dbus-send dbus-uuidgen
+# CMake invokes the SDK wrapper, whose runtime archive is external to Ninja.
+# Relink when the POSIX adapter changes, including peer credential handling.
+for name in dbus-daemon dbus-send dbus-uuidgen; do
+    if [[ "$build/runtime/rt/liblx.a" -nt "$stage/bin/$name" ]]; then
+        (cd "$stage" && ninja -t commands "bin/$name" | tail -1 | sh)
+    fi
+done
 "$build/runtime/cc" -Os -ffunction-sections -fdata-sections \
     -I"$cache/cpython-port/musl-1.2.5/src/process" "$port/run-session.c" "$root/User/rust/spawn.c" \
     -o "$stage/bin/dbus-run-session"

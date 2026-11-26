@@ -11,7 +11,7 @@ void free(void *);
 #include "../links/unicode.h"
 #include "../tcc/lixin.h"
 
-static unsigned char *load_atlas(const char *path, int bytes) {
+unsigned char *lx_load_font_atlas(const char *path, int bytes) {
     int fd = lx_open(path);
     if (fd < 0) return NULL;
     unsigned char *data = malloc(bytes);
@@ -35,7 +35,7 @@ const unsigned char *lx_han_glyph(unsigned codepoint) {
         return NULL;
     if (!attempted) {
         attempted = 1;
-        font = load_atlas("/src/links/han.font", 0x7300 * 32);
+        font = lx_load_font_atlas("/src/links/han.font", 0x7300 * 32);
     }
     return font ? font + slot * 32 : NULL;
 }
@@ -57,7 +57,7 @@ const unsigned char *lx_pingfang_glyph(unsigned codepoint, int scale) {
         const int digits = sizeof(path) - sizeof("00.gray");
         path[digits] = hex[(codepoint >> 12) & 15];
         path[digits + 1] = hex[(codepoint >> 8) & 15];
-        pages[page] = load_atlas(path, 32 + 256 * 640);
+        pages[page] = lx_load_font_atlas(path, 32 + 256 * 640);
     }
     unsigned char *data = pages[page];
     int index = slot & 255;
@@ -77,6 +77,24 @@ int lx_latin_glyph(unsigned codepoint, int style, int scale, const unsigned char
     static unsigned char *pages[8][5];
     static unsigned char attempted[8][5];
     static unsigned char alpha[40 * 32];
+    static int selected;
+    static unsigned char *cells;
+    if (!selected) {
+        selected = 1;
+        cells = lx_load_font_atlas("/lib/fonts/console.gray", 95*22*44);
+    }
+    if (cells && style == 0 && codepoint >= 32 && codepoint < 127 && (scale == 1 || scale == 2)) {
+        if (mask) {
+            const unsigned char *cell = cells + (codepoint-32)*22*44;
+            for (int y=0; y<16*scale; ++y)
+                for (int x=0; x<20*scale; ++x) {
+                    int col = x/scale-2;
+                    alpha[y*20*scale+x] = col >= 0 && col < 9 ? cell[(3+y/scale)*44+col*22/9] : 0;
+                }
+            *mask = alpha;
+        }
+        return 9*scale;
+    }
     unsigned high = codepoint >> 8;
     if ((high > 2 && high != 0x20 && high != 0x21) || (unsigned)style >= 8 ||
         (scale != 1 && scale != 2)) return 0;
@@ -88,7 +106,7 @@ int lx_latin_glyph(unsigned codepoint, int style, int scale, const unsigned char
         name[0] += style;
         name[2] += high >> 4;
         name[3] += high & 15;
-        pages[style][page] = load_atlas(path, 512 + 256 * 800);
+        pages[style][page] = lx_load_font_atlas(path, 512 + 256 * 800);
     }
     const unsigned char *data = pages[style][page];
     unsigned index = codepoint & 255;

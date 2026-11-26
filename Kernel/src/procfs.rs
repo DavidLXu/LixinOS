@@ -52,9 +52,11 @@ impl File {
                     format!("MemTotal:       {} kB\n", bytes / 1024)
                 });
                 let free = free / 1024;
+                unsafe extern "C" { fn vm_swap_total() -> u32; fn vm_swap_free() -> u32; }
+                let (swap, remaining) = unsafe { (vm_swap_total()*2048, vm_swap_free()*2048) };
                 format!(
                     "{total}MemFree:        {free} kB\nMemAvailable:   {free} kB\n\
-                     SwapTotal:      0 kB\nSwapFree:       0 kB\n"
+                     SwapTotal:      {swap} kB\nSwapFree:       {remaining} kB\n"
                 )
             }
             Self::Stat => {

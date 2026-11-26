@@ -53,12 +53,17 @@ upower() {
 
 ibus() {
     local stage="$build/ibus-cross"
-    patch_source "$build/ibus-1.5.35" ibus-client.patch
+    # On an existing build the daemon patch already includes the client change.
+    if ! patch -f -Rs --dry-run -p1 -d "$build/ibus-1.5.35" < "$port/ibus-daemon.patch" >/dev/null 2>&1; then
+        patch_source "$build/ibus-1.5.35" ibus-client.patch
+        patch_source "$build/ibus-1.5.35" ibus-daemon.patch
+    fi
+    patch_source "$build/ibus-1.5.35" ibus-parent.patch
     setup "$stage" "$build/ibus-1.5.35" -Dtests=false -Dxim=disabled -Dwayland=disabled \
         -Dgtk2=disabled -Dgtk3=false -Dgtk4=false -Dui=false -Dengine=false -Dsetup=false \
         -Dlibnotify=false -Dappindicator=false -Demoji-dict=false -Dunicode-dict=false \
         -Dsystemd-services=disabled -Ddconf=disabled -Dintrospection=false -Dvapi=disabled -Dgtk-doc=false
-    meson compile -C "$stage" -j "$jobs" ibus-1.0
+    meson compile -C "$stage" -j "$jobs" ibus-1.0 ibus-daemon
     meson install -C "$stage" --no-rebuild --tags devel
 }
 

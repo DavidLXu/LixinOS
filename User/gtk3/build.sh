@@ -115,6 +115,9 @@ meson_library() {
 if ! patch -d "$build/glib-2.78.6" -p1 -R -f --dry-run < "$port/glib.patch" >/dev/null 2>&1; then
     patch -d "$build/glib-2.78.6" -p1 < "$port/glib.patch"
 fi
+if ! patch -d "$build/glib-2.78.6" -p1 -R -f --dry-run < "$port/glib-unix-credentials.patch" >/dev/null 2>&1; then
+    patch -d "$build/glib-2.78.6" -p1 < "$port/glib-unix-credentials.patch"
+fi
 meson_library glib glib-2.78.6 -Dtests=false -Dnls=disabled -Dxattr=false \
     -Dselinux=disabled -Dlibmount=disabled -Dlibelf=disabled
 
@@ -175,6 +178,9 @@ meson_library pixbuf gdk-pixbuf-2.42.12 -Dintrospection=disabled -Dtests=false \
 meson_library epoxy libepoxy-1.5.10 -Dglx=no -Degl=no -Dx11=false -Dtests=false
 
 gtk="$build/gtk-3.24.49"
+if ! patch -d "$gtk" -p1 -R -f --dry-run < "$port/gtk-static-main-module.patch" >/dev/null 2>&1; then
+    patch -d "$gtk" -p1 < "$port/gtk-static-main-module.patch"
+fi
 cp "$port/gdk-lixinos-server.c" "$gtk/gdk/broadway/gdkbroadway-server.c"
 cp "$root/User/desktop/window-client.h" "$gtk/gdk/broadway/window-client.h"
 # The guest uses the window protocol in-process. GTK's Linux helper binaries
@@ -228,6 +234,8 @@ PY
 meson_library gtk gtk-3.24.49 -Dx11_backend=false -Dwayland_backend=false \
     -Dbroadway_backend=true -Dintrospection=false -Dtests=false -Dexamples=false \
     -Ddemos=false -Dprint_backends= -Dbuiltin_immodules=none
+
+python3 "$port/build-ibus.py"
 
 package="$build/package"
 mkdir -p "$package/bin" "$package/lib/gtk3/fonts" "$package/lib/gtk3/licenses"

@@ -1,0 +1,12 @@
+--- a/gtk/gtkmodules.c
++++ b/gtk/gtkmodules.c
+@@ -586,6 +586,9 @@ _gtk_module_has_mixed_deps (GModule *module_to_check)
+   else
+     module = module_to_check;
+ 
++  if (!module)
++    return FALSE;
++
+   if (g_module_symbol (module, "gtk_progress_get_type", &func))
+     result = TRUE;
+   else

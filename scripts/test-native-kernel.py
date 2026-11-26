@@ -1,6 +1,7 @@
 """Build the C/assembly kernel inside LixinOS and rebuild it under its own EL1."""
 import argparse
 import os
+import re
 from pathlib import Path, PurePosixPath
 import runpy
 import shutil
@@ -25,10 +26,29 @@ def command(serial, line, status=0, expected=b"", prompt=shell):
     assert f"\n{status}\n".encode() in result, (output, result)
 
 
-def shutdown(serial):
+def check_foreground_wait(serial):
+    serial.send(b"sleep 30\r")
+    serial.until(b"sleep 30\r\n")
+    serial.send(b"\x03")
+    serial.until(shell, timeout=3)
+    serial.expect(b"echo $?\r", shell, b"\n130\n")
+
+    serial.send(b"htop\r")
+    serial.until(b"F10 Quit")  # First frame establishes the CPU counters.
+    states = []
+    for _ in range(3):
+        frame = serial.until(b"F10 Quit")
+        row = re.search(rb"\b1 +0 +([RS]) +(\d+) +[^\x1b\r\n]* sh\x1b", frame)
+        assert row and int(row[2]) < 5, frame
+        states.append(row[1])
+    assert b"S" in states, states
+    serial.expect(b"q", shell)
+
+
+def shutdown(serial, timeout=15):
     serial.send(b"q\r")
-    serial.until(b"Shutting down LixinOS")
-    assert serial.vm.wait(timeout=15) == 0
+    serial.until(b"Shutting down LixinOS", timeout=timeout)
+    assert serial.vm.wait(timeout=timeout) == 0
 
 
 def read_file(disk, path):
@@ -118,6 +138,7 @@ def verify(disk, image, loader):
         serial.expect(b"?", b"Toggle process tree")
         serial.expect(b"\r", b"F1 Help")
         serial.expect(b"q", shell)
+        check_foreground_wait(serial)
         command(serial, "cat /proc/cpuinfo", expected=b"LixinOS aarch64 vCPU")
         command(serial, "cat /proc/meminfo", expected=b"MemTotal:")
         command(serial, "ps", expected=b"PID PPID STATE MODE")

@@ -1,0 +1,11 @@
+--- a/desktop/source/lib/init.cxx
++++ b/desktop/source/lib/init.cxx
+@@ -4074,7 +4074,7 @@
+         return;
+     }
+ 
+-#if !defined IOS && !defined ANDROID && !defined __EMSCRIPTEN__
++#if !defined IOS && !defined ANDROID && !defined __EMSCRIPTEN__ && !defined __lixinos__
+     uno::Reference<xml::crypto::XSEInitializer> xSEInitializer = xml::crypto::SEInitializer::create(xContext);
+     if (!xSEInitializer.is())
+     {

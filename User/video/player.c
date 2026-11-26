@@ -7,11 +7,13 @@
 #include <libswscale/swscale.h>
 #include "../desktop/window-widgets.h"
 #include "../console.h"
+#include "audio-track.h"
 
 #define DEMO "/lib/video/demo.mp4"
 static const AVRational milliseconds = {1, 1000};
 typedef struct {
     AVFormatContext *file;
+    AudioTrack *audio;
     AVCodecContext *decoder;
     AVPacket *packet;
     AVFrame *frame, *next;
@@ -31,6 +33,7 @@ static UiText editor;
 enum { PATH=1, OPEN, PLAY, SEEK };
 
 static void close_movie(Movie *m) {
+    audio_track_free(m->audio);
     av_frame_free(&m->frame);
     av_frame_free(&m->next);
     av_packet_free(&m->packet);
@@ -104,6 +107,7 @@ static const char *load(Movie *m,const char *filename) {
     m->position=-m->interval;
     if (decode(m)!=1) return "无法解码第一帧";
     present(m);
+    m->audio=audio_track_open(filename);
     return NULL;
 }
 
@@ -142,6 +146,7 @@ static void seek_to(int64_t target) {
         return;
     }
     notice=NULL;
+    audio_track_seek(movie.audio,target);
     avcodec_flush_buffers(movie.decoder);
     av_frame_unref(movie.next);
     movie.draining=movie.queued=ended=0;
@@ -160,6 +165,8 @@ static void toggle(void) {
     if (ended) seek_to(0);
     if (notice) return;
     playing=!playing;
+    if (!playing) audio_track_pause(movie.audio);
+    else audio_track_seek(movie.audio,movie.position);
     if (playing) movie.anchor=console_call(38,0)-movie.position;
 }
 
@@ -213,7 +220,7 @@ static void draw(AppWindow *s) {
     if (d>0) snprintf(status,sizeof status,"%ld:%02ld / %ld:%02ld",p/60,p%60,d/60,d%60);
     else snprintf(status,sizeof status,"%ld:%02ld",p/60,p%60);
     label(s,75,s->height-30,s->width-80,notice ? notice : status,notice ? 0xfda9 : 0xffff);
-    if (s->width>320) label(s,s->width-52,s->height-30,48,"静音",0xc618);
+    if (s->width>320 && movie.file && !movie.audio) label(s,s->width-68,s->height-30,64,"无音轨",0xc618);
 }
 
 static int event(AppWindow *s,WindowEvent e) {
@@ -221,11 +228,13 @@ static int event(AppWindow *s,WindowEvent e) {
     if (e.type==WINDOW_CLIENT_TIMER) {
         int64_t elapsed=console_call(38,0)-movie.anchor;
         dirty=0;
+        if (playing) audio_track_pump(movie.audio,elapsed);
         for (int i=0;playing && movie.queued && movie.upcoming<=elapsed && i<6;++i) {
             present(&movie); queue_next(); dirty=1;
         }
-        if (playing && !movie.queued && elapsed>=movie.position+movie.interval) {
+        if (playing && !movie.queued && elapsed>=FFMAX(movie.position+movie.interval,movie.duration)) {
             playing=0; ended=1; dirty=1;
+            audio_track_pause(movie.audio);
         }
     } else if (e.type==WINDOW_CLIENT_POINTER) {
         int hit=0;
@@ -249,7 +258,7 @@ static int event(AppWindow *s,WindowEvent e) {
             seek_to(movie.position+(e.value==UI_LEFT ? -5000 : 5000));
     } else if (e.type==WINDOW_CLIENT_PASTE && controls.focus==PATH)
         app_field_paste(s,&editor,path,sizeof path,e.value);
-    s->timer_ms=playing ? (unsigned)av_clip64(movie.interval,16,100) : 0;
+    s->timer_ms=playing ? (movie.audio ? 10 : (unsigned)av_clip64(movie.interval,16,100)) : 0;
     return dirty;
 }
 

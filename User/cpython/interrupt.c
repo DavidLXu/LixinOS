@@ -9,6 +9,11 @@ void lx_signal_interrupt(void) { PyErr_SetInterrupt(); }
 static unsigned char pending[4096];
 static unsigned head, count;
 int lx_check_interrupt(void) {
+#ifdef LX_WAYLAND_INPUT
+    // The compositor owns the physical keyboard. Polling stdin here would
+    // take keystrokes away from the focused Wayland surface.
+    return 0;
+#else
     if (!lx_thread_main() || console_call(24, 2) != 1)
         return 0;
     while (count < sizeof(pending) && lx_poll(0, LX_READABLE, 0) == LX_READABLE) {
@@ -22,6 +27,7 @@ int lx_check_interrupt(void) {
         pending[(head + count++) % sizeof(pending)] = ch;
     }
     return 0;
+#endif
 }
 int lx_input_byte(void) {
     if (count) {
@@ -38,7 +44,7 @@ void lx_vm_tick(void) {
     static unsigned ticks;
     if (++ticks % 1024)
         return;
-    if (lx_threads_active())
+    if (lx_cooperative_active())
         lx_schedule();
     lx_check_interrupt();
 }

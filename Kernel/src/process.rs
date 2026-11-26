@@ -58,7 +58,7 @@ const LINKS_ALIAS: &[u8] = b"LXalias1\n/bin/links";
 
 fn runnable(bytes: &[u8]) -> bool {
     bytes == LINKS_ALIAS || bytes == BASH_ALIAS || system_handler(bytes).is_some()
-        || crate::utility::load_segments(bytes).is_some()
+        || crate::utility::dynamic_program(bytes) || crate::utility::load_segments(bytes).is_some()
         || crate::user::is_executable(bytes)
         || crate::user::process_image(bytes).is_some()
 }
@@ -108,6 +108,7 @@ impl Volume {
     }
 
     pub(crate) fn require_writable(&self, path: &str) -> Result<()> {
+        if !crate::permissions::allowed(self,path,2) { return Err("permission denied"); }
         if !agent_write_allowed(path) { return Err("write outside the agent project"); }
         if self.is_virtual_proc(path) { Err("read-only filesystem") } else { Ok(()) }
     }
@@ -117,6 +118,7 @@ impl Volume {
     }
 
     pub(crate) fn entry(&self, path: &str) -> Option<Entry<'_>> {
+        if !crate::permissions::allowed(self,path,4) { return None; }
         if self.is_virtual_proc(path) {
             return if path == crate::procfs::ROOT { Some(Entry::Directory) }
             else { crate::procfs::file(path).map(Entry::ProcFile) };
@@ -134,6 +136,7 @@ impl Volume {
 
     pub(crate) fn children(&self, path: &str, prefix: &str, after: Option<&str>)
         -> impl Iterator<Item = (&str, Entry<'_>)> {
+        let readable=crate::permissions::allowed(self,path,5);
         let matches = move |name: &str| name.starts_with(prefix) && after.is_none_or(|key| key < name);
         let mut proc_root = (path == "/" && self.proc_mounted() && matches("proc"))
             .then_some(("proc", Entry::Directory));
@@ -151,7 +154,7 @@ impl Volume {
             .then_some(crate::procfs::FILES).into_iter().flatten()
             .filter(move |(name, _)| matches(name))
             .map(|&(name, file)| (name, Entry::ProcFile(file)));
-        children.chain(proc_files)
+        children.chain(proc_files).filter(move |_| readable)
     }
 
     pub(crate) fn save_changes<'a>(
@@ -163,9 +166,24 @@ impl Volume {
         let mut undo = Vec::with_capacity(changes.size_hint().0);
         let mut parents = alloc::collections::BTreeSet::new();
         let mut scratch_only = true;
+        let meta=crate::permissions::METADATA;
+        let old_meta=self.files.get(meta).cloned();
+        let mut changed_meta=false;
+        let mut has_data_path=false;
         for (path, existed) in changes {
+            match crate::permissions::update_entry(self,path,existed) {
+                Ok(changed)=>changed_meta |= changed,
+                Err(e)=>{
+                    if changed_meta {crate::permissions::restore(self,old_meta);}
+                    for (name,time) in undo.into_iter().rev() {self.set_time(name,time);}
+                    return Err(e);
+                }
+            }
             self.disk.invalidate_body(path);
-            scratch_only &= self.disk.scratch_path(path) && !self.versions.contains_key(path);
+            if path!=meta {
+                has_data_path=true;
+                scratch_only &= self.disk.scratch_path(path) && !self.versions.contains_key(path);
+            }
             let present = self.files.contains_key(path);
             let previous = self.disk.times.get(path).copied();
             undo.push((path, previous));
@@ -194,12 +212,17 @@ impl Volume {
                 ..previous.unwrap_or_default()
             }));
         }
-        let saved = if scratch_only && !undo.is_empty() {
+        if changed_meta {
+            self.disk.invalidate_body(meta);
+            if !undo.iter().any(|(path,_)|*path==meta) {undo.push((meta,self.disk.times.get(meta).copied()));}
+        }
+        let saved = if scratch_only && has_data_path && !undo.is_empty() {
             self.disk.write_back(&self.files, &undo)
         } else {
             self.disk.save(&self.files, &self.versions)
         };
         if let Err(error) = saved {
+            if changed_meta {crate::permissions::restore(self,old_meta);}
             for (path, time) in undo.into_iter().rev() {
                 self.set_time(path, time);
             }
@@ -228,6 +251,7 @@ impl Volume {
         entry: Option<Option<Vec<u8>>>,
         version: Option<Version>,
     ) -> Result<()> {
+        if entry.is_none() && !crate::permissions::allowed(self,&path,8) {return Err("permission denied");}
         self.require_writable(&path)?;
         if entry.is_some() && !self.files.contains_key(&path) && self.files.len() >= ENTRY_LIMIT {
             return Err("filesystem full");
@@ -440,6 +464,7 @@ impl Services {
     }
 
     fn executable_bytes(&self, name: &str) -> Result<Vec<u8>> {
+        if !crate::permissions::allowed(&self.volume.borrow(),&self.path(name)?,1) {return Err("permission denied");}
         let image = self.bytes(name)?;
         if image == BASH_ALIAS { self.bytes("/bin/bash") }
         else if image == LINKS_ALIAS { self.bytes("/bin/links") } else { Ok(image) }
@@ -454,6 +479,7 @@ impl Services {
     fn launch_legacy(&mut self, cmd: &str, tokens: &[String], status_out: &mut u8) -> Result<()> {
         let standalone = (tokens.len() == 1).then_some(cmd);
         if standalone == Some("shutdown") {
+            if crate::permissions::unprivileged() {return Err("permission denied");}
             {
                 let mut volume = self.volume.borrow_mut();
                 if volume.disk.scratch_dirty {
@@ -733,6 +759,8 @@ fn install_sources(volume: &mut Volume) -> Result<()> {
     let mut changed = Vec::new();
     let result = (|| {
         for &(path, contents) in SOURCES {
+            #[cfg(feature = "retina")]
+            crate::graphics::boot_tick();
             if let Some(existing) = volume.files.get(path) {
                 if existing.is_none() != contents.is_none() {
                     return Err("source path conflicts with an existing entry");
@@ -740,6 +768,7 @@ fn install_sources(volume: &mut Volume) -> Result<()> {
                 let upgrade = existing.as_ref().is_some_and(|file| {
                     let sig = file.sig();
                     match path {
+                    "/lib/lxe-runtime.elf" => sig == (397168, 0x120baaa7),
                     "/lib/foreground.elf" => sig == (266608, 0xa35d9810),
                     "/src/foreground/htop.c" => sig == (1587, 0x98c9c419),
                     "/lib/git.elf" => sig == (672928, 0x26d8dade),
@@ -754,7 +783,11 @@ fn install_sources(volume: &mut Volume) -> Result<()> {
                     "/src/kernel/stream.c" => matches!(sig, (1788, 0xb54adfb7) | (1824, 0xf1cef9ef) | (6569, 0x9d1c6f2c) | (8523, 0x768c39cb)),
                     "/src/gui/text-clipboard.h" => matches!(sig, (554, 0x4390c1c2) | (574, 0xc60846e9)),
                     "/src/gui/lixin-gui.h" => matches!(sig, (5983, 0x48ffa263) | (6955, 0x7ea945b1)),
-                    "/src/gui/han-font.c" => matches!(sig, (3460, 0xed2a1b7c)),
+                    "/src/gui/han-font.c" => matches!(sig, (3460, 0xed2a1b7c) | (3583, 0x4314f4ee) | (4016, 0xea8abe3c) | (4261, 0xab904ee2)),
+                    "/src/gui/han-font.h" => sig == (519, 0xb217901b),
+                    "/src/links/unicode.h" => sig == (725, 0x3a716197),
+                    "/src/tcc/platform.c" => sig == (4834, 0x94853055),
+                    "/src/fonts/fonts.c" => matches!(sig, (5206, 0x11ae198d) | (5363, 0xea23f5d1)),
                     "/src/gui/file-dialog.h" => matches!(sig, (8026, 0x7619e968) | (8128, 0x740cf8d3) | (8141, 0x932637e3)),
                     "/src/gui/file-path.h" => matches!(sig, (881, 0x9c550f55)),
                     "/src/desktop/window-widgets.h" => matches!(sig, (4056, 0xd801c4d5)),
@@ -762,7 +795,7 @@ fn install_sources(volume: &mut Volume) -> Result<()> {
                     "/src/gui/widgets.h" => matches!(sig, (4050, 0xf3f3a912)),
                     "/src/gui/text-editor.c" => matches!(sig, (12771, 0xac06779f) | (7684, 0xe1836cd7) | (9342, 0xa0428e2a)),
                     "/src/desktop/settings.c" => matches!(sig, (14296, 0xa905ee68) | (24677, 0xfaf7a280) | (25675, 0x2ec6825d) | (25749, 0xd2ec18f2)),
-                    "/src/desktop/window-app.h" => matches!(sig, (3648, 0x8f30269f) | (3705, 0x9989efc7) | (4348, 0x8876d233)),
+                    "/src/desktop/window-app.h" => matches!(sig, (3648, 0x8f30269f) | (3705, 0x9989efc7) | (4348, 0x8876d233) | (6276, 0xb561a19b)),
                     "/src/gui/mouse-cursor.h" => matches!(sig, (1327, 0x5072f402)),
                     "/src/kernel/input.c" => matches!(sig, (5834, 0x48dcd6bf) | (6623, 0x0ee8cd99) | (6914, 0xe9073641)),
                     "/src/kernel/loader-sources" => sig == (80, 0x7534928c),
@@ -770,19 +803,19 @@ fn install_sources(volume: &mut Volume) -> Result<()> {
                     "/src/kernel/smp.c" => matches!(sig, (3665, 0xb4caae7f) | (4643, 0x4777b707)),
                     "/src/kernel/smp.h" => matches!(sig, (443, 0xf568791d) | (528, 0x713013e0)),
                     "/src/kernel/smp-arch.S" => matches!(sig, (5341, 0x9040ebf0) | (5390, 0xa999c989)),
-                    "/src/kernel/sources" => matches!(sig, (1080, 0x2cdd_da4a) | (1100, 0x62652e92) | (1128, 0xdf1a973c)),
+                    "/src/kernel/sources" => matches!(sig, (1335, 0x945e1691) | (1080, 0x2cdd_da4a) | (1100, 0x62652e92) | (1128, 0xdf1a973c)),
                     "/src/kernel/process.c" => matches!(sig, (76762, 0x357f84f5) | (76827, 0x2a29b0ed) |
                         (66757, 0x0f788aa2) | (70784, 0x50475a8f) | (72567, 0x587e087f) | (75563, 0xb1234c0e) | (63989, 0x6d114b70) | (64480, 0x3ff4e081) | (64518, 0x34819eec) | (65851, 0x67f4783b) | (66460, 0x267f4e60) | (67371, 0x3aa2b0e0) | (13400, 0x0898_6dcc) | (45380, 0x5748_cd25) | (45801, 0x0a75_b6e9) | (52797, 0x254e_c10a) | (58020, 0x29ef_4f7f) | (58028, 0x44859e47) | (70123, 0x07cd_b98b) | (76698, 0xbf32fdc7) | (76847, 0xdbb95ed7)),
                     "/src/kernel/net.c" => sig == (8078, 0xfdb2_d249),
-                    "/src/kernel/task.c" => matches!(sig, (10673, 0x8b008d68) | (5822, 0x31fc4674) | (9407, 0x59d0dc5b) | (5587, 0xb041_d7c8) | (5698, 0x6ff2_a8b3) | (8251, 0x183c59e7) | (10721, 0x4cbeda3a)),
-                    "/src/kernel/disk.c" => matches!(sig,
+                    "/src/kernel/task.c" => matches!(sig, (11332, 0x0353adf5) | (10673, 0x8b008d68) | (5822, 0x31fc4674) | (9407, 0x59d0dc5b) | (5587, 0xb041_d7c8) | (5698, 0x6ff2_a8b3) | (8251, 0x183c59e7) | (10721, 0x4cbeda3a)),
+                    "/src/kernel/disk.c" => matches!(sig, (37309, 0x02cffdd5) |
                         (8700, 0xa8ba_c0e5) | (20901, 0xf5e0_c618) | (20999, 0x7f64_447e) | (27954, 0x7c21fc3b)),
-                    "/src/kernel/native.h" => matches!(sig,
+                    "/src/kernel/native.h" => matches!(sig, (8442, 0x7dc1903b) |
                         (5232, 0x65cbabc4) | (6161, 0xd5328656) | (6781, 0x88b0ef54) | (999, 0x055d_fc37) | (4091, 0xf3f4_5034) | (4367, 0x5e65_fa6c) | (7907, 0x0353213c) | (7966, 0x33918216)),
-                    "/src/kernel/display.c" => matches!(sig,
+                    "/src/kernel/display.c" => matches!(sig, (46325, 0x45b74c06) |
                         (35720, 0x1ed640d3) | (4726, 0x739a_83ce) | (25975, 0xc6a3_fe7b) | (27711, 0x4571_61b1) | (35309, 0xb11c_5e77)),
                     "/src/kernel/proc.c" => matches!(sig, (3080, 0x5026_f57d) | (3135, 0xee1ae832) | (3094, 0x934c_4a47) | (3085, 0xcd825883)),
-                    "/src/kernel/kernel.c" => matches!(sig,
+                    "/src/kernel/kernel.c" => matches!(sig, (3763, 0xe76523e1) |
                         (2937, 0xe0c9f33e) | (1090, 0x4f0a_818c) | (2768, 0x69ee_92b2) | (2768, 0x7556_94ab) | (3719, 0x1df08358)),
                     "/src/console.h" => matches!(sig, (569, 0x5646a81d)),
                     "/src/build/rebuild.c" => matches!(sig, (2668, 0xc7f2_1369) | (2761, 0x22fe_f9c0) | (2951, 0x9183_7f72) | (3094, 0x49c8_a199)),
@@ -794,7 +827,7 @@ fn install_sources(volume: &mut Volume) -> Result<()> {
                     "/src/tinycc/port.c" => matches!(sig, (8781, 0x182ee5f9) | (9991, 0xad0fa92c)),
                     "/src/tcc/port.c" => matches!(sig, (8781, 0x182ee5f9) | (9991, 0xad0fa92c)),
                     "/src/tinycc/slots.def" => matches!(sig, (2584, 0xc7c619ee)),
-                    "/src/bash/bash.c" => matches!(sig,(28822, 0x931e3765) | (32111, 0x6ce062f4) | (21087, 0x5a27_2604)|(21217,0xd799627c)|(23905,0xf0d95640)|(24657,0x960d3663)|(28403,0x43e717dd)|(28478,0x1f9c15f8)|(28486,0x775d056a)),
+                    "/src/bash/bash.c" => matches!(sig,(32623,0x5f6d45d9) | (32299,0x71e0e9eb) | (28822, 0x931e3765) | (32111, 0x6ce062f4) | (21087, 0x5a27_2604)|(21217,0xd799627c)|(23905,0xf0d95640)|(24657,0x960d3663)|(28403,0x43e717dd)|(28478,0x1f9c15f8)|(28486,0x775d056a)),
                     "/src/ls/ls.c" => old_stock_ls_source(sig),
                     "/src/core/discovery.h" => sig == (5547, 0x2cff_7a65),
                     "/src/links/config.h" => sig == (1058, 0xeca2a4c8),
@@ -813,7 +846,7 @@ fn install_sources(volume: &mut Volume) -> Result<()> {
                     "/src/ssh/src/sftp.rs" => sig == (18734, 0x87ba63dd),
                     "/src/ssh/port.c" => matches!(sig, (1810, 0xc6d26543) | (2380, 0xba9d8ff5)),
                     "/src/ssh/src/lib.rs" => matches!(sig, (11370, 0x81c5b726) | (15613, 0x276b3d15)),
-                    "/src/desktop/desktop.c" => matches!(sig, (13586, 0xb482580b) | (15502, 0xa0d13781) | (17767, 0x7fc65414) | (27008, 0x710e8655) | (31136, 0x0c2a4e1d) | (38720, 0x5490a6f8) | (41064, 0x15d7bcb7) | (42006, 0xff99e8d9) | (42192, 0x64ea1e04) | (58688, 0x027546d7) | (64603, 0xf68b6587) | (65590, 0x596da4aa) | (65793, 0x08f47430) | (66112, 0x7e896c25) | (66202, 0x7df78228) | (69118, 0xb2cf597a) | (69129, 0x27c89e82) | (70754, 0x821c6822) | (71535, 0x8b43d1c3) | (71535, 0xac529004) | (9781, 0x5daec732)),
+                    "/src/desktop/desktop.c" => matches!(sig, (97892, 0x0e330ca0) | (13586, 0xb482580b) | (15502, 0xa0d13781) | (17767, 0x7fc65414) | (27008, 0x710e8655) | (31136, 0x0c2a4e1d) | (38720, 0x5490a6f8) | (41064, 0x15d7bcb7) | (42006, 0xff99e8d9) | (42192, 0x64ea1e04) | (58688, 0x027546d7) | (64603, 0xf68b6587) | (65590, 0x596da4aa) | (65793, 0x08f47430) | (66112, 0x7e896c25) | (66202, 0x7df78228) | (69118, 0xb2cf597a) | (69129, 0x27c89e82) | (70754, 0x821c6822) | (71535, 0x8b43d1c3) | (71535, 0xac529004) | (9781, 0x5daec732)),
                     "/src/desktop/window-client.h" => matches!(sig, (442, 0x1881d856) | (527, 0xe99b_c843) | (896, 0xb7febea3) | (1299, 0x63c0ceb3) | (1358, 0x88bcb7d0)),
                     "/src/desktop/window-client-host.h" => matches!(sig, (7009, 0xc90249d1) | (2979, 0x8082_8916) | (3666, 0xb572_7954) | (7416, 0x92fe5a8b) | (8411, 0x2a0c9169) | (10292, 0xfdea4f71)),
                     "/src/desktop/README.md" => matches!(sig, (10213, 0x2943ae71) | (10635, 0xd3ab206d) | (11599, 0xd16763b0) | (11873, 0x4faf09cd) | (12196, 0x97b20e61) | (13031, 0x0647302c) | (1615, 0x0c62067e) | (3469, 0x1c0f3687) | (6363, 0xda6d6a91) | (7025, 0xdeb37807) | (962, 0x923c2f17) | (13458, 0xddd2_c35b)),
@@ -901,11 +934,17 @@ fn install_sources(volume: &mut Volume) -> Result<()> {
 pub fn run() -> ! {
     let started = crate::monitor::ticks();
     let (mut disk, files, versions) = crate::disk::Disk::mount().unwrap_or_else(|err| {
+        #[cfg(feature = "retina")]
+        crate::graphics::finish_boot();
         print("Mount failed: ");
         print(err);
         print("\n");
         crate::idle()
     });
+    #[cfg(feature = "retina")]
+    if let Some(Some(font)) = files.get("/lib/fonts/console.gray") {
+        crate::graphics::load_console_font(font);
+    }
     let history = disk.load_history().unwrap_or_else(|err| {
         print(err);
         print("\n");
@@ -941,7 +980,7 @@ pub fn run() -> ! {
     }
     if volume.files.get("/bin") == Some(&None) {
         let old_bash = volume.files.get("/bin/bash").and_then(Option::as_ref)
-            .is_some_and(|b| matches!(b.sig(), (23720, 0xb2ca_0c34) | (23776, 0x77f085b2) | (26928, 0x8968_5afc) | (27976, 0x7c17_a489) | (31528, 0xd918_f074) | (31600, 0x89a2_a041) | (31608, 0x9d07_19bc) | (31800, 0xc1129718) | (35696, 0x5d5f6f59)));
+            .is_some_and(|b| matches!(b.sig(), (36216, 0x2daaf978) | (23720, 0xb2ca_0c34) | (23776, 0x77f085b2) | (26928, 0x8968_5afc) | (27976, 0x7c17_a489) | (31528, 0xd918_f074) | (31600, 0x89a2_a041) | (31608, 0x9d07_19bc) | (31800, 0xc1129718) | (35696, 0x5d5f6f59) | (35880, 0x880089ed)));
         if !volume.files.contains_key("/bin/bash") || old_bash {
             // Bootstrap the C shell with the same guest compiler users invoke.
             let built = crate::user::compile("/src/bash/bash.c", include_str!("../../User/bash/bash.c"))
@@ -1079,6 +1118,8 @@ pub fn run() -> ! {
         started,
         cwd: "/".into(),
     };
+    #[cfg(feature = "retina")]
+    crate::graphics::finish_boot();
     crate::scheduler::init();
     let install_editor = services.volume.borrow().files.get("/bin/text-editor").is_none_or(|entry|
         entry.as_ref().is_some_and(|file| matches!(file.sig(), (276392, 0x1eb439d2) | (276496, 0x085f21f5) | (278400, 0xdb0261bf))));

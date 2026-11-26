@@ -29,6 +29,11 @@ smp_power_on:
     stp x9,x10,[x0,#16]
     RD(9,CPACR)
     RD(10,CNTKCTL)
+    // EL0 may read the virtual clock, but cannot program the timer.
+    mov x11,#2
+    orr x10,x10,x11
+    WR(CNTKCTL,10)
+    isb
     stp x9,x10,[x0,#32]
     RD(9,VBAR)
     str x9,[x0,#48]
@@ -310,3 +315,168 @@ smp_gic3_enable:
 .balign 16
     .skip 65536
 smp_stack_top:
+
+.text
+.global kt_access
+kt_access:
+    cbz x1,kt_read_access
+    .long 0xd5087860 // at s1e0w,x0
+    b kt_access_result
+kt_read_access:
+    .long 0xd5087840 // at s1e0r,x0
+kt_access_result:
+    isb
+    RD(0,REG(3,0,7,4,0))
+    and x0,x0,#1
+    eor x0,x0,#1
+    ret
+
+.global kt_fpcr
+kt_fpcr:
+    mrs x0,fpcr
+    ret
+.global kt_fpsr
+kt_fpsr:
+    mrs x0,fpsr
+    ret
+
+// Start with the creator's FP environment and clean vector registers.
+.global kt_init_fp
+kt_init_fp:
+    msr fpcr,x4
+    msr fpsr,x5
+    .long 0x4f00e400 // movi v0.16b,#0
+    .long 0x4f00e401 // movi v1.16b,#0
+    .long 0x4f00e402 // movi v2.16b,#0
+    .long 0x4f00e403 // movi v3.16b,#0
+    .long 0x4f00e404 // movi v4.16b,#0
+    .long 0x4f00e405 // movi v5.16b,#0
+    .long 0x4f00e406 // movi v6.16b,#0
+    .long 0x4f00e407 // movi v7.16b,#0
+    .long 0x4f00e408 // movi v8.16b,#0
+    .long 0x4f00e409 // movi v9.16b,#0
+    .long 0x4f00e40a // movi v10.16b,#0
+    .long 0x4f00e40b // movi v11.16b,#0
+    .long 0x4f00e40c // movi v12.16b,#0
+    .long 0x4f00e40d // movi v13.16b,#0
+    .long 0x4f00e40e // movi v14.16b,#0
+    .long 0x4f00e40f // movi v15.16b,#0
+    .long 0x4f00e410 // movi v16.16b,#0
+    .long 0x4f00e411 // movi v17.16b,#0
+    .long 0x4f00e412 // movi v18.16b,#0
+    .long 0x4f00e413 // movi v19.16b,#0
+    .long 0x4f00e414 // movi v20.16b,#0
+    .long 0x4f00e415 // movi v21.16b,#0
+    .long 0x4f00e416 // movi v22.16b,#0
+    .long 0x4f00e417 // movi v23.16b,#0
+    .long 0x4f00e418 // movi v24.16b,#0
+    .long 0x4f00e419 // movi v25.16b,#0
+    .long 0x4f00e41a // movi v26.16b,#0
+    .long 0x4f00e41b // movi v27.16b,#0
+    .long 0x4f00e41c // movi v28.16b,#0
+    .long 0x4f00e41d // movi v29.16b,#0
+    .long 0x4f00e41e // movi v30.16b,#0
+    .long 0x4f00e41f // movi v31.16b,#0
+    ret
+
+.global vm_current_root
+vm_current_root:
+    RD(0,TTBR)
+    ret
+.global vm_retry_user
+vm_retry_user:
+    stp x0,x1,[sp,#-16]!
+    stp x2,x3,[sp,#-16]!
+    stp x4,x5,[sp,#-16]!
+    stp x6,x7,[sp,#-16]!
+    stp x8,x9,[sp,#-16]!
+    stp x10,x11,[sp,#-16]!
+    stp x12,x13,[sp,#-16]!
+    stp x14,x15,[sp,#-16]!
+    stp x16,x17,[sp,#-16]!
+    stp x18,x19,[sp,#-16]!
+    stp x20,x21,[sp,#-16]!
+    stp x22,x23,[sp,#-16]!
+    stp x24,x25,[sp,#-16]!
+    stp x26,x27,[sp,#-16]!
+    stp x28,x29,[sp,#-16]!
+    stp x30,xzr,[sp,#-16]!
+    PUSHQ(0,1)
+    PUSHQ(2,3)
+    PUSHQ(4,5)
+    PUSHQ(6,7)
+    PUSHQ(8,9)
+    PUSHQ(10,11)
+    PUSHQ(12,13)
+    PUSHQ(14,15)
+    PUSHQ(16,17)
+    PUSHQ(18,19)
+    PUSHQ(20,21)
+    PUSHQ(22,23)
+    PUSHQ(24,25)
+    PUSHQ(26,27)
+    PUSHQ(28,29)
+    PUSHQ(30,31)
+    RD(0,REG(3,0,5,2,0))
+    RD(1,REG(3,0,6,0,0))
+    bl vm_handle_fault
+    .long 0xf100001f // cmp x0,#0
+    POPQ(30,31)
+    POPQ(28,29)
+    POPQ(26,27)
+    POPQ(24,25)
+    POPQ(22,23)
+    POPQ(20,21)
+    POPQ(18,19)
+    POPQ(16,17)
+    POPQ(14,15)
+    POPQ(12,13)
+    POPQ(10,11)
+    POPQ(8,9)
+    POPQ(6,7)
+    POPQ(4,5)
+    POPQ(2,3)
+    POPQ(0,1)
+    ldp x30,xzr,[sp],#16
+    ldp x28,x29,[sp],#16
+    ldp x26,x27,[sp],#16
+    ldp x24,x25,[sp],#16
+    ldp x22,x23,[sp],#16
+    ldp x20,x21,[sp],#16
+    ldp x18,x19,[sp],#16
+    ldp x16,x17,[sp],#16
+    ldp x14,x15,[sp],#16
+    ldp x12,x13,[sp],#16
+    ldp x10,x11,[sp],#16
+    ldp x8,x9,[sp],#16
+    ldp x6,x7,[sp],#16
+    ldp x4,x5,[sp],#16
+    ldp x2,x3,[sp],#16
+    ldp x0,x1,[sp],#16
+    beq vm_unhandled
+    ldp x30,xzr,[sp],#16
+    b smp_leave_user
+vm_unhandled:
+    ret
+.global vm_sync
+vm_sync:
+    dsb ishst
+    .long 0xd508831f // tlbi vmalle1is
+    dsb ish
+    isb
+    ret
+
+.global vm_sync_code
+vm_sync_code:
+    // Minimum cache line on AArch64 is 16 bytes.
+    add x1,x0,#4096
+vm_clean_line:
+    .long 0xd50b7b20 // dc cvau,x0
+    add x0,x0,#16
+    .long 0xeb01001f // cmp x0,x1
+    bne vm_clean_line
+    dsb ish
+    .long 0xd508711f // ic ialluis
+    dsb ish
+    isb
+    ret

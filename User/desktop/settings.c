@@ -44,7 +44,7 @@ static const Field fields[] = {
     {"PIP_ROOT_USER_ACTION", "pip 管理员提示", ""}, {"SSL_CERT_FILE", "TLS 证书", ""}
 };
 #define COUNT(a) ((int)(sizeof(a) / sizeof((a)[0])))
-enum { LIMIT = 32768, LINE_MAXIMUM = 512, HEAD = 34, ROW = 27, FOOT = 28 };
+enum { LIMIT = 32768, LINE_MAXIMUM = 512 };
 typedef struct {
     int line, start, end, stop; /* Byte offsets in the original, including untouched syntax. */
     int field, raw;
@@ -53,7 +53,7 @@ typedef struct {
 static Entry *entries;
 static int count, capacity, page, selected, top, editing, loaded, existed;
 static char original[LIMIT+1], working[LIMIT+1], draft[LINE_MAXIMUM+1], report[4097];
-enum { FIELD=1, PRESET, SAVE, BACK, TRACK, FIRST_ROW=16 };
+enum { FIELD=1, PRESET, SAVE, BACK, TRACK, NAV, FIRST_ROW=16 };
 static UiControls controls;
 static UiText input;
 static int thumb_grab;
@@ -400,16 +400,104 @@ static void save(void) {
     if (loaded) notice=page==BOOT ? "已保存，下次启动生效" : page==AGENT ? "已保存，下次任务生效" : "已保存，新终端生效";
 }
 
-enum { PAPER=0xf7be, WHITE=0xffff, INK=0x1947, MUTED=0x42ca, TEAL=0x1b8d, TINT=0xd730, EDGE=0xdedb, ERROR=0x8985 };
-static int visible(AppWindow *s) {
-    int n=(s->height-HEAD-FOOT)/ROW;
-    return n<1 ? 1 : n;
+#include "settings-art.h"
+
+#define RGB(r,g,b) (((r)>>3)<<11 | ((g)>>2)<<5 | ((b)>>3))
+enum {
+    CANVAS=RGB(248,247,245), RAIL=RGB(238,236,233), CARD=0xffff, INK=RGB(42,35,42),
+    SECONDARY=RGB(92,83,92), LINE=RGB(220,215,212), ORANGE=RGB(185,68,30),
+    PEACH=RGB(251,224,209), SOFT=RGB(255,246,237), PLUM=RGB(66,35,61), ERROR=RGB(170,45,48)
+};
+enum { SLIDERS, TERMINAL, CODE, SPARK, MONITOR, INFO, CLOCK, DISPLAY, CHIP, PORT, CUBE, FOLDER, PEN, NEXT, PREVIOUS };
+static const unsigned short icon_ink[]={PLUM,RGB(69,83,111),RGB(117,68,139),RGB(141,64,110),
+    ORANGE,RGB(32,99,112),RGB(157,83,36),RGB(71,95,153),RGB(115,73,134),
+    RGB(27,105,107),RGB(138,70,116),RGB(154,108,40),RGB(78,98,151)};
+static const unsigned short icon_bg[]={PEACH,RGB(227,231,242),RGB(237,227,246),RGB(248,227,239),
+    PEACH,RGB(218,239,237),RGB(250,235,210),RGB(228,235,250),RGB(237,229,248),
+    RGB(218,240,235),RGB(246,227,239),RGB(247,238,212),RGB(227,236,249)};
+static int min_int(int a,int b) { return a<b?a:b; }
+static unsigned short mix(unsigned short bg,unsigned short fg,int alpha) {
+    int b=255-alpha;
+    return ((((bg>>11)*b+(fg>>11)*alpha)/255)<<11) |
+           (((((bg>>5)&63)*b+((fg>>5)&63)*alpha)/255)<<5) |
+           (((bg&31)*b+(fg&31)*alpha)/255);
+}
+static void tint(AppWindow *s,int x,int y,unsigned short color,int alpha) {
+    if (!alpha || (unsigned)x>=(unsigned)s->width || (unsigned)y>=(unsigned)s->height) return;
+    unsigned short *p=s->pixels+y*s->width+x;
+    *p=mix(*p,color,alpha);
+}
+static void symbol(AppWindow *s,int x,int y,int id,int size,unsigned short ink) {
+    for (int j=0;j<size;j++)
+        for (int i=0;i<size;i++)
+            tint(s,x+i,y+j,ink,symbols[(j*24/size)*360+id*24+i*24/size]);
+}
+/* Render section headings and values with the desktop's proportional font atlas. */
+static void text(AppWindow *s,int x,int y,int width,const char *str,int size,unsigned short ink) {
+    int scale=size>16?2:1;
+    while (*str && width>0) {
+        const char *first=str;
+        unsigned cp=utf8_next(&str);
+        const unsigned char *mask=NULL;
+        int han=han_slot(cp)>=0, step, stride, offset;
+        if (han) {
+            step=size; stride=16*scale; offset=0;
+            mask=lx_pingfang_glyph(cp,scale);
+        } else {
+            int advance=lx_latin_glyph(cp,size>=20?2:0,scale,&mask);
+            step=advance ? (advance*size+8*scale)/(16*scale) : 11;
+            stride=20*scale; offset=2*scale;
+        }
+        if (step>width) break;
+        if (mask) {
+            for (int j=0;j<size;j++)
+                for (int i=0;i<step;i++) {
+                    int col=offset+i*16*scale/size;
+                    if (col<stride) tint(s,x+i,y+j,ink,mask[j*16*scale/size*stride+col]);
+                }
+        } else {
+            char glyph[8]={0}; memcpy(glyph,first,str-first);
+            label(s,x,y-3,width,glyph,ink);
+        }
+        x+=step; width-=step;
+    }
+}
+static int inset(int row,int h,int radius) {
+    int dy=row<radius ? radius-row-1 : row>=h-radius ? row-(h-radius) : 0;
+    int dx=radius;
+    while (dx*dx+dy*dy>radius*radius) --dx;
+    return radius-dx;
+}
+static void rounded(AppWindow *s,int x,int y,int w,int h,int radius,unsigned short fill) {
+    radius=min_int(radius,min_int(w,h)/2);
+    if (w<=0 || h<=0) return;
+    for (int j=0;j<h;++j) {
+        int edge=inset(j,h,radius);
+        app_rect(s,x+edge,y+j,w-2*edge,1,fill);
+    }
+}
+typedef struct { int rail,x,w,list,row,bottom,visible,nav_y,nav_h; } Layout;
+static Layout layout(AppWindow *s) {
+    Layout v={0};
+    int small=s->height<330;
+    v.rail=s->width>=570 && s->height>=245 && page!=HOME_PAGE ? 172 : 0;
+    int margin=s->width<400 ? 10 : 18;
+    v.w=min_int(s->width-v.rail-2*margin,700);
+    v.x=v.rail+(s->width-v.rail-v.w)/2;
+    v.list=small ? 70 : 122;
+    v.row=small ? 34 : 48;
+    v.bottom=s->height-(small ? 28 : 38);
+    v.visible=(v.bottom-v.list)/v.row;
+    if (v.visible<1) v.visible=1;
+    v.nav_y=small?46:84; v.nav_h=small?34:44;
+    return v;
 }
 static void reveal(AppWindow *s) {
-    top=ui_list_reveal(top,selected,count,visible(s));
+    top=ui_list_reveal(top,selected,count,layout(s).visible);
 }
 static int report_lines(AppWindow *s,int paint) {
-    int row=0, cols=s->width-24;
+    Layout v=layout(s);
+    int row=0,cols=v.w-32;
     const char *p=report;
     while (*p) {
         const char *start=p;
@@ -420,83 +508,160 @@ static int report_lines(AppWindow *s,int paint) {
             if (used && used+w>cols) break;
             used+=w; p=next;
         }
-        if (paint && row>=top && row<top+visible(s)) {
+        if (paint && row>=top && row<top+v.visible) {
             char fragment[4097];
             memcpy(fragment,start,p-start); fragment[p-start]=0;
-            label(s,12,HEAD+(row-top)*ROW+2,cols,fragment,INK);
+            label(s,v.x+12,v.list+(row-top)*v.row+(v.row-22)/2,cols,fragment,INK);
         }
         if (*p=='\n') ++p;
         ++row;
     }
     return row;
 }
-static int action_y(AppWindow *s) { return s->height-FOOT-30; }
 static AppControl control(AppWindow *s,int id) {
-    int y=action_y(s);
-    if (id==SAVE) return (AppControl){id,s->width-72,y,62,25,"保存"};
-    if (id==PRESET) return (AppControl){id,10,y,82,25,"切换选项"};
-    if (id==FIELD) return (AppControl){id,10,HEAD+28,s->width-20,27,""};
-    return (AppControl){BACK,5,4,35,25,"<"};
+    Layout v=layout(s);
+    int y=min_int(v.list+84,v.bottom-32);
+    if (id==SAVE) return (AppControl){id,v.x+v.w-79,y,79,30,"保存"};
+    if (id==PRESET) return (AppControl){id,v.x,y,94,30,"切换选项"};
+    if (id==FIELD) return (AppControl){id,v.x+10,v.list+16,v.w-20,30,""};
+    if (id>=NAV && id<NAV+SYSTEM) return (AppControl){id,9,v.nav_y+(id-NAV)*v.nav_h,v.rail-18,v.nav_h-4,titles[id-NAV+1]};
+    return (AppControl){BACK,v.x+8,16,28,28,"返回"};
 }
 static int choices_only(void) { return page==BOOT && (selected==1 || selected==2); }
-static void draw(AppWindow *s) {
-    app_rect(s,0,0,s->width,s->height,PAPER);
-    app_rect(s,0,0,s->width,HEAD,WHITE);
-    int left=page==HOME_PAGE ? 12 : 48;
-    if (page!=HOME_PAGE) app_button(s,&controls,control(s,BACK),0);
-    const char *heading=editing ? row_label(selected) : page==REPORT ? reports[report_id] : titles[page];
-    label(s,left,5,s->width-left-8,heading,INK);
-    app_rect(s,0,HEAD-1,s->width,1,EDGE);
-    if (page==REPORT) report_lines(s,1);
-    else if (editing) {
-        const char *hint=is_profile() ? (entries[selected].raw ? "登录语句" : entries[selected].key) :
-            page==AGENT ? (selected ? "64 - 2048" : "1 - 60") : boot_hints[selected];
-        label(s,12,HEAD+2,s->width-24,hint,MUTED);
-        int y=HEAD+28;
-        AppControl field=control(s,FIELD);
-        if (choices_only()) {
-            app_rect(s,field.x,field.y,field.w,field.h,WHITE);
-            label(s,15,y+2,field.w-10,display_value(draft),INK);
-            if (controls.focus==FIELD) app_rect(s,10,y+26,field.w,1,TEAL);
-        } else app_field(s,field,&input,draft,controls.focus==FIELD);
-        int buttons=action_y(s);
-        if (options()) app_button(s,&controls,control(s,PRESET),0);
-        app_button(s,&controls,control(s,SAVE),1);
-        if (buttons>y+54 && !options()) label(s,12,y+32,s->width-24,"输入替换当前值，回车保存",MUTED);
-    } else {
-        for (int j=0;j<visible(s) && top+j<count;++j) {
-            int i=top+j, y=HEAD+j*ROW;
-            char value[LINE_MAXIMUM+1];
-            row_value(i,value);
-            if (is_profile() && entries[i].line<0 && !entries[i].raw) strcpy(value,"未配置");
-            if (page==BOOT && i==1) strcpy(value,mode ? "双窗格" : "单窗格");
-            int split=*value ? s->width*47/100 : s->width-23;
-            int active=i==selected;
-            app_rect(s,0,y,s->width,ROW-1,active ? TINT : WHITE);
-            if (active) app_rect(s,0,y,3,ROW-1,TEAL);
-            label(s,12,y+2,split-16,row_label(i),INK);
-            if (*value) label(s,split,y+2,s->width-split-22,value,MUTED);
-            label(s,s->width-17,y+2,15,">",TEAL);
+static int needs_back(Layout v) { return page!=HOME_PAGE && (!v.rail || editing || page==REPORT); }
+static const char *release_name(void) {
+    static char version[64];
+    if (!version[0]) {
+        long n=console_call(29,2);
+        if (n>0 && n<(int)sizeof version) {
+            memcpy(version,(void *)0x443d7000,n);
+            version[strcspn(version,"\r\n")]=0;
         }
     }
-    int fy=s->height-FOOT;
-    app_rect(s,0,fy,s->width,FOOT,PAPER);
-    app_rect(s,0,fy,s->width,1,EDGE);
+    return strncmp(version,"kernel-",7)==0 ? version+7 : version;
+}
+static void sidebar(AppWindow *s,Layout v) {
+    app_rect(s,0,0,v.rail,s->height,RAIL);
+    app_rect(s,v.rail-1,0,1,s->height,LINE);
+    int by=v.nav_y==46 ? 8 : 21;
+    rounded(s,14,by,34,34,9,PLUM);
+    symbol(s,19,by+5,SLIDERS,24,CARD);
+    text(s,57,by+5,v.rail-60,"LixinOS",23,INK);
+    int active=page==REPORT ? SYSTEM : page;
+    for (int i=LOGIN;i<=SYSTEM;++i) {
+        AppControl b=control(s,NAV+i-1);
+        if (i==active || controls.pressed==b.id)
+            rounded(s,b.x,b.y,b.w,b.h,8,i==active?PEACH:LINE);
+        if (i==active) rounded(s,b.x+1,b.y+9,3,b.h-18,1,ORANGE);
+        symbol(s,b.x+11,b.y+(b.h-22)/2,i,22,i==active?ORANGE:icon_ink[i]);
+        text(s,b.x+44,b.y+(b.h-16)/2,b.w-46,b.name,16,i==active?PLUM:INK);
+    }
+    if (s->height-v.nav_y-SYSTEM*v.nav_h>60) {
+        int y=s->height-52;
+        app_rect(s,16,y,v.rail-32,1,LINE);
+        text(s,17,y+12,v.rail-30,release_name(),13,SECONDARY);
+    }
+}
+static void heading(AppWindow *s,Layout v) {
+    int y=10,h=v.list-22;
+    for (int j=0;j<h && y+j<s->height;j++) {
+        int edge=inset(j,h,10);
+        for (int i=edge;i<v.w-edge;++i) {
+            int x=v.x+i;
+            if ((unsigned)x<(unsigned)s->width)
+                s->pixels[(y+j)*s->width+x]=skyline[(j*96/h)*640+i*640/v.w];
+        }
+    }
+    int back=needs_back(v), x=v.x+18;
+    if (back) {
+        AppControl b=control(s,BACK);
+        rounded(s,b.x,b.y,b.w,b.h,8,PLUM);
+        symbol(s,b.x+5,b.y+5,PREVIOUS,18,CARD);
+        x=b.x+b.w+9;
+    }
+    const char *title=editing?row_label(selected):page==REPORT?reports[report_id]:titles[page];
+    const char *sub=editing ? (is_profile() ? (entries[selected].raw?"登录语句":entries[selected].key) :
+        page==AGENT ? (selected?"64 – 2048 字节":"1 – 60 次") : boot_hints[selected]) :
+        page==REPORT ? titles[SYSTEM] : hints[page];
+    int tall=h>=70,room=v.x+v.w-x-10;
+    text(s,x,y+(tall?18:8),room,title,tall?25:18,CARD);
+    if (tall) text(s,x,y+55,room,sub,15,RGB(254,220,208));
+    else if (editing) text(s,x,y+29,room,sub,13,CARD);
+}
+static int row_icon(int i) {
+    static const int boot[]={CLOCK,DISPLAY,CHIP,PORT,CUBE};
+    static const int system[]={CHIP,MONITOR,CHIP,CUBE,PORT,TERMINAL};
+    if (page==BOOT) return boot[i];
+    if (page==SYSTEM) return system[i];
+    if (page==HOME_PAGE) return i+1;
+    if (page==AGENT) return i?MONITOR:SPARK;
+    if (page==LOGIN) return entries[i].field==0?PEN:entries[i].field>=1 && entries[i].field<=4?FOLDER:TERMINAL;
+    return CODE;
+}
+static void draw_rows(AppWindow *s,Layout v) {
+    int n=min_int(count-top,v.visible);
+    if (n<=0) return;
+    rounded(s,v.x,v.list,v.w,n*v.row,10,LINE);
+    for (int j=0;j<n;j++) {
+        int i=top+j, y=v.list+j*v.row, chosen=i==selected;
+        unsigned short bg=chosen ? SOFT : CARD;
+        for (int k=1;k<v.row;++k) {
+            int edge=inset(j*v.row+k,n*v.row,10);
+            app_rect(s,v.x+edge+1,y+k,v.w-2*edge-2,1,bg);
+        }
+        int icon=row_icon(i), mid=y+v.row/2;
+        int badge=v.row>=40 ? 32 : 26;
+        rounded(s,v.x+10,mid-badge/2,badge,badge,8,icon_bg[icon]);
+        symbol(s,v.x+10+(badge-20)/2,mid-10,icon,20,icon_ink[icon]);
+        if (chosen) app_rect(s,v.x+1,mid-7,3,14,ORANGE);
+        char value[LINE_MAXIMUM+1];
+        row_value(i,value);
+        if (is_profile() && entries[i].line<0 && !entries[i].raw) strcpy(value,"未配置");
+        if (page==BOOT && i==1) strcpy(value,mode?"双窗格":"单窗格");
+        int x=v.x+badge+20, end=v.x+v.w-32,split=v.x+v.w*53/100;
+        text(s,x,mid-8,(*value ? split-8 : end)-x,row_label(i),16,INK);
+        if (*value) text(s,split,mid-8,end-split,value,15,SECONDARY);
+        symbol(s,end+6,mid-8,NEXT,16,SECONDARY);
+    }
+}
+static void draw_button(AppWindow *s,AppControl b,int primary) {
+    unsigned short bg=primary ? ORANGE : (controls.focus==b.id ? PEACH : LINE);
+    if (controls.pressed==b.id) bg=primary?PLUM:PEACH;
+    rounded(s,b.x,b.y,b.w,b.h,8,bg);
+    text(s,b.x+(primary?24:16),b.y+7,b.w-18,b.name,16,primary?CARD:INK);
+    if (controls.focus==b.id) app_rect(s,b.x+10,b.y+b.h-4,b.w-20,2,primary?CARD:ORANGE);
+}
+static void draw(AppWindow *s) {
+    Layout v=layout(s);
+    app_rect(s,0,0,s->width,s->height,CANVAS);
+    if (v.rail) sidebar(s,v);
+    heading(s,v);
+    if (editing) {
+        AppControl field=control(s,FIELD);
+        rounded(s,v.x,v.list,v.w,58,9,LINE);
+        rounded(s,v.x+1,v.list+1,v.w-2,56,8,CARD);
+        if (choices_only()) {
+            text(s,field.x+4,field.y+3,field.w-32,display_value(draft),16,INK);
+            symbol(s,field.x+field.w-22,field.y+2,NEXT,18,ORANGE);
+        } else app_field(s,field,&input,draft,controls.focus==FIELD);
+        if (controls.focus==FIELD) app_rect(s,field.x,field.y+field.h-1,field.w,2,ORANGE);
+        if (options()) draw_button(s,control(s,PRESET),0);
+        draw_button(s,control(s,SAVE),1);
+    } else if (page==REPORT) {
+        rounded(s,v.x,v.list,v.w,v.visible*v.row,10,CARD);
+        report_lines(s,1);
+    } else draw_rows(s,v);
+    if (notice) text(s,v.x+4,s->height-24,v.w-8,notice,15,editing?ERROR:SECONDARY);
     int items=page==REPORT ? report_lines(s,0) : count;
-    int paged=!editing && items>visible(s);
-    const char *hint=page==REPORT ? "当前系统" : hints[page];
-    if (editing && !notice) hint=page==BOOT ? "显式启动参数优先" : "回车保存";
-    label(s,9,fy+3,s->width-18,notice ? notice : hint,notice && editing ? ERROR : MUTED);
-    if (paged) {
-        UiThumb thumb=ui_list_thumb(top,items,visible(s),fy-HEAD);
-        app_rect(s,s->width-7,HEAD,7,fy-HEAD,EDGE);
-        app_rect(s,s->width-6,HEAD+thumb.start,5,thumb.length,MUTED);
+    if (!editing && items>v.visible) {
+        UiThumb thumb=ui_list_thumb(top,items,v.visible,v.bottom-v.list);
+        rounded(s,v.x+v.w+3,v.list+thumb.start,4,thumb.length,2,SECONDARY);
     }
 }
 static void move(AppWindow *s,int delta) {
     notice=NULL;
     if (page==REPORT) {
-        int limit=report_lines(s,0)-visible(s);
+        int limit=report_lines(s,0)-layout(s).visible;
         top+=delta;
         if (top>limit) top=limit;
         if (top<0) top=0;
@@ -515,7 +680,13 @@ static void cycle(void) {
     ui_text_begin(&input,draft,1); notice=NULL;
 }
 static int event(AppWindow *s,WindowEvent e) {
+    Layout v=layout(s);
     if (e.type==WINDOW_CLIENT_CONFIGURE) {
+        static int opened;
+        if (!opened) {
+            opened=1;
+            if (s->width>=570 && s->height>=245) enter_page(BOOT);
+        }
         if (page==REPORT) move(s,0);
         else reveal(s);
         return 1;
@@ -524,27 +695,31 @@ static int event(AppWindow *s,WindowEvent e) {
     if (e.type==WINDOW_CLIENT_PASTE && editing && !choices_only() && controls.focus==FIELD)
         return app_field_paste(s,&input,draft,sizeof draft,e.value);
     if (e.type==WINDOW_CLIENT_WHEEL && !editing) {
-        top=ui_list_top(top-e.value,items,visible(s));
+        top=ui_list_top(top-e.value,items,v.visible);
         return 1;
     }
     if (e.type==WINDOW_CLIENT_POINTER) {
         int hit=0;
-        if (page!=HOME_PAGE && app_control_hit(control(s,BACK),e.x,e.y)) hit=BACK;
+        if (v.rail) {
+            for (int i=0;i<SYSTEM;++i)
+                if (app_control_hit(control(s,NAV+i),e.x,e.y)) hit=NAV+i;
+        }
+        if (needs_back(v) && app_control_hit(control(s,BACK),e.x,e.y)) hit=BACK;
         if (editing) {
             for (int id=FIELD;id<=SAVE;++id)
                 if ((id!=PRESET || options()) && app_control_hit(control(s,id),e.x,e.y)) hit=id;
-        } else if (e.y>=HEAD && e.y<s->height-FOOT && e.x>=0 && e.x<s->width) {
-            int row=(e.y-HEAD)/ROW;
-            if (items>visible(s) && e.x>=s->width-9) hit=TRACK;
-            else if (page!=REPORT && row<visible(s) && top+row<count) hit=FIRST_ROW+top+row;
+        } else if (e.y>=v.list && e.y<v.bottom && e.x>=v.x && e.x<v.x+v.w+10) {
+            int row=(e.y-v.list)/v.row;
+            if (items>v.visible && e.x>=v.x+v.w) hit=TRACK;
+            else if (page!=REPORT && e.x<v.x+v.w && row<v.visible && top+row<count) hit=FIRST_ROW+top+row;
         }
         int press=e.value && !controls.down, was=controls.pressed;
         int action=ui_pointer(&controls,hit,e.value);
         if (controls.pressed==TRACK) {
-            UiThumb thumb=ui_list_thumb(top,items,visible(s),s->height-FOOT-HEAD);
-            int y=e.y-HEAD;
+            UiThumb thumb=ui_list_thumb(top,items,v.visible,v.bottom-v.list);
+            int y=e.y-v.list;
             if (press) thumb_grab=y>=thumb.start && y<thumb.start+thumb.length ? y-thumb.start : thumb.length/2;
-            top=ui_list_drag(y-thumb_grab,thumb.travel,items,visible(s));
+            top=ui_list_drag(y-thumb_grab,thumb.travel,items,v.visible);
         }
         if (controls.pressed==FIELD && !choices_only()) {
             input.caret=app_field_position(control(s,FIELD),&input,draft,e.x);
@@ -553,7 +728,9 @@ static int event(AppWindow *s,WindowEvent e) {
         if (action==BACK) back();
         else if (action==SAVE) save();
         else if (action==PRESET || (action==FIELD && choices_only())) cycle();
+        else if (action>=NAV && action<NAV+SYSTEM) enter_page(LOGIN+action-NAV);
         else if (action>=FIRST_ROW) { selected=action-FIRST_ROW; activate(); }
+        if (action && !editing && page!=REPORT) reveal(s);
         return press || was || action;
     } else if (e.type==WINDOW_CLIENT_KEY) {
         int key=e.value;

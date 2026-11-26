@@ -1,0 +1,12 @@
+--- a/src/corelib/thread/qsemaphore.cpp
++++ b/src/corelib/thread/qsemaphore.cpp
+@@ -94,7 +94,8 @@
+     unspecified, but it's likely single-token threads will get woken up first.
+  */
+ 
+-#if defined(FUTEX_OP) && QT_POINTER_SIZE > 4
++// The LixinOS futex adapter supports WAIT and WAKE. Use Qt's wake-all path.
++#if defined(FUTEX_OP) && QT_POINTER_SIZE > 4 && !defined(__lixinos__)
+ static constexpr bool futexHasWaiterCount = true;
+ #else
+ static constexpr bool futexHasWaiterCount = false;

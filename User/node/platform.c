@@ -7,12 +7,14 @@
 #include "uv.h"
 
 // The Linux build tools omit this marker and use native page protections.
+#ifndef LX_DYNAMIC_RUNTIME
 const char lx_node_eager_heap = 1;
 extern char __end_image[];
 static pthread_t main_thread;
 __attribute__((constructor)) static void record_main_thread(void) {
     main_thread = pthread_self();
 }
+#endif
 enum { launcher_stack = 2 << 20 };
 
 int __real_getaddrinfo(const char *, const char *, const struct addrinfo *, struct addrinfo **);
@@ -34,8 +36,10 @@ int __wrap_getaddrinfo(const char *host, const char *service, const struct addri
 int __real_pthread_getattr_np(pthread_t thread, pthread_attr_t *attr);
 int __wrap_pthread_getattr_np(pthread_t thread, pthread_attr_t *attr) {
     int err = __real_pthread_getattr_np(thread, attr);
+#ifndef LX_DYNAMIC_RUNTIME
     if (!err && pthread_equal(thread, main_thread))
         err = pthread_attr_setstack(attr, __end_image, launcher_stack);
+#endif
     return err;
 }
 

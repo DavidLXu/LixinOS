@@ -16,13 +16,16 @@ install = runpy.run_path(str(root / "User/gcc/install.py"))["install"]
 VERSIONS = {"node": "v22.23.5", "node26": "v26.13.1"}
 
 
-def check(kernel, release, seed, package, scratch, binary, openssl):
+def check(kernel, release, seed, package, scratch, binary, openssl, wasm, addon):
     version = VERSIONS[binary]
     disk = scratch / f"{kernel}.img"
     # APFS cloning is optional. Plain copies also isolate guest writes.
     if subprocess.run(["cp", "-c", seed, disk], capture_output=True).returncode:
         shutil.copyfile(seed, disk)
     install(package, disk, binary)
+    if addon:
+        from disk_image import edit_files
+        edit_files(disk, lambda rows: rows.update({b"/probe.node": (bytes(8), addon.read_bytes())}))
     cmd = [root / "scripts/run-kernel.sh", "--kernel", kernel, "--release", release, "--serial"]
     with native["guest"]["boot"](disk, cmd, prompt=b"LixinOS Bash (C shell)") as serial:
         serial.until(b"$ ", timeout=90)
@@ -36,6 +39,11 @@ def check(kernel, release, seed, package, scratch, binary, openssl):
         command(f"{binary} -p '6 * 7'", b"\n42\n")
         command(f"""{binary} -e 'process.title = "demo"; console.log(process.execPath)'""", f"\n/bin/{binary}\n".encode())
         command(f"""echo 'console.log(7 * 6)' | {binary}""", b"\n42\n")
+        if addon:
+            command(f"""{binary} -p 'require("/probe.node")(17,25)'""", b"\n42\n")
+        if wasm:
+            module = "0061736d0100000001070160027f7f017f030201000707010373756d00000a09010700200020016a0b"
+            command(f"""{binary} -e 'WebAssembly.instantiate(Buffer.from("{module}","hex")).then(x=>console.log(x.instance.exports.sum(17,25)))'""", b"\n42\n")
         if openssl:
             command(f"""{binary} -p 'require("node:crypto").createHash("sha256").update("abc").digest("hex")'""",
                     b"\nba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n")
@@ -67,6 +75,8 @@ def main():
     parser.add_argument("--disk", required=True, type=Path)
     parser.add_argument("--command", choices=VERSIONS, default="node")
     parser.add_argument("--package", type=Path)
+    parser.add_argument("--wasm", action="store_true", help="run a WebAssembly module in V8")
+    parser.add_argument("--addon", type=Path, help="guest Node-API addon exporting add(a,b)")
     parser.add_argument("--openssl", action="store_true", help="also test the optional OpenSSL build")
     parser.add_argument("--kernel", choices=("both", "rust", "tcc"), default="both")
     parser.add_argument("--release", default="latest")
@@ -79,7 +89,7 @@ def main():
         release = subprocess.check_output(["python3", root/"scripts/kernel-release.py", "latest"], text=True).strip()
     with tempfile.TemporaryDirectory(prefix="lixin-node-") as tmp:
         for kernel in ("rust", "tcc") if args.kernel == "both" else (args.kernel,):
-            check(kernel, release, seed, package, Path(tmp), args.command, args.openssl)
+            check(kernel, release, seed, package, Path(tmp), args.command, args.openssl, args.wasm, args.addon)
 
 
 if __name__ == "__main__":

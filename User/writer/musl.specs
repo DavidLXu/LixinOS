@@ -1,0 +1,3 @@
+*link_ssp:
+%{fstack-protector*:-lc}
+

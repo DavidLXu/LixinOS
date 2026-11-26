@@ -151,7 +151,14 @@
    return 0;
  }
  
-@@ -776,6 +771,7 @@
+@@ -761,5 +756,6 @@
+ static int f_get_clipboard(lua_State *L) {
++  if (lxl_shared_paste(L)) return 1;
+   char *text = SDL_GetClipboardText();
+   if (!text) { return 0; }
+ #ifdef _WIN32
+   // on windows, text-based clipboard formats must terminate with \r\n
+@@ -776,6 +772,7 @@
  static int f_set_clipboard(lua_State *L) {
    const char *text = luaL_checkstring(L, 1);
    SDL_SetClipboardText(text);
@@ -202,11 +209,17 @@
    local run_threads_full = 0
 --- a/data/core/style.lua
 +++ b/data/core/style.lua
-@@ -23,10 +23,16 @@
+@@ -23,10 +23,21 @@
  -- On High DPI monitor or non RGB monitor you may consider using antialiasing grayscale instead.
  -- The antialiasing grayscale with full hinting is interesting for crisp font rendering.
- style.font = renderer.font.load(DATADIR .. "/fonts/FiraSans-Regular.ttf", 15 * SCALE)
-+local fallback_path = DATADIR .. "/fonts/NotoSansMonoCJKsc-Regular.otf"
+-style.font = renderer.font.load(DATADIR .. "/fonts/FiraSans-Regular.ttf", 15 * SCALE)
++local function font_path(name)
++  local shared = "/usr/share/fonts/" .. name
++  if system.get_file_info(shared) then return shared end
++  return DATADIR .. "/fonts/" .. name
++end
++style.font = renderer.font.load(font_path("FiraSans-Regular.ttf"), 15 * SCALE)
++local fallback_path = font_path("NotoSansMonoCJKsc-Regular.otf")
 +local fallback = renderer.font.load(fallback_path, 15 * SCALE, {antialiasing="grayscale"})
 +style.font = renderer.font.group { style.font, fallback }
  style.big_font = style.font:copy(46 * SCALE)
@@ -214,12 +227,12 @@
  style.icon_big_font = style.icon_font:copy(23 * SCALE)
 -style.code_font = renderer.font.load(DATADIR .. "/fonts/JetBrainsMono-Regular.ttf", 15 * SCALE)
 +style.code_font = renderer.font.group {
-+  renderer.font.load(DATADIR .. "/fonts/JetBrainsMono-Regular.ttf", 15 * SCALE),
++  renderer.font.load(font_path("JetBrainsMono-Regular.ttf"), 15 * SCALE),
 +  fallback
 +}
- 
+
  style.syntax = {}
- 
+
 --- a/data/core/doc/init.lua
 +++ b/data/core/doc/init.lua
 @@ -105,12 +105,9 @@

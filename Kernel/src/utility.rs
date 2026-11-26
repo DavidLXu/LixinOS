@@ -83,6 +83,11 @@ pub fn segment(file: &[u8]) -> Option<&[u8]> {
     file.get(start..start.checked_add(len)?)
 }
 
+pub(crate) fn dynamic_program(file: &[u8]) -> bool {
+    unsafe extern "C" { fn musl_program(file: *const u8, len: usize) -> i32; }
+    unsafe { musl_program(file.as_ptr(), file.len()) != 0 }
+}
+
 pub(crate) fn load_segments(file: &[u8]) -> Option<(&[u8], &[u8])> {
     if let Some(large) = user::large_program(file) { return Some((large.entry, &[])); }
     segment(file).map(|code| (code, &[][..])).or_else(|| user::application_segments(file))
@@ -168,7 +173,7 @@ impl Streams {
 }
 
 enum Handle {
-    File { data: Vec<u8>, position: usize },
+    File { path: String, data: Vec<u8>, position: usize },
     Writable {
         path: String,
         position: usize,
@@ -207,13 +212,37 @@ extern "C" fn gpu_free(p: *mut u8, n: u32) {
     unsafe { alloc::alloc::dealloc(p, layout) }
 }
 
+#[derive(Default)]
+struct AudioStream(u32);
+unsafe extern "C" {
+    fn audio_call(owned: *mut u32, size: u64, mail: *const u8) -> i64;
+    fn audio_close(owned: *mut u32);
+}
+impl Drop for AudioStream {
+    fn drop(&mut self) { unsafe { audio_close(&mut self.0); } }
+}
+
+#[derive(Default)]
+struct RecordLocks(u64);
+unsafe extern "C" {
+    fn record_call(owner: &mut u64, path: *const u8, length: u32, writable: i32,
+                   query: u32, request: *mut u8) -> i64;
+    fn record_release(owner: u64);
+}
+impl Drop for RecordLocks {
+    fn drop(&mut self) { unsafe { record_release(self.0); } }
+}
+
 pub(super) struct Context {
+    locks: RecordLocks,
+    audio: AudioStream,
     #[cfg(feature = "retina")]
     gpu: GpuContext,
     heap: user::UserArena,
     extended: user::UserArena,
     program: user::UserArena,
     wide: user::UserArena,
+    vm: user::VmSpace,
     shared: user::SharedMappings,
     connections: crate::net::Connections,
     #[cfg(feature = "retina")]
@@ -230,8 +259,8 @@ pub(super) struct Context {
     pub(super) executable: String,
     peeked:Option<u8>,
     pub streams: Streams,
-    // Match the 32 guest descriptors in the musl adapter, in addition to stdio.
-    handles: [Option<Handle>; 32],
+    // IPC encodes descriptors in one byte. Keep per-process slots off the kernel stack.
+    handles: Vec<Option<Handle>>,
     fs_batch: Option<crate::fs_batch::Batch>,
 }
 struct Slot(UnsafeCell<Option<Context>>);
@@ -277,9 +306,12 @@ impl Context {
             extended: user::UserArena::extended(),
             program: user::UserArena::for_program(),
             wide: user::UserArena::wide(),
+            vm: Default::default(),
+            audio: Default::default(),
+            locks: Default::default(),
             shared: user::SharedMappings::new(),
             executable: String::new(),
-            connections: Default::default(), peeked:None,cursor: None, volume, cwd: cwd.into(), streams, handles: core::array::from_fn(|_| None), fs_batch: None }
+            connections: Default::default(), peeked:None,cursor: None, volume, cwd: cwd.into(), streams, handles: (3..256).map(|_| None).collect(), fs_batch: None }
     }
     // Move open handles and the directory cursor back to the caller on yield.
     // Each suspended process therefore retains its own descriptors.
@@ -293,6 +325,7 @@ impl Context {
         self.program.set_mapped(true);
         self.wide.set_mapped(true);
         self.shared.set_mapped(true);
+        self.vm.bind(true);
         unsafe { *slot = Some(self); }
         let result = launch();
         let io = unsafe { (*slot).take().unwrap() };
@@ -301,11 +334,18 @@ impl Context {
         io.program.set_mapped(false);
         io.wide.set_mapped(false);
         io.shared.set_mapped(false);
+        io.vm.bind(false);
         (io, result)
     }
 }
 
 pub(super) fn launch_program(file: &[u8], cwd: &str, args: &str) -> Result<u16, &'static str> {
+    let interpreter;
+    let file = if dynamic_program(file) {
+        let io = unsafe { (&*SLOTS[user::bank()].0.get()).as_ref() }.ok_or("missing program context")?;
+        interpreter = io.volume.borrow().read_file("/bin/ld-musl")?;
+        interpreter.as_slice()
+    } else { file };
     let (text, data) = load_segments(file).ok_or("invalid LixinOS executable")?;
     if let Some(large) = user::large_program(file) {
         let io = unsafe { (&mut *SLOTS[user::bank()].0.get()).as_mut() }.ok_or("missing program context")?;
@@ -417,7 +457,13 @@ fn local_socket(context: &mut Context, value: u64) -> i64 {
                 socket.shutdown(argument);
                 return 0;
             }
-            if command == 9 { return socket.peer as i64; }
+            if command == 9 {
+                if argument==8 {
+                    payload[..4].copy_from_slice(&socket.credentials[0].to_le_bytes());
+                    payload[4..8].copy_from_slice(&socket.credentials[1].to_le_bytes());
+                }
+                return socket.peer as i64;
+            }
             let bytes = &mut payload[..argument as usize];
             if command == 7 || command == 10 { return socket.write(bytes, rights); }
             let (status, received) = socket.read(bytes);
@@ -450,6 +496,12 @@ fn shared_memory(context: &mut Context, value: u64) -> i64 {
     let argument = value as u32;
     let mail = unsafe { slice::from_raw_parts_mut(user::utility_mailbox(), 4096) };
     let word = |at: usize| u64::from_le_bytes(mail[at..at + 8].try_into().unwrap());
+    if command == 9 {
+        let (used, free) = crate::monitor::heap_usage();
+        mail[..8].copy_from_slice(&((used + free) as u64).to_le_bytes());
+        mail[8..16].copy_from_slice(&(free as u64).to_le_bytes());
+        return 0;
+    }
     if command == 5 { return context.shared.unmap(word(0) as usize, word(8) as usize); }
     let file = fd.checked_sub(3).and_then(|i| context.handles.get(i)).and_then(Option::as_ref);
     if command == 0 || command == 1 {
@@ -477,7 +529,7 @@ unsafe extern "C" { fn smp_clock_read(mode: u64) -> u64; }
 
 // Authorize the clock shortcut only after normal syscall entry and policy checks.
 #[unsafe(no_mangle)]
-extern "C" fn smp_clock_allowed() -> i32 {
+pub(crate) extern "C" fn smp_clock_allowed() -> i32 {
     #[cfg(feature = "retina")]
     if !crate::scheduler::background() && crate::graphics::terminal_closed() { return 0; }
     (active() && !user::test_io_active() && !crate::agent_tools::active()
@@ -485,12 +537,38 @@ extern "C" fn smp_clock_allowed() -> i32 {
 }
 
 pub fn io(value: u64, operation: u64) -> Option<u64> {
+    if matches!(operation, 38 | 43) {
+        if !active() { return None; }
+        if operation == 38 { return Some(unsafe { smp_clock_read(value) }); }
+        if value > 3_600_000 { return Some(u64::MAX); }
+        crate::scheduler::sleep_ms(value);
+        return Some(0);
+    }
     let context = unsafe { (&mut *SLOTS[user::bank()].0.get()).as_mut()? };
     match operation {
         #[cfg(feature = "retina")]
         60 => Some(unsafe { gpu_call(&mut context.gpu.0, value, user::git_mailbox()) as u64 }),
         58 => Some(local_socket(context, value) as u64),
         59 => Some(shared_memory(context, value) as u64),
+        63 if !crate::process::agent_noninteractive() =>
+            Some(unsafe { audio_call(&mut context.audio.0, value, user::utility_mailbox()) } as u64),
+        62 => {
+            let words = unsafe { *user::utility_mailbox().cast::<[u64; 6]>() };
+            let volume = context.volume.borrow();
+            let bytes: &[u8] = if value == 4 {
+                match (words[4] as usize).checked_sub(3).and_then(|fd| context.handles.get(fd))
+                    .and_then(Option::as_ref) {
+                    Some(Handle::File { data, .. }) => data,
+                    Some(Handle::Writable { path, .. }) => match volume.files.get(path) {
+                        Some(Some(data)) => data,
+                        _ => return Some((-9i64) as u64),
+                    },
+                    _ => return Some((-9i64) as u64),
+                }
+            } else { &[] };
+            Some(unsafe { user::vm_call(&mut context.vm, user::bank() as u32, value,
+                                         words.as_ptr(), bytes.as_ptr(), bytes.len()) as u64 })
+        }
         49 => {
             let mut free = context.handles.iter().enumerate().filter(|(_, h)| h.is_none()).map(|(i, _)| i);
             let (Some(r), Some(w)) = (free.next(), free.next()) else { return Some(u64::MAX); };
@@ -610,6 +688,7 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
             }
             let Some(canvas) = &mut context.canvas else { return Some(u64::MAX) };
             Some(match operation {
+                19 if value == 2 => crate::graphics::canvas_navigation_keys(),
                 19 if value == 1 && canvas.resizable => canvas.geometry(),
                 19 if value == 0 && !canvas.resizable => crate::graphics::canvas_size(),
                 19 => u64::MAX,
@@ -655,12 +734,12 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
                 .and_then(|name| {
                     let volume = context.volume.borrow();
                     let path = volume.resolve(&context.cwd, name).ok()?;
-                    volume.read_file(&path).ok()
+                    volume.read_file(&path).ok().map(|bytes| (path, bytes))
                 });
             let fd = context.handles.iter().position(Option::is_none);
             Some(match (data, fd) {
-                (Some(bytes), Some(fd)) => {
-                    context.handles[fd] = Some(Handle::File { data: bytes, position: 0 });
+                (Some((path, bytes)), Some(fd)) => {
+                    context.handles[fd] = Some(Handle::File { path, data: bytes, position: 0 });
                     fd as u64 + 3
                 }
                 _ => u64::MAX,
@@ -714,7 +793,7 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
             match handle {
                 Handle::PipeRead(r) if operation == 9 => Some(r.read_into(buffer) as u64),
                 Handle::PipeWrite(w) if operation == 39 => Some(w.write_from(buffer).map_or(u64::MAX, |n| n as u64)),
-                Handle::File { data, position } if operation == 9 => {
+                Handle::File { data, position, .. } if operation == 9 => {
                     let bytes = data.get(*position..).unwrap_or_default();
                     let n = count.min(bytes.len());
                     buffer[..n].copy_from_slice(&bytes[..n]);
@@ -916,6 +995,8 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
             let mail = unsafe { slice::from_raw_parts_mut(user::utility_mailbox().cast::<u64>(), 512) };
             Some(crate::scheduler::resource_snapshot(mail) as u64)
         }
+        #[cfg(feature = "retina")]
+        29 if value == 11 => Some(crate::graphics::input_modifiers()),
         29 => {
             use crate::inspect;
             let text = match value {
@@ -950,7 +1031,6 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
         }
         // Monotonic time from the ARM virtual counter. Mode 0 is the original
         // millisecond API, mode 1 is microseconds, and mode 2 is raw ticks.
-        38 => Some(unsafe { smp_clock_read(value) }),
         56 => {
             if value == u64::MAX { context.streams.environment = None; return Some(0); }
             if value > 8192 { return Some(u64::MAX); }
@@ -959,7 +1039,35 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
             context.streams.environment = Some(Rc::from(env));
             Some(0)
         }
-        54 => Some(crate::scheduler::pid() as u64),
+        54 => Some(crate::scheduler::query_pid(value)),
+        65 => {
+            if value == u64::MAX { return Some(0x4c584c4b); }
+            let handle = (value >> 32).checked_sub(3).and_then(|i| context.handles.get(i as usize))
+                .and_then(Option::as_ref);
+            let (path, writable) = match handle {
+                Some(Handle::File { path, .. }) => (path, false),
+                Some(Handle::Writable { path, .. }) => (path, true),
+                _ => return Some((-9i64) as u64),
+            };
+            Some(unsafe { record_call(&mut context.locks.0, path.as_ptr(), path.len() as u32,
+                                      writable as i32, value as u32, user::utility_mailbox()) } as u64)
+        }
+        64 => {
+            unsafe extern "C" { fn id_call(owner:u32, op:u32, words:*mut u32) -> i64; }
+            if value==18 {
+                let mut v=context.volume.borrow_mut();
+                let crate::process::Volume{disk,files,versions,..}=&mut *v;
+                Some(if !disk.scratch_dirty || disk.save(files,versions).is_ok() {0} else {(-5i64) as u64})
+            } else if (12..=17).contains(&value) {
+                let mail=unsafe {slice::from_raw_parts_mut(user::utility_mailbox(),4096)};
+                let n=mail[16..529].iter().position(|&b| b==0)?;
+                let Ok(name)=core::str::from_utf8(&mail[16..16+n]) else {return Some((-22i64) as u64);};
+                let mut volume=context.volume.borrow_mut();
+                let Ok(path)=volume.resolve(&context.cwd,name) else {return Some((-2i64) as u64);};
+                let words=unsafe {slice::from_raw_parts_mut(mail.as_mut_ptr().cast::<u32>(),4)};
+                Some(crate::permissions::syscall(&mut volume,&path,value as u32,words) as u64)
+            } else {Some(unsafe { id_call(user::bank() as u32, value as u32, user::utility_mailbox().cast()) as u64 })}
+        },
         53 => Some(match context.streams.environment.as_ref() {
             None => 0,
             Some(env) => {
@@ -1022,11 +1130,6 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
             };
             Some(result as u64)
         }
-        43 => {
-            if value > 3_600_000 { return Some(u64::MAX); }
-            crate::scheduler::sleep_ms(value);
-            Some(0)
-        }
         24 if value == 2 => Some(u64::from(!context.streams.null[0] && !context.streams.closed[0] && context.streams.input_pipe.is_none() && context.streams.buffer.borrow().input.is_none())),
         24 if value == 1 => Some(u64::from(!context.streams.null[1] && !context.streams.redirected())),
         24 => Some(u64::from(context.streams.output_pipe.is_none() && context.streams.buffer.borrow().output.is_none())),
@@ -1054,7 +1157,8 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
                 let range = unsafe { slice::from_raw_parts(user::utility_mailbox().add(520).cast::<usize>(), 2) };
                 let (address, size) = (range[0], range[1]);
                 if size > volume.disk.file_limit() || ![&context.heap, &context.extended, &context.wide]
-                    .iter().any(|arena| arena.contains(address, size)) { return Some(u64::MAX); }
+                    .iter().any(|arena| arena.contains(address, size)) &&
+                    unsafe { user::vm_readable(&context.vm, address, size) } == 0 { return Some(u64::MAX); }
                 let mut bytes = Vec::new();
                 if bytes.try_reserve_exact(size).is_err() { return Some(u64::MAX); }
                 bytes.extend_from_slice(unsafe { slice::from_raw_parts(address as *const u8, size) });

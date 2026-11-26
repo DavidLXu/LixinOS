@@ -8,6 +8,10 @@ sdk="$build/sdk"
 LIXINOS_GCC_BUILD="$build/runtime" bash "$root/User/gcc/build.sh" rt
 musl="$root/Kernel/target/user-build/cpython-port/sysroot/lib"
 mkdir -p "$sdk"
+if [[ ${NODE_PAGED_VM:-0} == 1 ]]; then
+    bash "$root/User/dynlink/build.sh"
+    cp "$musl/Scrt1.o" "$root/Kernel/target/user-build/dynlink-port/package/lib/libc.so" "$sdk/"
+fi
 cp "$musl"/{crt1.o,crti.o,crtn.o,libc.a} "$sdk/"
 cp "$build/runtime/rt/liblx.a" "$sdk/"
 if ! command -v aarch64-none-elf-ar >/dev/null; then

@@ -40,6 +40,7 @@ The optional [Node.js package](node/README.md) runs JavaScript with V8 and libuv
 
 The optional [dte package](dte/README.md) adds a terminal code editor with
 multiple tabs, UTF-8 editing, and compiler diagnostic navigation.
+The [LixinOS Code package](code/README.md) opens a graphical UTF-8 editor with the VS Code document model from the shell using `code filename`.
 The optional [Lite XL package](lite-xl/README.md) adds a desktop code
 editor with a project tree, mouse editing, and Chinese font fallback.
 The optional [GTK 3 package](gtk3/README.md) adds a native window backend,

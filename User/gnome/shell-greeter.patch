@@ -1,0 +1,23 @@
+--- a/js/ui/main.js
++++ b/js/ui/main.js
+@@ -236,7 +236,7 @@
+     magnifier = new Magnifier.Magnifier();
+     locatePointer = new LocatePointer.LocatePointer();
+ 
+-    if (LoginManager.canLock())
++    if (sessionMode.isGreeter || LoginManager.canLock())
+         screenShield = new ScreenShield.ScreenShield();
+ 
+     inputMethod = new InputMethod.InputMethod();
+--- a/js/gdm/loginDialog.js
++++ b/js/gdm/loginDialog.js
+@@ -907,7 +907,8 @@
+     }
+ 
+     _updateDisableUserList() {
+-        let disableUserList = this._settings.get_boolean(GdmUtil.DISABLE_USER_LIST_KEY);
++        let disableUserList = GLib.getenv('LIXINOS_GREETER') === '1' ||
++            this._settings.get_boolean(GdmUtil.DISABLE_USER_LIST_KEY);
+ 
+         // Disable user list when there are no users.
+         if (this._userListLoaded && this._userList.numItems() === 0)

@@ -14,6 +14,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/utsname.h>
@@ -30,8 +31,11 @@
 #include "../file-time.h"
 #include "../tcc/lixin.h"
 #include "../../Kernel/native/ipc.h"
+#include "../../Kernel/native/record-lock.h"
 
-long lx_mmap(long, unsigned long, long, long, long);
+long lx_mmap(long, unsigned long, long, long, long, unsigned long);
+long lx_madvise(uintptr_t, unsigned long, long);
+long lx_mprotect(uintptr_t, unsigned long, long);
 long lx_munmap(uintptr_t, unsigned long);
 long lx_brk(uintptr_t);
 extern int lx_save_buffer(const char *, const void *, unsigned);
@@ -43,15 +47,59 @@ struct handle {
     long size, pos;
     int fd, flags;
     int kind;
-    int fd_flags, local_bound;
+    unsigned refs;
+    int local_bound;
     socklen_t local_length, peer_length;
     struct sockaddr_un local_address, local_peer;
     struct sockaddr_in peer;
 };
-static struct handle files[32];
+enum { HANDLE_COUNT = LX_DESCRIPTOR_LIMIT - 3 };
+// Descriptor-local flags and shared open file descriptions have different lifetimes.
+static struct handle descriptions[HANDLE_COUNT];
+static struct { struct handle *file; int flags; } descriptor_slots[HANDLE_COUNT];
 
 static struct handle *handle(long fd) {
-    return fd >= 3 && fd < 35 && files[fd - 3].path[0] ? &files[fd - 3] : NULL;
+    return fd >= 3 && fd < LX_DESCRIPTOR_LIMIT ? descriptor_slots[fd - 3].file : NULL;
+}
+/* linux-run can host several Linux process IDs in one native process. */
+long lx_record_lock(int fd, unsigned query, struct lx_record_request *request) {
+    static int supported;
+    int held = lx_runtime_lock();
+    if (!supported)
+        supported = console_call(65, LX_LOCK_PROBE) == LX_LOCK_VERSION ? 1 : -1;
+    struct handle *h = handle(fd);
+    long rc = -ENOSYS;
+    if (supported > 0) {
+        rc = -EBADF;
+        if (h && !h->kind && h->fd >= 3 && h->size != LX_DIR) {
+            memcpy(MAIL, request, sizeof *request);
+            rc = console_call(65, (unsigned long)h->fd << 32 | query);
+            if (!rc && query) memcpy(request, MAIL, sizeof *request);
+        }
+    }
+    lx_runtime_unlock(&held);
+    return rc;
+}
+static int free_slot(int start) {
+    for (int i = start; i < HANDLE_COUNT; ++i)
+        if (!descriptor_slots[i].file) return i;
+    return -EMFILE;
+}
+static struct handle *new_description(int slot, int flags) {
+    // The caller has already reserved an unused descriptor, so at least one
+    // description is free even when every other descriptor is distinct.
+    unsigned i = 0;
+    while (descriptions[i].refs) ++i;
+    struct handle *h = &descriptions[i];
+    *h = (struct handle){.refs = 1, .flags = flags};
+    descriptor_slots[slot].file = h;
+    descriptor_slots[slot].flags = flags & O_CLOEXEC ? FD_CLOEXEC : 0;
+    return h;
+}
+static void release_slot(int fd) {
+    --descriptor_slots[fd - 3].file->refs;
+    descriptor_slots[fd - 3].file = NULL;
+    descriptor_slots[fd - 3].flags = 0;
 }
 enum { TCP = 1, PIPE_FD, NULL_FD, LOCAL_FD, SHARED_FD };
 enum { LOCAL_PAIR = 1, LOCAL_BIND, LOCAL_LISTEN, LOCAL_CONNECT, LOCAL_ACCEPT,
@@ -68,19 +116,20 @@ static long ipc_call(unsigned service, unsigned command, int fd, unsigned argume
 #define shared_call(command, fd, argument) ipc_call(59, command, fd, argument)
 
 static int stream_fd_from(int kind, int raw, int flags, int start) {
-    for (int i = start; i < 32; ++i) if (!files[i].path[0]) {
-        struct handle *h = &files[i];
-        h->kind = kind; h->fd = raw; h->flags = flags;
-        strcpy(h->path, kind == TCP || kind == LOCAL_FD ? "socket" :
-                        kind == SHARED_FD ? "memfd" : "pipe");
-        return i + 3;
-    }
-    return -EMFILE;
+    int slot = free_slot(start);
+    if (slot < 0) return slot;
+    struct handle *h = new_description(slot, flags);
+    h->kind = kind;
+    h->fd = raw;
+    strcpy(h->path, kind == TCP || kind == LOCAL_FD ? "socket" :
+                    kind == SHARED_FD ? "memfd" : "pipe");
+    return slot + 3;
 }
 static int stream_fd(int kind, int raw, int flags) {
     return stream_fd_from(kind, raw, flags, 0);
 }
 int lx_lookup_ipv4(const char *name, unsigned char *address) {
+    int held __attribute__((cleanup(lx_runtime_unlock))) = lx_runtime_lock();
     if (strlen(name) > 253) return -1;
     strcpy(MAIL, name);
     long result = console_call(48, 0);
@@ -137,7 +186,9 @@ static long stream_io(struct handle *h, void *buf, size_t n, int writing, int fl
                 return r;
             }
         } else if (h->kind == TCP) {
-            r = writing ? lx_tcp_write(h->fd, buf, length) : lx_tcp_read(h->fd, buf, length);
+            if (writing) r = lx_tcp_write(h->fd, buf, length);
+            else if (flags & MSG_PEEK) r = lx_tcp_peek(h->fd, buf, length);
+            else r = lx_tcp_read(h->fd, buf, length);
             if (r != LX_TCP_AGAIN) return r < 0 ? -ECONNRESET : r;
         } else {
             if ((h->flags & O_ACCMODE) != (writing ? O_WRONLY : O_RDONLY)) return -EBADF;
@@ -204,47 +255,31 @@ static int resolve_at(long parent, const char *path, char absolute[513]) {
 
 static int local_fd(int raw, int flags) {
     int fd = stream_fd(LOCAL_FD, raw, O_RDWR | (flags & SOCK_NONBLOCK));
-    if (fd >= 0) handle(fd)->fd_flags = flags & SOCK_CLOEXEC ? FD_CLOEXEC : 0;
+    if (fd >= 0) descriptor_slots[fd - 3].flags = flags & SOCK_CLOEXEC ? FD_CLOEXEC : 0;
     return fd;
 }
 
 static int shared_fd(int raw, int cloexec, int minimum) {
     if (raw < 0) return raw;
     int fd = stream_fd_from(SHARED_FD, raw, O_RDWR, minimum > 3 ? minimum - 3 : 0);
-    if (fd >= 0) handle(fd)->fd_flags = cloexec ? FD_CLOEXEC : 0;
+    if (fd >= 0) descriptor_slots[fd - 3].flags = cloexec ? FD_CLOEXEC : 0;
     else lx_close(raw);
     return fd;
 }
 
 static long duplicate_fd(struct handle *source, long minimum, int cloexec) {
     if (!source) return -EBADF;
-    if (minimum < 0 || minimum >= 35) return -EINVAL;
-    if (source->kind == SHARED_FD)
-        return shared_fd(shared_call(SHARED_DUP, source->fd, 0), cloexec, minimum);
-    if (source->fd < 0 || (source->kind != LOCAL_FD && source->kind != PIPE_FD))
-        return -ENOTSUP;
-    int fd = stream_fd_from(source->kind, source->fd, source->flags, minimum > 3 ? minimum - 3 : 0);
-    if (fd >= 0) {
-        *handle(fd) = *source;
-        handle(fd)->fd_flags = cloexec ? FD_CLOEXEC : 0;
-    }
-    return fd;
-}
-
-static int raw_is_aliased(const struct handle *source) {
-    if (source->kind != LOCAL_FD && source->kind != PIPE_FD) return 0;
-    for (unsigned i = 0; i < 32; ++i)
-        if (&files[i] != source && files[i].path[0] &&
-            files[i].kind == source->kind && files[i].fd == source->fd) return 1;
-    return 0;
+    if (minimum < 0 || minimum >= LX_DESCRIPTOR_LIMIT) return -EINVAL;
+    int slot = free_slot(minimum > 3 ? minimum - 3 : 0);
+    if (slot < 0) return slot;
+    descriptor_slots[slot].file = source;
+    descriptor_slots[slot].flags = cloexec ? FD_CLOEXEC : 0;
+    ++source->refs;
+    return slot + 3;
 }
 
 static void nonblocking(struct handle *source, int enabled) {
     source->flags = (source->flags & ~O_NONBLOCK) | (enabled ? O_NONBLOCK : 0);
-    if (source->fd < 0 || (source->kind != LOCAL_FD && source->kind != PIPE_FD)) return;
-    for (unsigned i = 0; i < 32; ++i)
-        if (files[i].path[0] && files[i].kind == source->kind && files[i].fd == source->fd)
-            files[i].flags = (files[i].flags & ~O_NONBLOCK) | (enabled ? O_NONBLOCK : 0);
 }
 
 static int send_rights(const struct msghdr *message, unsigned raw[LX_IPC_RIGHTS]) {
@@ -379,7 +414,7 @@ static long local_vector(struct handle *h, const struct iovec *iov, long count,
     } else if (message && message->msg_control && message->msg_controllen >= CMSG_LEN(0)) {
         size_t slots = (message->msg_controllen - CMSG_LEN(0)) / sizeof(int);
         unsigned free = 0;
-        for (unsigned i = 0; i < 32; ++i) free += !files[i].path[0];
+        for (unsigned i = 0; i < HANDLE_COUNT; ++i) free += !descriptor_slots[i].file;
         transfers = slots > LX_IPC_RIGHTS ? LX_IPC_RIGHTS : slots;
         if (transfers > free) transfers = free;
     }
@@ -404,7 +439,23 @@ static long local_vector(struct handle *h, const struct iovec *iov, long count,
     }
     return result;
 }
-static long port_openat(long parent, const char *path, int flags) {
+static int identity_available(void) { return console_call(64,0)==1; }
+static long path_mode(unsigned op,const char *path,unsigned a,unsigned b,unsigned out[3]) {
+    size_t length=strnlen(path,513);
+    if (!length || length>512) return -ENAMETOOLONG;
+    unsigned *words=(void *)MAIL;
+    memmove(MAIL+16,path,length+1);
+    words[0]=a;words[1]=b;
+    long status=console_call(64,op);
+    if (!status && out) memcpy(out,words,3*sizeof(unsigned));
+    return status;
+}
+static long change_ids(unsigned op,unsigned a,unsigned b,unsigned c) {
+    unsigned *words=(void *)MAIL;
+    words[0]=a;words[1]=b;words[2]=c;
+    return console_call(64,op);
+}
+static long port_openat(long parent, const char *path, int flags, unsigned create_mode) {
     char absolute[513];
     if (!strcmp(path, "/dev/null")) {
         if (flags & O_DIRECTORY) return -ENOTDIR;
@@ -424,46 +475,57 @@ static long port_openat(long parent, const char *path, int flags) {
     if ((flags & O_DIRECTORY) && size != LX_DIR)
         return -ENOTDIR;
     int mode = flags & O_ACCMODE;
-    if (size == LX_DIR && mode != O_RDONLY)
-        return -EISDIR;
-    for (int i = 0; i < 32; ++i)
-        if (!files[i].path[0]) {
-            struct handle *h = &files[i];
-            int fd = -1;
-            if (size != LX_DIR) {
-                if ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) {
-                    strcpy(MAIL, absolute);
-                    if (console_call(31, 0) < 0)
-                        return lx_stat(absolute) >= 0 ? -EEXIST : -EIO;
-                }
-                if (mode == O_RDONLY) fd = lx_open(absolute);
-                else {
-                    strcpy(MAIL, absolute);
-                    fd = console_call(40, flags & O_TRUNC ? 0 : flags & O_APPEND ? 1 : 2);
-                }
-                if (fd < 0) return mode == O_RDONLY ? -ENOENT : -EIO;
-                if (size < 0 || (flags & O_TRUNC))
-                    size = 0;
-            }
-            if ((flags & O_APPEND) && size > 0 &&
-                console_call(47, (unsigned long)fd << 32 | (uint32_t)size) < 0) {
-                lx_close(fd);
-                return -EIO;
-            }
-            h->size = size;
-            h->pos = (flags & O_APPEND) ? size : 0;
-            h->fd = fd;
-            h->flags = flags;
-            strcpy(h->path, absolute);
-            return i + 3;
+    if (size == LX_DIR && mode != O_RDONLY) return -EISDIR;
+    if ((flags&O_CREAT) && size==LX_MISSING && identity_available()) {
+        long res=path_mode(16,absolute,create_mode,flags&O_EXCL,NULL);
+        if (res<0) return res;
+        flags &= ~O_EXCL;
+        size=0;
+    }
+    int i = free_slot(0);
+    if (i < 0) return i;
+    int fd = -1;
+    if (size != LX_DIR) {
+        if ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) {
+            strcpy(MAIL, absolute);
+            if (console_call(31, 0) < 0)
+                return lx_stat(absolute) >= 0 ? -EEXIST : -EIO;
         }
-    return -EMFILE;
+        if (mode == O_RDONLY) fd = lx_open(absolute);
+        else {
+            strcpy(MAIL, absolute);
+            fd = console_call(40, flags & O_TRUNC ? 0 : flags & O_APPEND ? 1 : 2);
+        }
+        if (fd < 0) return mode == O_RDONLY ? -ENOENT : -EIO;
+        if (size < 0 || (flags & O_TRUNC))
+            size = 0;
+    }
+    if ((flags & O_APPEND) && size > 0 &&
+        console_call(47, (unsigned long)fd << 32 | (uint32_t)size) < 0) {
+        lx_close(fd);
+        return -EIO;
+    }
+    struct handle *h = new_description(i, flags);
+    h->size = size;
+    h->pos = (flags & O_APPEND) ? size : 0;
+    h->fd = fd;
+    h->flags = flags;
+    strcpy(h->path, absolute);
+    return i + 3;
 }
 static long stat_info(const char *name, long size, struct stat *st, int character) {
     if (size < 0 && size != LX_DIR)
         return -ENOENT;
     memset(st, 0, sizeof(*st));
     st->st_mode = (character ? S_IFCHR : size == LX_DIR ? S_IFDIR : S_IFREG) | 0777;
+    if (!character && identity_available()) {
+        unsigned info[3];
+        long result=path_mode(12,name,0,0,info);
+        if (!result) {
+            st->st_uid=info[0]; st->st_gid=info[1];
+            st->st_mode=(st->st_mode&S_IFMT)|info[2];
+        } else if (strncmp(name,"/proc/",6) && strcmp(name,"/proc")) return result;
+    }
     uint32_t hash = 2166136261U;
     for (const char *p = name; *p; p++)
         hash = (hash ^ (unsigned char)*p) * 16777619U;
@@ -610,7 +672,8 @@ static long port_getdents(struct handle *h, char *out, size_t cap) {
     }
     return total;
 }
-long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
+long lx_posix(long, long, long, long, long, long, long);
+static long posix_locked(long op, long a, long b, long c, long d, long e, long f) {
     struct handle *h = handle(a);
     const char *path = (void *)b;
     char absolute[513], target[513];
@@ -622,18 +685,16 @@ long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
         long limit = console_call(42, 6);
         // Older kernels provide 16 file handles in addition to standard I/O.
         if (limit < 3) limit = 19;
-        long local_limit = 3 + sizeof(files) / sizeof(files[0]);
+        long local_limit = LX_DESCRIPTOR_LIMIT;
         if (limit > local_limit) limit = local_limit;
         struct rlimit *info = (void *)d;
         info->rlim_cur = info->rlim_max = limit;
         return 0;
     }
-    case SYS_exit:
-        lx_thread_exit(NULL, 0);
-    case SYS_exit_group:
-        finish(a);
     case SYS_wait4: return wait_child(a,(int *)b,c);
+    case SYS_getppid: return identity_available()?console_call(54,~0UL):0;
     case SYS_kill:
+        if (a>0 && !b) return console_call(54,a)==a?0:-ESRCH;
         if (a <= 0 || b != SIGKILL) return -ENOTSUP;
         return console_call(55, a) < 0 ? -ESRCH : 0;
     case SYS_pipe2: {
@@ -644,19 +705,19 @@ long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
         int r = stream_fd(PIPE_FD,raw[0],O_RDONLY|(b & O_NONBLOCK));
         int w = r < 0 ? -1 : stream_fd(PIPE_FD,raw[1],O_WRONLY|(b & O_NONBLOCK));
         if (w < 0) {
-            if (r >= 0) memset(handle(r),0,sizeof(struct handle));
+            if (r >= 0) release_slot(r);
             lx_close(raw[0]); lx_close(raw[1]); return -EMFILE;
         }
-        if (b & O_CLOEXEC) handle(r)->fd_flags = handle(w)->fd_flags = FD_CLOEXEC;
+        if (b & O_CLOEXEC) descriptor_slots[r - 3].flags = descriptor_slots[w - 3].flags = FD_CLOEXEC;
         ((int *)a)[0] = r; ((int *)a)[1] = w;
         return 0;
     }
     case SYS_ppoll:
         return wait_fds((void *)a, b, (void *)c);
     case SYS_pselect6: {
-        if (a < 0 || a > 35) return -EINVAL;
+        if (a < 0 || a > LX_DESCRIPTOR_LIMIT) return -EINVAL;
         fd_set *readers = (void *)b, *writers = (void *)c, *errors = (void *)d;
-        struct pollfd list[35]; unsigned n = 0;
+        struct pollfd list[LX_DESCRIPTOR_LIMIT]; unsigned n = 0;
         for (int i = 0; i < a; ++i) {
             int mask = (readers && FD_ISSET(i,readers) ? POLLIN : 0) |
                        (writers && FD_ISSET(i,writers) ? POLLOUT : 0);
@@ -695,14 +756,34 @@ long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
         int right = local_fd(-1, b);
         long pair = right < 0 ? right : unix_call(LOCAL_PAIR, 0, 0);
         if (pair < 0) {
-            memset(handle(left), 0, sizeof(*h));
-            if (right >= 0) memset(handle(right), 0, sizeof(*h));
+            release_slot(left);
+            if (right >= 0) release_slot(right);
             return pair;
         }
         handle(left)->fd = pair >> 32;
         handle(right)->fd = (uint32_t)pair;
         ((int *)d)[0] = left;
         ((int *)d)[1] = right;
+        return 0;
+    }
+    case SYS_fstatfs:
+        if (!h) return -EBADF;
+        if (h->kind != SHARED_FD) return -ENOSYS;
+        /* fall through */
+    case SYS_statfs: {
+        if (op == SYS_statfs && strcmp((const char *)a, "/dev/shm")) return -ENOSYS;
+        if (!b) return -EFAULT;
+        long result = shared_call(LX_SHARED_SPACE, 0, 0);
+        if (result < 0) return result;
+        unsigned long space[2];
+        memcpy(space, MAIL, sizeof space);
+        struct statfs *st = (void *)b;
+        memset(st, 0, sizeof *st);
+        st->f_type = 0x01021994; /* TMPFS_MAGIC */
+        st->f_bsize = st->f_frsize = 4096;
+        st->f_blocks = space[0] / 4096;
+        st->f_bavail = st->f_bfree = space[1] / 4096;
+        st->f_namelen = 255;
         return 0;
     }
     case SYS_memfd_create:
@@ -766,7 +847,7 @@ long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
             if (lx_check_interrupt()) { raw = -EINTR; break; }
         }
         if (raw < 0) {
-            memset(handle(fd), 0, sizeof(*h));
+            release_slot(fd);
             return raw;
         }
         struct handle *accepted = handle(fd);
@@ -810,9 +891,10 @@ long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
         if (!d || !e) return -EFAULT;
         if (h->kind == LOCAL_FD && b == SOL_SOCKET && c == SO_PEERCRED) {
             if (*(socklen_t *)e < sizeof(struct ucred)) return -EINVAL;
-            long pid = h->fd < 0 ? -ENOTCONN : unix_call(LOCAL_PEER, h->fd, 0);
+            memset(MAIL,0,8);
+            long pid = h->fd < 0 ? -ENOTCONN : unix_call(LOCAL_PEER, h->fd, 8);
             if (pid < 0) return pid;
-            *(struct ucred *)d = (struct ucred){.pid=pid, .uid=getuid(), .gid=getgid()};
+            *(struct ucred *)d = (struct ucred){.pid=pid, .uid=((unsigned *)MAIL)[0], .gid=((unsigned *)MAIL)[1]};
             *(socklen_t *)e = sizeof(struct ucred);
             return 0;
         }
@@ -824,7 +906,9 @@ long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
     case SYS_sendto:
     case SYS_recvfrom:
         if (!h || (h->kind != TCP && h->kind != LOCAL_FD)) return -ENOTSOCK;
-        if (e || (d & ~(MSG_DONTWAIT | MSG_NOSIGNAL))) return -ENOTSUP;
+        int allowed = MSG_DONTWAIT | MSG_NOSIGNAL;
+        if (op == SYS_recvfrom && h->kind == TCP) allowed |= MSG_PEEK;
+        if (e || (d & ~allowed)) return -ENOTSUP;
         return stream_io(h,(void *)b,c,op == SYS_sendto,d);
     case SYS_sendmsg:
     case SYS_recvmsg: {
@@ -838,14 +922,14 @@ long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
         return local_vector(h, message->msg_iov, message->msg_iovlen, writing, c, message);
     }
     case SYS_openat:
-        return port_openat(a, path, c);
+        return port_openat(a, path, c, d);
     case SYS_close:
         if (a >= 0 && a < 3) return lx_close(a) < 0 ? -EBADF : 0;
         if (!h)
             return -EBADF;
         error = 0;
-        if (h->fd >= 0 && !raw_is_aliased(h) && lx_close(h->fd) < 0) error = -EIO;
-        memset(h, 0, sizeof(*h));
+        if (h->fd >= 0 && h->refs == 1 && lx_close(h->fd) < 0) error = -EIO;
+        release_slot(a);
         return error;
     case SYS_read:
     case SYS_write:
@@ -873,7 +957,7 @@ long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
         if (op == SYS_ftruncate && (!h || (h->flags & O_ACCMODE) == O_RDONLY)) return -EBADF;
         if (op == SYS_ftruncate && h->kind == SHARED_FD) return shared_call(SHARED_RESIZE, h->fd, b);
         if (op == SYS_ftruncate && h->kind) return -EINVAL;
-        int fd = op == SYS_truncate ? port_openat(AT_FDCWD, (const char *)a, O_WRONLY) : a;
+        int fd = op == SYS_truncate ? port_openat(AT_FDCWD, (const char *)a, O_WRONLY,0) : a;
         if (fd < 0) return fd;
         struct handle *file = handle(fd);
         long status = console_call(47, 1UL << 63 | (unsigned long)file->fd << 32 | (uint32_t)b);
@@ -914,6 +998,7 @@ long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
         return port_getdents(h, (void *)b, c);
     case SYS_fchmod:
         if (!h) return -EBADF;
+        if (identity_available() && !h->kind) return path_mode(13,h->path,b,0,NULL);
         return (b & 07777) == 0777 ? 0 : -ENOTSUP;
     case SYS_fstat:
         if (h && h->kind == NULL_FD) return stat_info("/dev/null", 0, (void *)b, 1);
@@ -938,8 +1023,21 @@ long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
     case SYS_faccessat:
     case SYS_faccessat2:
     case SYS_fchmodat:
+#ifdef SYS_fchmodat2
+    case SYS_fchmodat2:
+#endif
+    case SYS_fchownat:
         error = resolve_at(a, path, absolute);
-        return error ? error : lx_stat(absolute) == LX_MISSING ? -ENOENT : 0;
+        if (error) return error;
+        if (identity_available()) {
+            if (op==SYS_fchownat) return path_mode(14,absolute,c,d,NULL);
+            if (op==SYS_faccessat || op==SYS_faccessat2) return path_mode(15,absolute,c,0,NULL);
+            return path_mode(13,absolute,c,0,NULL);
+        }
+        return lx_stat(absolute)==LX_MISSING ? -ENOENT : op==SYS_fchownat ? -ENOTSUP : 0;
+    case SYS_fchown:
+        if (!h || h->kind) return -EBADF;
+        return identity_available()?path_mode(14,h->path,b,c,NULL):-ENOTSUP;
     case SYS_renameat:
     case SYS_renameat2:
         if (op == SYS_renameat2 && e) return -ENOTSUP;
@@ -989,6 +1087,7 @@ long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
         error = resolve_at(op == SYS_chdir ? AT_FDCWD : a, path, absolute);
         if (error) return error;
         long size = lx_stat(absolute);
+        if (op==SYS_mkdirat && identity_available()) return path_mode(17,absolute,c,1,NULL);
         if (op == SYS_mkdirat && size != LX_MISSING) return -EEXIST;
         if (op == SYS_unlinkat && size == LX_MISSING) return -ENOENT;
         strcpy(MAIL, absolute);
@@ -998,6 +1097,7 @@ long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
                                                      : 3);
     }
     case SYS_umask: {
+        if (identity_available()) return change_ids(6,a,0,0);
         static unsigned mask = 022;
         unsigned previous = mask;
         mask = (unsigned)a & 0777;
@@ -1005,13 +1105,13 @@ long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
     }
     case SYS_fsync:
     case SYS_fdatasync:
-        // Guest file writes commit a disk snapshot before returning.
-        return h ? 0 : -EBADF;
+        if (!h) return -EBADF;
+        return identity_available()?console_call(64,18):0;
     case SYS_fcntl:
         if (!h && (a < 0 || a > 2))
             return -EBADF;
         if ((b == F_DUPFD || b == F_DUPFD_CLOEXEC) && h && h->size == LX_DIR && c == 0)
-            return port_openat(AT_FDCWD, h->path, O_DIRECTORY);
+            return port_openat(AT_FDCWD, h->path, O_DIRECTORY,0);
         if (b == F_DUPFD || b == F_DUPFD_CLOEXEC)
             return duplicate_fd(h, c, b == F_DUPFD_CLOEXEC);
         if (b == F_SETFL && h && h->kind) {
@@ -1020,9 +1120,9 @@ long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
         }
         if (b == F_GETFL)
             return h ? h->flags : a ? O_WRONLY : O_RDONLY;
-        if (h && (h->kind == LOCAL_FD || h->kind == PIPE_FD || h->kind == SHARED_FD)) {
-            if (b == F_GETFD) return h->fd_flags;
-            if (b == F_SETFD) { h->fd_flags = c & FD_CLOEXEC; return 0; }
+        if (h) {
+            if (b == F_GETFD) return descriptor_slots[a - 3].flags;
+            if (b == F_SETFD) { descriptor_slots[a - 3].flags = c & FD_CLOEXEC; return 0; }
         }
         if (b == F_GETFD || b == F_SETFD)
             return 0;
@@ -1041,16 +1141,41 @@ long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
         return -ENOTTY;
     case SYS_mmap:
         h = handle(e);
-        if (h && h->kind == SHARED_FD) {
-            if (d != MAP_SHARED) return -ENOTSUP;
+        if (!(d & MAP_ANONYMOUS) && h && h->kind == SHARED_FD) {
+            if (d == MAP_PRIVATE) {
+                if (a || !b || b > LX_SHARED_LIMIT || (f & 4095) || (c & ~7)) return -EINVAL;
+                unsigned long *request = (void *)MAIL;
+                request[0] = b; request[1] = f; request[2] = PROT_READ;
+                long source = shared_call(SHARED_MAP, h->fd, 0);
+                if (source < 0) return source;
+                long copy = lx_mmap(0, b, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                if (copy >= 0) memcpy((void *)copy, (const void *)source, b);
+                request[0] = source; request[1] = b;
+                shared_call(SHARED_UNMAP, 0, 0);
+                if (copy < 0) return copy;
+                long rc = lx_mprotect(copy, b, c);
+                if (rc < 0) { lx_munmap(copy, b); return rc; }
+                return copy;
+            }
+            if (d != MAP_SHARED || a) return -ENOTSUP;
             unsigned long *words = (void *)MAIL;
             words[0] = b; words[1] = f; words[2] = c;
             return shared_call(SHARED_MAP, h->fd, 0);
         }
-        return lx_mmap(a, b, c, d, e);
+        if (!(d & MAP_ANONYMOUS)) {
+            if (!h) return -EBADF;
+            if (h->kind || h->size < 0) return -ENODEV;
+            if ((h->flags & O_ACCMODE) == O_WRONLY) return -EACCES;
+            e = h->fd;
+        }
+        return lx_mmap(a, b, c, d, e, f);
+    case SYS_madvise:
+        return lx_madvise(a,b,c);
+    case SYS_mprotect:
+        return lx_mprotect(a, b, c);
     case SYS_munmap:
         if ((unsigned long)a >= LX_SHARED_BASE &&
-            (unsigned long)a < LX_SHARED_BASE + LX_SHARED_LIMIT * LX_SHARED_MAPS) {
+            (unsigned long)a < LX_SHARED_BASE + LX_SHARED_APERTURE) {
             unsigned long *words = (void *)MAIL;
             words[0] = a; words[1] = b;
             return shared_call(SHARED_UNMAP, 0, 0);
@@ -1058,10 +1183,6 @@ long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
         return lx_munmap(a, b);
     case SYS_brk:
         return lx_brk(a);
-    case SYS_futex: return lx_futex((int *)a, b, c, (void *)d, (int *)e, f);
-    case SYS_sched_yield: lx_schedule(); return 0;
-    case SYS_rt_sigprocmask: return lx_sigmask(a, (void *)b, (void *)c);
-    case SYS_prctl: return lx_prctl(a, b);
     case SYS_rt_sigaction: {
         static uint8_t actions[65][32];
         if (a <= 0 || a > 64 || d != 8) return -EINVAL;
@@ -1069,8 +1190,6 @@ long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
         if (b) memcpy(actions[a], (void *)b, 32);
         return 0;
     }
-    case SYS_gettid: return lx_thread_id();
-    case SYS_set_tid_address: return lx_clear_tid((int *)a);
     case SYS_getpid: {
         long pid = console_call(54, 0);
         return pid >= 0 ? pid : lx_pid();
@@ -1079,7 +1198,35 @@ long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
     case SYS_getgid:
     case SYS_geteuid:
     case SYS_getegid:
-        return 0;
+    case SYS_getresuid:
+    case SYS_getresgid: {
+        unsigned ids[6]={0};
+        if (identity_available() && !console_call(64,1)) memcpy(ids,MAIL,sizeof(ids));
+        if (op==SYS_getresuid || op==SYS_getresgid) {
+            unsigned *p=ids+(op==SYS_getresgid?3:0);
+            *(unsigned *)a=p[0];*(unsigned *)b=p[1];*(unsigned *)c=p[2];return 0;
+        }
+        return ids[op==SYS_getuid?0:op==SYS_geteuid?1:op==SYS_getgid?3:4];
+    }
+    case SYS_setresuid: case SYS_setresgid:
+    case SYS_setuid: case SYS_setgid: case SYS_setreuid: case SYS_setregid:
+        if (!identity_available()) return -ENOTSUP;
+        return change_ids(op==SYS_setresuid?2:op==SYS_setresgid?3:op==SYS_setuid?7:
+            op==SYS_setgid?8:op==SYS_setreuid?9:10,a,b,c);
+    case SYS_setgroups:
+        if (!identity_available()) return -ENOTSUP;
+        if ((unsigned long)a>32) return -EINVAL;
+        *(unsigned *)MAIL=a;
+        if (a) memcpy(MAIL+4,(void *)b,a*4);
+        return console_call(64,4);
+    case SYS_getgroups: {
+        if (!identity_available()) return 0;
+        long n=console_call(64,5);
+        if (n<0 || !a) return n;
+        if (a<n) return -EINVAL;
+        memcpy((void *)b,MAIL,n*4);
+        return n;
+    }
     case SYS_clock_gettime: {
         struct timespec *ts = (void *)b;
         if (a == CLOCK_REALTIME) {
@@ -1129,5 +1276,26 @@ long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
     }
     default:
         return -ENOSYS;
+    }
+}
+
+long lx_posix(long op, long a, long b, long c, long d, long e, long f) {
+    switch (op) {
+    case SYS_futex: return lx_futex((int *)a, b, c, (void *)d, (int *)e, f);
+    case SYS_sched_yield: lx_schedule(); return 0;
+    case SYS_rt_sigprocmask: return lx_sigmask(a, (void *)b, (void *)c);
+    case SYS_prctl: return lx_prctl(a, b);
+    case SYS_gettid: return lx_thread_id();
+    case SYS_set_tid_address: return lx_clear_tid((int *)a);
+    case SYS_exit:
+        lx_thread_exit(NULL, 0);
+    case SYS_exit_group:
+        finish(a & 255);
+    default: {
+        int held=lx_runtime_lock();
+        long result=posix_locked(op,a,b,c,d,e,f);
+        lx_runtime_unlock(&held);
+        return result;
+    }
     }
 }

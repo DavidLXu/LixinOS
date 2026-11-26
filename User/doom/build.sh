@@ -39,6 +39,12 @@ sed -i.bak 's/M_SetConfigDir(NULL);/M_SetConfigDir(".doom\/");/' "$engine/d_main
 sed -i.bak '/I_VideoBuffer = (byte\*)Z_Malloc /a\
     memset(I_VideoBuffer, 0, SCREENWIDTH * SCREENHEIGHT);\
 ' "$engine/i_video.c"
+# DoomGeneric couples FEATURE_SOUND to SDL_mixer music. Register the native
+# digital effects module independently so upstream music stays optional.
+sed -i.bak '/^static sound_module_t \*sound_modules\[\]/i\
+extern sound_module_t DG_sound_module;\
+' "$engine/i_sound.c"
+sed -i.bak '/^static sound_module_t \*sound_modules\[\]/,/^};/s/#ifdef FEATURE_SOUND/#if 1/' "$engine/i_sound.c"
 objects=()
 read -r -a sources <<< "$(make -s -C "$engine" print OBJDIR=. | sed 's/^OBJS: //')"
 flags=(-O2 -std=gnu11 -DNORMALUNIX -DLINUX -D_DEFAULT_SOURCE -fcommon -ffunction-sections -fdata-sections
@@ -49,6 +55,8 @@ for name in "${sources[@]}"; do
     objects+=("$build/obj/$name")
     "$musl/cc" "${flags[@]}" -c "$engine/${name%.o}.c" -o "$build/obj/$name"
 done
+"$musl/cc" "${flags[@]}" -c "$port/sound.c" -o "$build/obj/sound.o"
+objects+=("$build/obj/sound.o")
 "$musl/cc" "${flags[@]}" -c "$port/platform.c" -o "$build/obj/platform.o"
 "$musl/cc" -nostartfiles -static -s -Wl,--gc-sections,--build-id=none,-z,max-page-size=4096 \
     -Wl,-T,"$root/User/gcc/application.ld" "$build/obj/crt0.o" "$build/obj/crt1.o" \

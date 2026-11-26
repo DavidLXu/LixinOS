@@ -1,0 +1,15 @@
+--- a/src/core/meta-clipboard-manager.c
++++ b/src/core/meta-clipboard-manager.c
+@@ -175,6 +175,12 @@
+ {
+   MetaSelection *selection;
+ 
++#ifdef __lixinos__
++  /* In a private one-client session the owner already holds its selection.
++   * No other client needs a pipe transfer to preserve it after exit. */
++  if (g_getenv ("LIXINOS_SINGLE_CLIENT"))
++    return;
++#endif
+   selection = meta_display_get_selection (display);
+   g_signal_connect_after (selection, "owner-changed",
+                           G_CALLBACK (owner_changed_cb), display);

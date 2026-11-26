@@ -1,0 +1,57 @@
+--- a/content/shell/BUILD.gn
++++ b/content/shell/BUILD.gn
+@@ -506,6 +506,17 @@
+         "//ui/views/controls/webview",
+         "//ui/wm:test_support",
+       ]
++      if (shell_minimal && !enable_devtools_frontend) {
++        # The only item in the Views context menu opens the local inspector.
++        sources -= [
++          "browser/shell_devtools_bindings.cc",
++          "browser/shell_devtools_bindings.h",
++          "browser/shell_devtools_frontend.cc",
++          "browser/shell_devtools_frontend.h",
++          "browser/shell_web_contents_view_delegate_views.cc",
++        ]
++        sources += [ "browser/shell_web_contents_view_delegate_aura.cc" ]
++      }
+       if (shell_minimal) {
+         # Desktop Aura needs the widget delegates, while its focus test clients
+         # and compositor fixtures belong to the alternate shell implementation.
+--- a/content/shell/browser/shell.cc
++++ b/content/shell/browser/shell.cc
+@@ -42,7 +42,10 @@
+ #include "content/public/common/content_switches.h"
+ #include "content/shell/app/resource.h"
+ #include "content/shell/browser/shell_content_browser_client.h"
++#include "content/public/common/buildflags.h"
++#if BUILDFLAG(ENABLE_DEVTOOLS_FRONTEND)
+ #include "content/shell/browser/shell_devtools_frontend.h"
++#endif
+ #include "content/shell/browser/shell_javascript_dialog_manager.h"
+ #include "content/shell/common/shell_switches.h"
+ #include "media/media_buildflags.h"
+@@ -363,19 +366,23 @@
+ }
+ 
+ void Shell::ShowDevTools() {
++#if BUILDFLAG(ENABLE_DEVTOOLS_FRONTEND)
+   if (!devtools_frontend_) {
+     auto* devtools_frontend = ShellDevToolsFrontend::Show(web_contents());
+     devtools_frontend_ = devtools_frontend->GetWeakPtr();
+   }
+ 
+   devtools_frontend_->Activate();
++#endif
+ }
+ 
+ void Shell::CloseDevTools() {
++#if BUILDFLAG(ENABLE_DEVTOOLS_FRONTEND)
+   if (!devtools_frontend_)
+     return;
+   devtools_frontend_->Close();
+   devtools_frontend_ = nullptr;
++#endif
+ }
+ 
+ void Shell::ResizeWebContentForTests(const gfx::Size& content_size) {

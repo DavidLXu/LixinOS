@@ -1,0 +1,54 @@
+# Run inside upstream FreeCAD's main window on LixinOS.
+import os
+import tempfile
+
+import FreeCAD as App
+import FreeCADGui as Gui
+import Part
+import Sketcher
+
+def verify_workbenches():
+    with tempfile.TemporaryDirectory() as workspace:
+        path = os.path.join(workspace, "workbench-test.FCStd")
+        doc = App.newDocument("LixinPortCheck")
+        try:
+            Gui.activateWorkbench("SketcherWorkbench")
+            assert Gui.activeWorkbench().name() == "SketcherWorkbench"
+            sketch = doc.addObject("Sketcher::SketchObject", "Profile")
+            circle = sketch.addGeometry(Part.Circle(App.Vector(), App.Vector(0, 0, 1), 4), False)
+            sketch.addConstraint(Sketcher.Constraint("Radius", circle, 5))
+            doc.recompute()
+            assert abs(sketch.Geometry[circle].Radius - 5) < 1e-6
+
+            Gui.activateWorkbench("PartWorkbench")
+            assert Gui.activeWorkbench().name() == "PartWorkbench"
+            solid = doc.addObject("Part::Box", "Block")
+            solid.Length, solid.Width, solid.Height = 12, 8, 3
+            doc.recompute()
+            Gui.activeDocument().activeView().viewAxonometric()
+            Gui.activeDocument().activeView().fitAll()
+            Gui.updateGui()
+            doc.saveAs(path)
+        finally:
+            App.closeDocument(doc.Name)
+
+        restored = App.openDocument(path)
+        try:
+            restored.recompute()
+            assert abs(restored.Block.Shape.Volume - 288) < 1e-6
+            assert abs(restored.Profile.Geometry[0].Radius - 5) < 1e-6
+            assert not restored.Block.Shape.isNull()
+            Gui.updateGui()
+            os.write(1, b"Sketcher radius 5 and Part volume 288 verified after FCStd reopen\n")
+            if not Gui.getMainWindow().isVisible():
+                raise RuntimeError("The FreeCAD main window must be visible")
+            os.write(1, b"FreeCAD GUI, Sketcher, Part and FCStd round trip passed\n")
+        finally:
+            App.closeDocument(restored.Name)
+
+try:
+    verify_workbenches()
+except BaseException:
+    import traceback
+    os.write(2, traceback.format_exc().encode())
+    raise

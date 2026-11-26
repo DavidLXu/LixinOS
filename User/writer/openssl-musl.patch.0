@@ -1,0 +1,11 @@
+--- crypto/o_str.c
++++ crypto/o_str.c
+@@ -300,7 +300,7 @@
+ {
+ #if defined(_MSC_VER) && _MSC_VER>=1400 && !defined(_WIN32_WCE)
+     return !strerror_s(buf, buflen, errnum);
+-#elif defined(_GNU_SOURCE)
++#elif defined(_GNU_SOURCE) && defined(__GLIBC__)
+     char *err;
+ 
+     /*

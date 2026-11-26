@@ -1,0 +1,17 @@
+--- a/src/Base/Interpreter.cpp
++++ b/src/Base/Interpreter.cpp
+@@ -620,6 +620,14 @@
+     config.user_site_directory = 1;
+ 
+     status = PyConfig_SetBytesArgv(&config, argc, argv);
++    config.module_search_paths_set = 1;
++    config.write_bytecode = 0;
++    if (!PyStatus_Exception(status))
++        status = PyConfig_SetString(&config, &config.home, L"/lib/freecad-desktop");
++    if (!PyStatus_Exception(status))
++        status = PyWideStringList_Append(&config.module_search_paths, L"/lib/freecad-desktop/lib/python3.14");
++    if (!PyStatus_Exception(status))
++        status = PyWideStringList_Append(&config.module_search_paths, L"/lib/freecad-desktop/lib/python3.14/site-packages");
+     if (PyStatus_Exception(status)) {
+         throw Base::RuntimeError("Failed to set config");
+     }

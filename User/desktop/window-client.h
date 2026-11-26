@@ -21,11 +21,21 @@ typedef char WindowUpdateSizeCheck[sizeof(WindowUpdate) == 10 ? 1 : -1];
 /* .win3 adds wheel and close requests. After the rectangle, the client may
  * return up to 4096 UTF-8 bytes to copy to the system clipboard. */
 enum { WINDOW_CLIENT_WHEEL = 4, WINDOW_CLIENT_CLOSE = 5, WINDOW_CLIENT_PASTE = 6,
-       WINDOW_CLIENT_RIGHT_CLICK = 7,
+       WINDOW_CLIENT_RIGHT_CLICK = 7, WINDOW_CLIENT_FILE_DROP = 8,
        WINDOW_CLIENT_CLIPBOARD_MAX = 4096 };
 /* CONFIGURE.value advertises optional input. A reply can opt in using the
  * high bit of frame.timer_ms. Older hosts advertise zero. */
 enum { WINDOW_CLIENT_RIGHT_CLICK_AVAILABLE = 1, WINDOW_CLIENT_WANT_RIGHT_CLICK = 0x8000 };
+/* Opt-in viewer extensions use the high bits of encoded_size only when
+ * CONFIGURE advertises support. The lower bits are the original RLE length. */
+enum { WINDOW_CLIENT_VIEWER_AVAILABLE = 2, WINDOW_CLIENT_RAW_BUTTONS_AVAILABLE = 4,
+       WINDOW_CLIENT_FILE_DROP_AVAILABLE = 8, WINDOW_CLIENT_OPEN_URL_AVAILABLE = 16 };
+#define WINDOW_CLIENT_WANT_MODIFIERS (1u << 31)
+#define WINDOW_CLIENT_FULLSCREEN (1u << 30)
+#define WINDOW_CLIENT_WINDOW_TITLE (1u << 29)
+#define WINDOW_CLIENT_ACCEPT_FILES (1u << 28)
+/* When negotiated, the trailing payload contains an HTTP(S) URL to open. */
+#define WINDOW_CLIENT_OPEN_URL (1u << 27)
 typedef struct {
     WindowUpdate frame;
     unsigned short clipboard_size;

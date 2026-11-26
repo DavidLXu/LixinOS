@@ -17,7 +17,7 @@ SECTIONS
     .stack ALIGN(16) (NOLOAD) : {
         /* The desktop can host a shell and its foreground child on this stack. */
         __stack_bottom = .;
-        . += 128K;
+        . += 64K;
         __stack_top = .;
     }
 }

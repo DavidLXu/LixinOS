@@ -1,0 +1,21 @@
+--- a/src/App/Application.cpp
++++ b/src/App/Application.cpp
+@@ -1758,7 +1758,9 @@
+ #endif
+ 
+ #if defined(FC_OS_LINUX)
++#if __has_include(<execinfo.h>)
+ #include <execinfo.h>
++#endif
+ #include <dlfcn.h>
+ #include <cxxabi.h>
+ 
+@@ -1774,7 +1776,7 @@
+ // This function produces a stack backtrace with demangled function & method names.
+ void printBacktrace(size_t skip=0)
+ {
+-#if defined HAVE_BACKTRACE_SYMBOLS
++#if defined(HAVE_BACKTRACE_SYMBOLS) && __has_include(<execinfo.h>)
+     void *callstack[128];
+     size_t nMaxFrames = sizeof(callstack) / sizeof(callstack[0]);
+     size_t nFrames = backtrace(callstack, nMaxFrames);

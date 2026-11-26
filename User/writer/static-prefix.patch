@@ -1,0 +1,20 @@
+--- a/cppuhelper/source/paths.cxx
++++ b/cppuhelper/source/paths.cxx
+@@ -34,7 +34,7 @@
+ 
+ namespace {
+ 
+-#if !(defined ANDROID || defined EMSCRIPTEN)
++#if !(defined ANDROID || defined EMSCRIPTEN || defined __lixinos__)
+ OUString get_this_libpath() {
+     static OUString s_uri = []() {
+         OUString uri;
+@@ -61,6 +61,8 @@
+     // and since rtlBootstrapHandle is not ref-counted doing anything
+     // clean here is hardish.
+     OUString uri("file:///assets/program");
++#elif defined(__lixinos__)
++    OUString uri(u"file:///lib/writer/program"_ustr);
+ #elif defined(EMSCRIPTEN)
+     OUString uri("file:///instdir/program");
+ #else

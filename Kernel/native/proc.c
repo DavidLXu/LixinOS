@@ -1,4 +1,5 @@
 #include "native.h"
+#include "vm.h"
 #include "version.h"
 #include "smp.h"
 
@@ -52,7 +53,9 @@ int vfs_lookup(const char *path, struct file *f) {
         p = add_number(add_text(p, "MemTotal:       "), native_ram_bytes() / 1024);
         p = add_number(add_text(p, " kB\nMemFree:        "), free);
         p = add_number(add_text(p, " kB\nMemAvailable:   "), free);
-        p = add_text(p, " kB\nSwapTotal:      0 kB\nSwapFree:       0 kB\n");
+        p = add_number(add_text(p," kB\nSwapTotal:      "), (u64)vm_swap_total()*2048);
+        p = add_number(add_text(p," kB\nSwapFree:       "), (u64)vm_swap_free()*2048);
+        p = add_text(p," kB\n");
     }
     if (i == 2 || i == 3) {
         u64 hz = clock_hz(), time = clock_ticks() * 100 / hz, idle = idle_ticks() * 100 / hz;

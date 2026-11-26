@@ -1,0 +1,252 @@
+--- a/simulate/main.cc
++++ b/simulate/main.cc
+@@ -26,7 +26,8 @@
+ #include <thread>
+ 
+ #include <mujoco/mujoco.h>
+-#include "glfw_adapter.h"
++#include "win3.h"
++#include <pthread.h>
+ #include "simulate.h"
+ #include "array_safety.h"
+ 
+@@ -180,8 +181,8 @@
+   // check and print plugins that are linked directly into the executable
+   int nplugin = mjp_pluginCount();
+   if (nplugin) {
+-    std::printf("Built-in plugins:\n");
+-    for (int i = 0; i < nplugin; ++i) { std::printf("    %s\n", mjp_getPluginAtSlot(i)->name); }
++    std::fprintf(stderr, "Built-in plugins:\n");
++    for (int i = 0; i < nplugin; ++i) { std::fprintf(stderr, "    %s\n", mjp_getPluginAtSlot(i)->name); }
+   }
+ 
+   // define platform-specific strings
+@@ -202,9 +203,9 @@
+   mj_loadAllPluginLibraries(
+       plugin_dir.c_str(),
+       +[](const char* filename, int first, int count) {
+-        std::printf("Plugins registered by library '%s':\n", filename);
++        std::fprintf(stderr, "Plugins registered by library '%s':\n", filename);
+         for (int i = first; i < first + count; ++i) {
+-          std::printf("    %s\n", mjp_getPluginAtSlot(i)->name);
++          std::fprintf(stderr, "    %s\n", mjp_getPluginAtSlot(i)->name);
+         }
+       });
+ }
+@@ -272,7 +273,7 @@
+   double load_seconds  = Seconds(load_interval).count();
+ 
+   if (!mnew) {
+-    std::printf("%s\n", loadError);
++    std::fprintf(stderr, "%s\n", loadError);
+     mju::strcpy_arr(sim.load_error, loadError);
+     return nullptr;
+   }
+@@ -280,7 +281,7 @@
+   // compiler warning: print and pause
+   if (loadError[0]) {
+     // mj_forward() below will print the warning message
+-    std::printf("Model compiled, but simulation warning (paused):\n  %s\n", loadError);
++    std::fprintf(stderr, "Model compiled, but simulation warning (paused):\n  %s\n", loadError);
+     sim.run = 0;
+   }
+ 
+@@ -528,13 +529,13 @@
+ #endif
+ 
+   // print version, check compatibility
+-  std::printf("MuJoCo version %s\n", mj_versionString());
++  std::fprintf(stderr, "MuJoCo version %s\n", mj_versionString());
+   if (mjVERSION_HEADER != mj_version()) {
+     mju_error("Headers and library have different versions");
+   }
+ 
+   // scan for libraries in the plugin directory to load additional plugins
+-  scanPluginLibraries();
++  // The Win3 executable links bundled plugins statically.
+ 
+   mjvCamera cam;
+   mjv_defaultCamera(&cam);
+@@ -547,21 +548,32 @@
+ 
+   // simulate object encapsulates the UI
+   auto sim = std::make_unique<mj::Simulate>(
+-          std::make_unique<mj::GlfwAdapter>(),
++          MakeWin3Adapter(),
+       &cam,
+       &opt,
+       &pert,
+       /* is_passive = */ false);
+ 
+-  const char* filename = nullptr;
++  const char* filename = "/lib/simulate/humanoid.xml";
+   if (argc > 1) { filename = argv[1]; }
+ 
+   // start physics thread
+-  std::thread physicsthreadhandle(&PhysicsThread, sim.get(), filename);
++  struct Args { mj::Simulate* sim; const char* file; } args{sim.get(), filename};
++  pthread_attr_t attr;
++  pthread_attr_init(&attr);
++  pthread_attr_setstacksize(&attr, 2 * 1024 * 1024);
++  pthread_t worker;
++  int status = pthread_create(&worker, &attr, [](void* ptr) -> void* {
++    auto& args = *static_cast<Args*>(ptr);
++    PhysicsThread(args.sim, args.file);
++    return nullptr;
++  }, &args);
++  pthread_attr_destroy(&attr);
++  if (status) { std::fprintf(stderr, "MuJoCo physics thread: %s\n", std::strerror(status)); return 1; }
+ 
+   // start simulation UI loop (blocking call)
+   sim->RenderLoop();
+-  physicsthreadhandle.join();
++  pthread_join(worker, nullptr);
+ 
+   return 0;
+ }
+--- a/simulate/simulate.cc
++++ b/simulate/simulate.cc
+@@ -13,6 +13,7 @@
+ // limitations under the License.
+ 
+ #include "simulate.h"
++#include "win3.h"
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -123,6 +124,7 @@
+   {mjITEM_BUTTON,    "Print data",    2, nullptr, "CD"},
+   {mjITEM_BUTTON,    "Quit",          1, nullptr, "CQ"},
+   {mjITEM_BUTTON,    "Screenshot",    2, nullptr, "CP"},
++  {mjITEM_BUTTON,    "Open model",    1, nullptr, "CO"},
+   {mjITEM_END}
+     // clang-format on
+ };
+@@ -1629,8 +1631,8 @@
+       con->auxColor_r[id] == 0 ||
+       con->auxWidth[id] != ui->width ||
+       con->auxHeight[id] != ui->maxheight ||
+-      con->auxSamples[id] != ui->spacing.samples) {
+-    mjr_addAux(id, ui->width, ui->maxheight, ui->spacing.samples, con);
++      con->auxSamples[id] != 0) {
++    mjr_addAux(id, ui->width, ui->maxheight, 0, con);  // single-sample Win3 surface
+   }
+ 
+   UiLayout(state);
+@@ -1671,6 +1673,9 @@
+           sim->exitrequest.store(1);
+           break;
+ 
++        case 6:
++          OpenWin3Model(*sim->platform_ui);
++          break;
+         case 5:  // Screenshot
+           sim->screenshotrequest.store(true);
+           break;
+@@ -2215,7 +2220,7 @@
+   if (pending_.save_xml) {
+     char err[200];
+     if (!pending_.save_xml->empty() && !mj_saveLastXML(pending_.save_xml->c_str(), m_, err, 200)) {
+-      std::printf("Save XML error: %s", err);
++      std::fprintf(stderr, "Save XML error: %s", err);
+     }
+     pending_.save_xml = std::nullopt;
+   }
+@@ -2458,7 +2463,7 @@
+     // Wait for the render thread to be done loading
+     // so that we know the old model and data's memory can
+     // be free'd by the other thread (sometimes python)
+-    cond_loadrequest.wait(lock, [this]() { return this->loadrequest == 0; });
++    cond_loadrequest.wait(lock, [this]() { return this->loadrequest == 0 || this->exitrequest.load(); });
+   }
+ }
+ 
+@@ -2591,7 +2596,9 @@
+   }
+ 
+   // re-create scene
+-  mjv_makeScene(this->m_, &this->scn, kMaxGeom);
++  const int capacity = std::clamp<mjtSize>(4096 + 8 * (m_->ngeom + m_->nbody +
++      m_->nflexedge + m_->nflexelem + m_->ntendon + d_->ncon), 4096, kMaxGeom);
++  mjv_makeScene(this->m_, &this->scn, capacity);
+ 
+   this->platform_ui->RefreshMjrContext(this->m_, 50 * (this->font + 1));
+   UiModify(&this->ui0, &this->uistate, &this->platform_ui->mjr_context());
+@@ -2981,7 +2988,7 @@
+       if (lodepng::encode(path, rgb.get(), w, h, LCT_RGB)) {
+         mju_error("could not save screenshot");
+       } else {
+-        std::printf("saved screenshot: %s\n", path.c_str());
++        std::fprintf(stderr, "saved screenshot: %s\n", path.c_str());
+       }
+     }
+   }
+@@ -3033,7 +3040,7 @@
+   // make empty scene
+   if (!is_passive_) {
+     mjv_defaultScene(&this->scn);
+-    mjv_makeScene(nullptr, &this->scn, kMaxGeom);
++    mjv_makeScene(nullptr, &this->scn, 1024);
+   }
+ 
+   if (!this->platform_ui->IsGPUAccelerated()) {
+@@ -3182,6 +3189,7 @@
+   }
+ 
+   this->exitrequest.store(2);
++  cond_loadrequest.notify_all();
+ }
+ 
+ // add state to history buffer
+--- a/src/engine/engine_thread.cc
++++ b/src/engine/engine_thread.cc
+@@ -31,7 +31,7 @@
+ #include <intrin.h>
+ static inline void CpuPause() { __yield(); }
+ #elif defined(__aarch64__) || defined(__arm__)
+-static inline void CpuPause() { __asm__ __volatile__("yield" ::: "memory"); }
++static inline void CpuPause() { std::this_thread::yield(); }
+ #else
+ static inline void CpuPause() {}
+ #endif
+--- a/src/xml/xml_global.cc
++++ b/src/xml/xml_global.cc
+@@ -52,8 +52,8 @@
+ GlobalModel& GetGlobalModel();
+ 
+ void GlobalModel::Set(mjSpec* spec) {
+-  static std::once_flag atexit_once;
+-  std::call_once(atexit_once, []() { std::atexit([]() { GetGlobalModel().Set(nullptr); }); });
++  static const int cleanup = std::atexit([]() { GetGlobalModel().Set(nullptr); });
++  (void)cleanup;
+ 
+   std::lock_guard<std::mutex> lock(*mutex_);
+   if (spec_ != nullptr) { mj_deleteSpec(spec_); }
+--- a/src/render/classic/render_context.c
++++ b/src/render/classic/render_context.c
+@@ -1879,8 +1879,12 @@
+     mju_error("Could not allocate auxiliary color buffer");
+   }
+   glBindRenderbuffer(GL_RENDERBUFFER, con->auxColor[index]);
+-  glRenderbufferStorageMultisample(GL_RENDERBUFFER, con->auxSamples[index], GL_RGBA8,
+-                                   con->auxWidth[index], con->auxHeight[index]);
++  if (con->auxSamples[index]) {
++    glRenderbufferStorageMultisample(GL_RENDERBUFFER, con->auxSamples[index], GL_RGBA8,
++                                     con->auxWidth[index], con->auxHeight[index]);
++  } else {
++    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, con->auxWidth[index], con->auxHeight[index]);
++  }
+   glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                             GL_RENDERBUFFER, con->auxColor[index]);
+ 
+--- a/src/engine/engine_util_errmem.c
++++ b/src/engine/engine_util_errmem.c
+@@ -346,7 +346,7 @@
+   }
+ 
+   if (cfg->logto_console) {
+-    FILE* stream = (msg->level >= mjLOG_WARNING) ? stderr : stdout;
++    FILE* stream = stderr;  // stdout carries the Win3 binary protocol
+     mju_fprint_message(stream, msg->timestamp ? timestr : "", msg);
+   }
+ 

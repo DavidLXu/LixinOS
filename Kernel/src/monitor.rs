@@ -59,20 +59,3 @@ pub fn kernel_span_bytes() -> usize {
     }
     addr_of!(__stack_top) as usize - addr_of!(__kernel_start) as usize
 }
-
-/// Sample the kernel stack currently executing this code, including during a pane switch.
-#[cfg(feature = "retina")]
-pub fn kernel_stack_usage() -> Option<(usize, usize)> {
-    unsafe extern "C" {
-        static __stack_bottom: u8;
-        static __stack_top: u8;
-    }
-    let sp: usize;
-    unsafe { asm!("mov {}, sp", out(reg) sp, options(nostack, nomem, preserves_flags)); }
-    let stacks = [
-        (addr_of!(__stack_bottom) as usize, addr_of!(__stack_top) as usize),
-        crate::scheduler::stack_bounds(),
-    ];
-    stacks.into_iter().find(|&(bottom, top)| (bottom..=top).contains(&sp))
-        .map(|(bottom, top)| (top - sp, top - bottom))
-}

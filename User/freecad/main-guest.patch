@@ -1,0 +1,27 @@
+--- a/src/Main/MainGui.cpp
++++ b/src/Main/MainGui.cpp
+@@ -232,7 +232,13 @@
+     App::Application::Config()["AboutImage"] = App::Application::isDevelopmentVersion()
+         ? "freecadaboutdev"
+         : "freecadabout";
+-    App::Application::Config()["StartWorkbench"] = "PartDesignWorkbench";
++    if (qEnvironmentVariableIsEmpty("FREECAD_USER_HOME"))
++        qputenv("FREECAD_USER_HOME", qgetenv("HOME"));
++    if (qEnvironmentVariableIsEmpty("QT_QPA_FONTDIR"))
++        qputenv("QT_QPA_FONTDIR", "/lib/freecad-desktop/fonts");
++    if (qEnvironmentVariableIsEmpty("QT_WAYLAND_CLIENT_BUFFER_INTEGRATION"))
++        qputenv("QT_WAYLAND_CLIENT_BUFFER_INTEGRATION", "wayland-egl");
++    App::Application::Config()["StartWorkbench"] = "PartWorkbench";
+     // App::Application::Config()["HiddenDockWindow"] = "Property editor";
+     App::Application::Config()["SplashAlignment"] = "Bottom|Left";
+     App::Application::Config()["SplashTextColor"] = "#418FDE";
+@@ -308,6 +308,9 @@
+         exit(0);
+     }
+     catch (const Base::Exception& e) {
++        std::fprintf(stderr, "FreeCAD startup failed: %s\n", e.what());
++        if (!Py_IsInitialized())
++            return 100;
+         // Popup an own dialog box instead of that one of Windows
+         QApplication app(argc, argv);
+         QString appName = QString::fromStdString(App::Application::Config()["ExeName"]);

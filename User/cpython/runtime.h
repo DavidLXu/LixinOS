@@ -5,6 +5,7 @@
 int lx_thread_id(void);
 int lx_thread_main(void);
 int lx_threads_active(void);
+int lx_cooperative_active(void);
 long lx_clear_tid(int *);
 void lx_schedule(void);
 void lx_delay(unsigned);
@@ -15,3 +16,5 @@ _Noreturn void lx_thread_exit(void *, size_t);
 int lx_check_interrupt(void);
 int lx_input_byte(void);
 void lx_signal_interrupt(void);
+int lx_runtime_lock(void);
+void lx_runtime_unlock(int *);

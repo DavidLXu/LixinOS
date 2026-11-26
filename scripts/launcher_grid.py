@@ -1,12 +1,15 @@
 """Drive the native Desktop application grid in QMP integration tests."""
+from pathlib import Path
 import re
 import time
 
 
 def installed_apps(output):
     names = re.sub(rb"\x1b\[[0-9;]*m", b"", output).splitlines()
+    catalog = Path(__file__).resolve().parents[1] / "User/desktop/launcher-programs.def"
+    programs = re.findall(rb'^PROGRAM\("([^"]+)"', catalog.read_bytes(), re.M)
     return [b"agent.win3", *sorted(n for n in names if n != b"agent.win3" and
-            (n == b"nxeyes" or n.endswith((b".win", b".win2", b".win3"))))]
+            (n in programs or n == b"nxeyes" or n.endswith((b".win", b".win2", b".win3"))))]
 
 
 def select_icon(click, qmp, width, height, index, count):

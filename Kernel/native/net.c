@@ -244,12 +244,12 @@ int socket_connect(const char *name, unsigned port) {
     socket_release(i);
     return -1;
 }
-long socket_io(int id, int write, u8 *bytes, unsigned size) {
+long socket_io(int id, enum socket_operation op, u8 *bytes, unsigned size) {
     net_poll();
     struct connection *c = &connections[id];
     if (!size)
         return 0;
-    if (write) {
+    if (op == SOCKET_WRITE) {
         if (!c->pcb || c->failed)
             return -1;
         unsigned n = tcp_sndbuf(c->pcb);
@@ -269,9 +269,12 @@ long socket_io(int id, int write, u8 *bytes, unsigned size) {
     if (n > size)
         n = size;
     for (unsigned i = 0; i < n; i++)
-        bytes[i] = c->data[c->head++ % sizeof(c->data)];
-    if (c->pcb)
-        tcp_recved(c->pcb, n);
+        bytes[i] = c->data[(c->head + i) % sizeof(c->data)];
+    if (op != SOCKET_PEEK) {
+        c->head += n;
+        if (c->pcb)
+            tcp_recved(c->pcb, n);
+    }
     return n;
 }
 unsigned socket_ready(int id) {

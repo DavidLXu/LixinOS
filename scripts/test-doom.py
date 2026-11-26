@@ -1,6 +1,8 @@
 """Check Freedoom's framebuffer and recorded input on a disposable LixinOS disk."""
 import argparse
 import json
+import os
+from audio_capture import check_samples
 from pathlib import Path
 import runpy
 import subprocess
@@ -61,7 +63,7 @@ def exercise(guest, control, directory, screenshot):
         qmp("human-monitor-command", **{"command-line": f"sendkey {key} 60"})
         time.sleep(.16)
     qmp("human-monitor-command", **{"command-line": "sendkey ctrl-q 60"})
-    guest.until(b"recorded", timeout=30)
+    guest.until(b"recorded", timeout=180)
     guest.until(b"$ ", timeout=20)
     SHUTDOWN(guest)
 
@@ -75,7 +77,7 @@ def main():
     args = parser.parse_args()
     boot = PANES["serial"]["boot"]
 
-    def release_boot(disk, command):
+    def release_boot(disk, command, **kwargs):
         return boot(disk, [*command, "--kernel", args.kernel, "--release", args.release], prompt=b"$ ")
 
     with tempfile.TemporaryDirectory(prefix="doom-") as tmp:
@@ -83,8 +85,10 @@ def main():
         subprocess.run(["cp", "-c", args.disk, disk], check=True)
         subprocess.run(["python3", ROOT / "User/gcc/install.py", "--toolchain", "doom",
                         PACKAGE, disk], check=True)
-        with patch.dict(PANES["serial"], {"boot": release_boot}):
+        capture = Path(tmp) / "doom.wav"
+        with patch.dict(os.environ, {"LIXINOS_AUDIO": f"wav,path={capture},out.frequency=48000"}), patch.dict(PANES["serial"], {"boot": release_boot}):
             PANES["test"](lambda g, c, d: exercise(g, c, d, args.screenshot), mode="--window", disk=disk)
+        frames = check_samples(capture)
         rows, _ = disk_entries(disk)
         demo = bytes(rows["/doom-test.lmp"][1])
         assert demo[0] == 109 and demo[-1] == 0x80 and (len(demo) - 14) % 4 == 0
@@ -92,7 +96,7 @@ def main():
         assert any(0 < command[0] < 128 for command in commands), "missing forward movement"
         assert any(command[2] for command in commands), "missing turn"
         assert any(command[3] & 1 for command in commands), "missing attack"
-    print(f"{args.kernel}: Freedoom rendered MAP01 and recorded movement, turning and firing.")
+    print(f"{args.kernel}: Freedoom rendered MAP01 and recorded movement, turning and firing, captured {frames} stereo frames.")
 
 
 if __name__ == "__main__":

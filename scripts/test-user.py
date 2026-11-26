@@ -100,7 +100,11 @@ def boot(disk, command=None, prompt=SHELL):
             yield serial
         finally:
             vm.terminate()
-            vm.wait(timeout=5)
+            try:
+                vm.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                vm.kill()
+                vm.communicate()
 
 
 def check_ls(s):

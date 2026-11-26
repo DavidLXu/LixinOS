@@ -604,7 +604,7 @@ static int configure(void) {
     }
     return !dma.control;
 }
-void display_init(void) {
+void display_boot(void) {
     volatile u8 *fw = (volatile u8 *)0x09020000UL;
     *(volatile u16 *)(fw + 8) = 0x1900;
     u32 count = 0;
@@ -660,12 +660,20 @@ void display_init(void) {
     }
     for (unsigned y = 0; y < height; y++)
         frame[y] = fb + y * width;
-    struct file f;
-    if (!lookup("/src/gui/console-menlo.gray", &f) || f.size != sizeof(font))
-        return;
-    memcpy(font, f.data, sizeof(font));
     if (!(virtio_gpu ? gpu_set_mode(fb, width, width, height) : configure()))
         return;
+    online = 1;
+    boot_splash_begin(fb, width, width, height);
+}
+void display_init(void) {
+    boot_splash_end();
+    if (!online) return;
+    online = 0;
+    struct file f;
+    if ((!lookup("/lib/fonts/console.gray", &f) || f.size != sizeof(font)) &&
+        (!lookup("/src/gui/console-menlo.gray", &f) || f.size != sizeof(font)))
+        return;
+    memcpy(font, f.data, sizeof(font));
     online = 1;
     for (unsigned y = 0; y < height; y++)
         for (unsigned x = 0; x < width; x++)

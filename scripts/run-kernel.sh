@@ -2,13 +2,15 @@
 set -euo pipefail
 
 usage() {
-    printf 'Usage: %s [--kernel rust|tcc] [--release latest|TAG | --source] [--window | --split | --cocoa | --terminal | --serial | --ssh]\n' "$0"
+    printf 'Usage: %s [--kernel rust|tcc] [--release latest|TAG | --source] [--ram SIZE] [--window | --split | --cocoa | --terminal | --serial | --ssh]\n' "$0"
+    printf '  --ram SIZE   Guest memory for this boot, e.g. 4G, 5G or 4096M.\n'
 }
 
 mode=
 choice=
 release=
 source_boot=false
+requested_ram=
 while (( $# )); do
     case $1 in
         --kernel)
@@ -17,6 +19,14 @@ while (( $# )); do
                 exit 2
             fi
             choice=$2
+            shift
+            ;;
+        --ram)
+            if [[ $# -lt 2 || -z ${2:-} || -n $requested_ram ]]; then
+                usage >&2
+                exit 2
+            fi
+            requested_ram=$2
             shift
             ;;
         --release)
@@ -136,17 +146,25 @@ if [[ -z $choice && -z ${LIXINOS_KERNEL:-} ]] && [[ -t 0 || -z ${LIXINOS_DISK:-}
                     if [[ -s $tcc_loader && -r $tcc_loader ]]; then tcc_ready=true; fi
                 fi
             fi
-            disk_label=
-            if [[ ${LIXINOS_DISK:-$rust_default} == "$work_disk" && $tcc_disk == "$work_disk" ]]; then disk_label=daily; fi
-            choice=$(osascript "$root/scripts/choose-kernel.applescript" "$tcc_ready" "$rust_label" "$tcc_label" "${alternate##*/}" "$disk_label" "$menu_kernel") || {
-                echo '无法打开内核选择窗口。可使用 --kernel rust 或 --kernel tcc 启动。' >&2
-                exit 1
-            }
-            [[ $choice != cancel ]] || exit 0
-            if [[ -n $alternate ]]; then
-                export LIXINOS_DISK="$alternate"
-                tcc_disk=$alternate
+            picker_args=(--phase picker --disk="${alternate:-${LIXINOS_DISK:-$rust_default}}" --ram="$requested_ram")
+            if "$tcc_ready"; then
+                picker_args+=(--picker-tcc-disk="${alternate:-$tcc_disk}" --release="$release" --custom-kernel="$tcc_loader")
             fi
+            profiles=$(python3 "$root/scripts/boot_prep.py" "${picker_args[@]}") || exit $?
+            # NUL framing preserves spaces, quotes and newlines in image paths.
+            fields=()
+            while IFS= read -r -d '' field; do fields+=("$field"); done < <(
+                swift "$root/scripts/choose-kernel.swift" "$rust_label" "$tcc_label" "$profiles" \
+                    "$menu_kernel" "$work_disk" "$release" "$requested_ram" "${alternate##*/}" "$root/scripts/boot_prep.py"
+            )
+            [[ ${fields[0]:-} != cancel ]] || exit 0
+            if [[ ${#fields[@]} != 4 ]]; then
+                echo '无法打开启动窗口。可使用 --kernel rust 或 --kernel tcc 启动。' >&2
+                exit 1
+            fi
+            choice=${fields[0]} requested_ram=${fields[1]}
+            export LIXINOS_DISK="${fields[2]}"
+            if [[ $choice == tcc ]]; then tcc_disk=$LIXINOS_DISK; tcc_loader=${fields[3]}; fi
             ;;
         --serial|--ssh)
             if [[ -t 0 ]]; then
@@ -190,6 +208,7 @@ esac
 disk=${LIXINOS_DISK:-$rust_default}
 prep_args=(
     --phase=launch
+    --ram="$requested_ram"
     --disk="$disk"
     --release="$release"
     --choice="$choice"
@@ -225,6 +244,10 @@ case $mode in
         display=(-name LixinOS -display "$cocoa" -serial null
                  -device "$gpu_device" -device virtio-keyboard-device,bus=virtio-mmio-bus.1
                  -device virtio-tablet-device,bus=virtio-mmio-bus.3)
+        if [[ ${LIXINOS_AUDIO:-coreaudio} != off ]]; then
+            display+=(-audiodev "${LIXINOS_AUDIO:-coreaudio},id=playback"
+                      -device virtio-sound-device,audiodev=playback,streams=1,bus=virtio-mmio-bus.8)
+        fi
         if [[ $mode == --split ]]; then
             machine=virt,gic-version=3
         fi
@@ -254,9 +277,7 @@ if [[ -z ${LIXINOS_KERNEL:-} ]] && ! "$use_release"; then
 fi
 printf 'LixinOS 启动盘：%s\n' "$disk" >&2
 if ! "$disk_prepared"; then
-    ram=640M
     python3 ../scripts/disk_image.py "$disk"
-    if [[ $(head -c8 "$disk") == LIXBLD01 ]]; then ram=12G; fi
 fi
 [[ -n $qemu ]] || { echo "找不到 qemu-system-aarch64。" >&2; exit 1; }
 launcher=("$qemu")
@@ -268,6 +289,9 @@ if [[ "$profile" == retina || "$profile" == split ]]; then
     need_clipboard=true
 fi
 outbound="user,id=outbound,net=10.0.2.0/24,host=10.0.2.2,guestfwd=tcp:10.0.2.100:22-cmd:../scripts/gpu20-tunnel.sh,guestfwd=tcp:10.0.2.101:8080-cmd:../scripts/map-tile.py"
+if "$need_clipboard" && [[ ${LIXINOS_MAC_CLIPBOARD:-1} == 1 ]]; then
+    outbound+=,guestfwd=tcp:10.0.2.104:8767-cmd:../scripts/mac-text-clipboard.py
+fi
 codex_bridge=${LIXINOS_CODEX_DEEPSEEK:-auto}
 if [[ $codex_bridge == 1 || ( $codex_bridge == auto && $disk -ef "$work_disk" ) ]]; then
     outbound+=,guestfwd=tcp:10.0.2.102:8765-cmd:../scripts/codex-deepseek-bridge.py
@@ -293,6 +317,11 @@ vm_args=(
     -device virtio-net-device,netdev=outbound,bus=virtio-mmio-bus.4 \
     -kernel "$kernel_image"
 )
+if [[ ${LIXINOS_SWAP:-on} != off ]]; then
+    paging_template=$(python3 "$root/scripts/swap_image.py")
+    vm_args+=(-drive "if=none,id=paging,format=raw,snapshot=on,file=${paging_template//,/,,}"
+             -device virtio-blk-device,drive=paging,bus=virtio-mmio-bus.9)
+fi
 if [[ -n ${LIXINOS_KERNEL:-} ]]; then
     vm_args+=(-fw_cfg "name=opt/lixinos/mode,string=${mode#--}")
 else

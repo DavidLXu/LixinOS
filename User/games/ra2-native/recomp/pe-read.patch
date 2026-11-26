@@ -1,0 +1,31 @@
+--- a/runtime/win32hle/pe_loader.c
++++ b/runtime/win32hle/pe_loader.c
+@@ -8,6 +8,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <fcntl.h>
++#include <errno.h>
+ #include <unistd.h>
+ #include <sys/stat.h>
+ #include "pe_format.h"
+@@ -22,11 +23,17 @@
+     int fd = open(path, O_RDONLY);
+     if (fd < 0) return NULL;
+     struct stat st;
+-    if (fstat(fd, &st) < 0) { close(fd); return NULL; }
++    if (fstat(fd, &st) < 0 || st.st_size <= 0) { close(fd); return NULL; }
+     uint8_t *buf = (uint8_t *)malloc((size_t)st.st_size);
+-    ssize_t n = buf ? read(fd, buf, (size_t)st.st_size) : -1;
++    size_t got = 0;
++    while (buf && got < (size_t)st.st_size) {
++        ssize_t n = read(fd, buf + got, (size_t)st.st_size - got);
++        if (n < 0 && errno == EINTR) continue;
++        if (n <= 0) break;
++        got += (size_t)n;
++    }
+     close(fd);
+-    if (n != (ssize_t)st.st_size) { free(buf); return NULL; }
++    if (got != (size_t)st.st_size) { free(buf); return NULL; }
+     *len = (size_t)st.st_size;
+     return buf;
+ }

@@ -1,0 +1,30 @@
+--- a/net/http/http_network_transaction.cc
++++ b/net/http/http_network_transaction.cc
+@@ -2107,7 +2107,15 @@
+     // ERR_EMPTY_RESPONSE. This may still be close/reuse race if the socket was
+     // preconnected but failed to be used before the server timed it out.
+     case RetryReason::kEmptyResponse:
+-      if (ShouldResendRequest()) {
++      // A slow first certificate verification can outlive the peer's idle
++      // timeout. GetRemoteEndpoint detects this before we start the stream.
++      // Give a bodyless navigation one fresh connection in this case.
++      if (ShouldResendRequest() ||
++          (error == ERR_SOCKET_NOT_CONNECTED &&
++           next_state_ == STATE_CONNECTED_CALLBACK_COMPLETE &&
++           retry_attempts_on_connection_errors_ == 0 &&
++           !request_->upload_data_stream &&
++           (request_->method == "GET" || request_->method == "HEAD"))) {
+         if (retry_attempts_on_connection_errors_ >=
+             kMaxRetryAttemptsOnConnectionErrors) {
+           base::UmaHistogramBoolean(
+--- a/net/spdy/spdy_http_stream.cc
++++ b/net/spdy/spdy_http_stream.cc
+@@ -604,7 +604,7 @@
+   if (!spdy_session_)
+     return ERR_SOCKET_NOT_CONNECTED;
+ 
+-  return spdy_session_->GetPeerAddress(endpoint);
++  return spdy_session_->GetRemoteEndpoint(endpoint);
+ }
+ 
+ void SpdyHttpStream::PopulateNetErrorDetails(NetErrorDetails* details) {

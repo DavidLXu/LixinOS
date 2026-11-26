@@ -1,4 +1,5 @@
 #include "native.h"
+#include "identity.h"
 #include "build-memory.h"
 
 /* Modern virtio-mmio block device, queue zero. The kernel is single-core
@@ -68,6 +69,9 @@ static int init_blk(void) {
 }
 
 static int transfer(u32 type, u64 sector, void *data, u32 bytes) {
+#ifndef LIXINOS_BOOT_DISK
+    boot_splash_tick();
+#endif
     u16 seq = avail.index;
     request.type = type;
     request.sector = sector;
@@ -380,6 +384,7 @@ static void base_file_stats(u64 *stats) {
     }
 }
 
+static int disk_access(int staging,const char *path,unsigned bits);
 #include "build-fs.h"
 u32 disk_usage(void) { return build_volume ? build_live.bytes : live.size; }
 void file_stats(u64 *stats) {
@@ -398,13 +403,29 @@ void file_stats(u64 *stats) {
         }
     }
 }
-int lookup(const char *path, struct file *f) {
-    return agent_path_allowed(path, 0) &&
-           (build_live.items ? build_find(&build_live, path, f) : find(&live, path, f));
+static int raw_find(int staging,const char *path,struct file *f) {
+    if (build_volume) return build_find(staging?&build_staged:&build_live,path,f);
+    return find(staging?&staged:&live,path,f);
 }
-int batch_lookup(int id, const char *path, struct file *f) {
-    return id == owner && !batch_stale(id) && agent_path_allowed(path, 0) &&
-           (build_volume ? build_find(&build_staged, path, f) : find(&staged, path, f));
+static int metadata(int staging,struct file *f) {
+    if (!raw_find(staging,LX_PERMISSIONS,f)) {f->data=0;f->size=0;return 1;}
+    return f->size<=LX_PERM_LIMIT;
+}
+static int disk_access(int staging,const char *path,unsigned bits) {
+    unsigned slot=task_active();
+    if (slot>=16 || !id_uid(slot)) return 1;
+    struct file meta,target;
+    if (!metadata(staging,&meta)) return 0;
+    int kind=raw_find(staging,path,&target)?target.size==DIR_SIZE:-1;
+    return id_path(slot,meta.data,meta.size,path,strlen(path),kind,bits);
+}
+int lookup(const char *path, struct file *f) {
+    return agent_path_allowed(path,0) && disk_access(0,path,4) && raw_find(0,path,f);
+}
+int disk_can_execute(const char *path) {return disk_access(0,path,1);}
+int batch_lookup(int id,const char *path,struct file *f) {
+    return id==owner && !batch_stale(id) && agent_path_allowed(path,0) &&
+        disk_access(1,path,4) && raw_find(1,path,f);
 }
 #endif
 static int load_snapshot(const u8 *head, unsigned slot) {
@@ -493,7 +514,17 @@ static int load_snapshot(const u8 *head, unsigned slot) {
             return 0;
         pos += n;
     }
-    if (hash(live.data, size) != word(head + 20))
+    u32 digest = 2166136261u;
+    for (u32 pos = 0; pos < size;) {
+#ifndef LIXINOS_BOOT_DISK
+        boot_splash_tick();
+#endif
+        u32 chunk = size - pos;
+        if (chunk > (1u << 20)) chunk = 1u << 20;
+        digest = hash_cont(digest, live.data + pos, chunk);
+        pos += chunk;
+    }
+    if (digest != word(head + 20))
         return 0;
     live.size = size;
     live.timed = head[7] == '3';
@@ -511,7 +542,7 @@ static int load_snapshot(const u8 *head, unsigned slot) {
     live.buckets = 0;
     ordered = 0;
     struct file root;
-    if (!lookup("/", &root) || root.size != DIR_SIZE)
+    if (!find(&live, "/", &root) || root.size != DIR_SIZE)
         return 0;
     live.end = offset;
     active_slot = slot;
@@ -631,12 +662,12 @@ static long list_entry(struct snapshot *view, const char *path, u64 index, char 
 }
 
 long directory_entry(const char *path, u64 index, char *name) {
-    return agent_path_allowed(path, 0) ? (build_volume ? build_child(&build_live, path, index, name)
+    return agent_path_allowed(path, 0) && disk_access(0,path,5) ? (build_volume ? build_child(&build_live, path, index, name)
                                                        : list_entry(&live, path, index, name))
                                        : -1;
 }
 long batch_child(int id, const char *path, u64 index, char *name) {
-    return id == owner && !batch_stale(id) && agent_path_allowed(path, 0)
+    return id == owner && !batch_stale(id) && agent_path_allowed(path, 0) && disk_access(1,path,5)
                ? (build_volume ? build_child(&build_staged, path, index, name)
                                : list_entry(&staged, path, index, name))
                : -1;
@@ -688,9 +719,8 @@ int canonical_path(const char *path) {
 // Set one entry in a private, sorted snapshot. NULL removes it. A directory
 // has size UINT32_MAX. A source view can alias the staged snapshot.
 #include "revision.h"
-int batch_set(int id, const char *path, const struct file *value) {
-    if (owner != id || batch_stale(id) || !canonical_path(path) || !path[1] ||
-        !agent_path_allowed(path, 1))
+static int batch_set_raw(int id, const char *path, const struct file *value) {
+    if (owner != id || batch_stale(id) || !canonical_path(path) || !path[1])
         return 0;
     u32 n = 0;
     while (path[n])
@@ -841,6 +871,66 @@ int batch_commit(int id) {
     active_slot = 1 - active_slot;
     return 1;
 }
+static int save_mode(int id,const char *path,const struct lx_mode *mode) {
+    struct file meta;
+    if (!metadata(1,&meta)) return 0;
+    unsigned n=strlen(path),cap=meta.size+16+n;
+    if (!mode) {
+        struct lx_mode dummy;
+        long found=id_find(meta.data,meta.size,path,n,&dummy,0);
+        if (found<=0) return !found;
+    }
+    u8 *buf=file_buffer(cap);
+    if (!buf) return 0;
+    long size=id_encode(meta.data,meta.size,path,n,mode,buf,cap);
+    struct file result={buf,size<0?0:size};
+    int previous=needs_checkpoint;
+    int ok=size>=0 && batch_set_raw(id,LX_PERMISSIONS,&result);
+    if (build_volume && scratch_name(path)) needs_checkpoint=previous;
+    release_buffer(buf,cap);
+    return ok;
+}
+int batch_set(int id,const char *path,const struct file *value) {
+    if (id!=owner || !canonical_path(path) || !agent_path_allowed(path,1) ||
+        !disk_access(1,path,value?2:8)) return 0;
+    unsigned slot=task_active();
+    struct file prior;
+    int create=value && slot<16 && id_uid(slot) && !raw_find(1,path,&prior);
+    if (!batch_set_raw(id,path,value)) return 0;
+    if ((strlen(path)==sizeof(LX_PERMISSIONS)-1 && !memcmp(path,LX_PERMISSIONS,sizeof(LX_PERMISSIONS)-1))) return 1;
+    if (!value || create) {
+        struct lx_mode m={id_uid(slot),id_gid(slot),(value && value->size==DIR_SIZE?0777:0666)&~id_mask(slot)};
+        if (!save_mode(id,path,value?&m:0)) {batch_abort(id);return 0;}
+    }
+    return 1;
+}
+long disk_mode(const char *path,unsigned op,unsigned *w) {
+    unsigned slot=task_active(),n=strlen(path);
+    struct file f,meta;
+    struct lx_mode m;
+    if (op==16 || op==17) {
+        if (raw_find(0,path,&f)) return (w[1] || op==17)?-17:0;
+        if (!agent_path_allowed(path,1) || !disk_access(0,path,2)) return -13;
+        int id=0x7ffffffe;
+        if (!batch_begin(id)) return -16;
+        struct file created={0,op==17?DIR_SIZE:0};
+        struct lx_mode attrs={id_uid(slot),id_gid(slot),w[0]&0777&~id_mask(slot)};
+        if (batch_set(id,path,&created) && save_mode(id,path,&attrs) && batch_commit(id)) return 0;
+        batch_abort(id);return -5;
+    }
+    if (!agent_path_allowed(path,op==13||op==14) || !disk_access(0,path,0)) return -13;
+    if (!raw_find(0,path,&f)) return -2;
+    if (!metadata(0,&meta) || !id_mode(meta.data,meta.size,path,n,f.size==DIR_SIZE,&m)) return -5;
+    if (op==12) {w[0]=m.uid;w[1]=m.gid;w[2]=m.mode;return 0;}
+    if (op==15) return !(w[0]&~7u) && disk_access(0,path,w[0])?0:-13;
+    if ((strlen(path)==sizeof(LX_PERMISSIONS)-1 && !memcmp(path,LX_PERMISSIONS,sizeof(LX_PERMISSIONS)-1))) return -13;
+    long res=id_modify(slot,&m,op,w[0],w[1]);
+    if (res) return res;
+    int id=0x7ffffffe;
+    if (!batch_begin(id)) return -16;
+    if (save_mode(id,path,&m) && batch_commit(id)) return 0;
+    batch_abort(id);return -5;
+}
 int store_file(const char *path, const u8 *data, u32 size) {
     const int single = 0x7fffffff;
     struct file file = {data, size};
@@ -956,7 +1046,10 @@ int batch_move(int id, const char *source, const char *dest) {
         unsigned to_len=dst+e.length-src;
         if (e.length>=3 && !memcmp(from+e.length-3,".py",3) &&
             !edit_revision(id,from,to_len>=3 && !memcmp(to+to_len-3,".py",3) ? to : 0)) return 0;
-        if (!batch_set(id, from, 0) || !batch_set(id, to, &f))
+        struct file meta;
+        struct lx_mode mode;
+        if (!metadata(0,&meta) || !id_mode(meta.data,meta.size,from,e.length,e.size==DIR_SIZE,&mode)) return 0;
+        if (!batch_set(id, from, 0) || !batch_set(id, to, &f) || !save_mode(id,to,&mode))
             return 0;
         if ((build_volume || staged.timed) && batch_lookup(id, to, &f)) {
             u8 *stamp = (u8 *)f.data - (dst + e.length - src) - 8;

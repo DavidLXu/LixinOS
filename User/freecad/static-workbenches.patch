@@ -1,0 +1,180 @@
+--- a/src/Base/CMakeLists.txt
++++ b/src/Base/CMakeLists.txt
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: LGPL-2.1-or-later
+ 
+-add_library(FreeCADBase SHARED)
++add_library(FreeCADBase STATIC)
+ 
+ if(WIN32)
+     add_definitions(-DFCBase)
+--- a/src/App/CMakeLists.txt
++++ b/src/App/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-add_library(FreeCADApp SHARED)
++add_library(FreeCADApp STATIC)
+ 
+ if(WIN32)
+     add_definitions(-DFCApp)
+--- a/src/Gui/CMakeLists.txt
++++ b/src/Gui/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-add_library(FreeCADGui SHARED)
++add_library(FreeCADGui STATIC)
+ 
+ if ( EXISTS "${CMAKE_SOURCE_DIR}/src/3rdParty/GSL/include" )
+     include_directories( ${CMAKE_SOURCE_DIR}/src/3rdParty/GSL/include )
+--- a/src/Mod/Part/App/CMakeLists.txt
++++ b/src/Mod/Part/App/CMakeLists.txt
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: LGPL-2.1-or-later
+ 
+-add_library(Part SHARED)
++add_library(Part STATIC)
+ 
+ target_include_directories(
+     Part
+--- a/src/Mod/Part/Gui/CMakeLists.txt
++++ b/src/Mod/Part/Gui/CMakeLists.txt
+@@ -258,7 +258,7 @@
+     Resources/icons/PartWorkbench.svg
+ )
+ 
+-add_library(PartGui SHARED ${PartGui_SRCS} ${PartGuiIcon_SVG})
++add_library(PartGui STATIC ${PartGui_SRCS} ${PartGuiIcon_SVG})
+ 
+ if(FREECAD_USE_PCH)
+     target_precompile_headers(PartGui PRIVATE
+--- a/src/Mod/Sketcher/App/CMakeLists.txt
++++ b/src/Mod/Sketcher/App/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-add_library(Sketcher SHARED)
++add_library(Sketcher STATIC)
+ 
+ # Uncomment this code if you want to try Eigen's multithread
+ #find_package(OpenMP)
+--- a/src/Mod/Sketcher/Gui/CMakeLists.txt
++++ b/src/Mod/Sketcher/Gui/CMakeLists.txt
+@@ -174,7 +174,7 @@
+     Resources/icons/SketcherWorkbench.svg
+ )
+ 
+-add_library(SketcherGui SHARED
++add_library(SketcherGui STATIC
+     ${SketcherGui_SRCS}
+     ${SketcherGuiIcon_SVG}
+ )
+--- a/src/Mod/Material/App/CMakeLists.txt
++++ b/src/Mod/Material/App/CMakeLists.txt
+@@ -135,7 +135,7 @@
+     )
+ endif(BUILD_MATERIAL_EXTERNAL)
+ 
+-add_library(Materials SHARED ${Materials_SRCS})
++add_library(Materials STATIC ${Materials_SRCS})
+ 
+ if(FREECAD_USE_PCH)
+     target_precompile_headers(Materials PRIVATE
+--- a/src/Mod/Material/Gui/CMakeLists.txt
++++ b/src/Mod/Material/Gui/CMakeLists.txt
+@@ -156,7 +156,7 @@
+     Resources/ui/materials-editor.ui
+ )
+ 
+-add_library(MatGui SHARED
++add_library(MatGui STATIC
+     ${MatGui_SRCS}
+     ${MatGuiIcon_SVG}
+     ${MatGuiImages}
+--- a/src/Mod/Measure/App/CMakeLists.txt
++++ b/src/Mod/Measure/App/CMakeLists.txt
+@@ -57,7 +57,7 @@
+     ${Python_SRCS}
+ )
+ 
+-add_library(Measure SHARED ${Measure_SRCS})
++add_library(Measure STATIC ${Measure_SRCS})
+ 
+ if(FREECAD_USE_PCH)
+     target_precompile_headers(Measure PRIVATE
+--- a/src/Mod/Measure/Gui/CMakeLists.txt
++++ b/src/Mod/Measure/Gui/CMakeLists.txt
+@@ -63,7 +63,7 @@
+     Resources/icons/preferences-measure.svg
+ )
+ 
+-add_library(MeasureGui SHARED ${MeasureGui_SRCS} ${MeasureGuiIcon_SVG})
++add_library(MeasureGui STATIC ${MeasureGui_SRCS} ${MeasureGuiIcon_SVG})
+ 
+ if(FREECAD_USE_PCH)
+     target_precompile_headers(MeasureGui PRIVATE
+--- a/src/Main/CMakeLists.txt
++++ b/src/Main/CMakeLists.txt
+@@ -26,7 +26,23 @@
+     endif(NOT BUILD_DYNAMIC_LINK_PYTHON)
+ 
+     add_executable(FreeCADMain WIN32 ${FreeCAD_SRCS})
+-    target_link_libraries(FreeCADMain ${FreeCAD_LIBS})
++    find_package(Qt6 REQUIRED COMPONENTS WaylandClient)
++    foreach(plugin IN ITEMS QWaylandIntegrationPlugin QWaylandXdgShellIntegrationPlugin QWaylandEglClientBufferPlugin)
++        if(NOT TARGET Qt6::${plugin})
++            find_package(Qt6${plugin} CONFIG REQUIRED)
++        endif()
++    endforeach()
++    qt_import_plugins(FreeCADMain EXCLUDE_BY_TYPE egldeviceintegrations)
++    qt_import_plugins(FreeCADMain INCLUDE_BY_TYPE platforms Qt6::QWaylandIntegrationPlugin)
++    qt_import_plugins(FreeCADMain INCLUDE_BY_TYPE wayland-shell-integration Qt6::QWaylandXdgShellIntegrationPlugin)
++    qt_import_plugins(FreeCADMain INCLUDE_BY_TYPE wayland-graphics-integration-client Qt6::QWaylandEglClientBufferPlugin)
++    # Built-in Python modules and Qt resource constructors belong to the same process.
++    set(guest_cad_libraries FreeCADBase FreeCADApp FreeCADGui Materials MatGui
++                            Part PartGui Sketcher SketcherGui Measure MeasureGui)
++    target_link_libraries(FreeCADMain ${FreeCAD_LIBS} ${guest_cad_libraries} Qt6::WaylandClient Qt6::QWaylandIntegrationPlugin Qt6::QWaylandIntegrationPlugin_init)
++    foreach(lib IN LISTS guest_cad_libraries)
++        set_property(TARGET FreeCADMain PROPERTY LINK_LIBRARY_OVERRIDE_${lib} WHOLE_ARCHIVE)
++    endforeach()
+     if (FREECAD_WARN_ERROR)
+         target_compile_warn_error(FreeCADMain)
+     endif()
+--- a/src/Main/MainGui.cpp
++++ b/src/Main/MainGui.cpp
+@@ -130,8 +130,40 @@
+     }
+ }
+ 
++#include <Python.h>
++extern "C" {
++PyObject *PyInit__lixin_http();
++PyObject *PyInit__ssl();
++PyObject *PyInit__lixin_process();
++PyObject *PyInit_Materials();
++PyObject *PyInit_MatGui();
++PyObject *PyInit_Part();
++PyObject *PyInit_PartGui();
++PyObject *PyInit_Sketcher();
++PyObject *PyInit_SketcherGui();
++PyObject *PyInit_Measure();
++PyObject *PyInit_MeasureGui();
++}
++
+ int main(int argc, char** argv)
+ {
++    if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM"))
++        qputenv("QT_QPA_PLATFORM", "wayland");
++    static struct _inittab workbenches[] = {
++        {"_lixin_http", PyInit__lixin_http}, {"_ssl", PyInit__ssl},
++        {"_lixin_process", PyInit__lixin_process},
++        {"Materials", PyInit_Materials}, {"MatGui", PyInit_MatGui},
++        {"Part", PyInit_Part}, {"PartGui", PyInit_PartGui},
++        {"Sketcher", PyInit_Sketcher}, {"SketcherGui", PyInit_SketcherGui},
++        {"Measure", PyInit_Measure}, {"MeasureGui", PyInit_MeasureGui},
++        {nullptr, nullptr}
++    };
++    extern int registerGuestBindings();
++    if (registerGuestBindings() < 0 || PyImport_ExtendInittab(workbenches) < 0) {
++        std::fputs("Could not register built-in FreeCAD workbenches\n", stderr);
++        return 1;
++    }
++
+ #if defined(FC_OS_LINUX) || defined(FC_OS_BSD)
+     setlocale(LC_ALL, "");       // use native environment settings
+     setlocale(LC_NUMERIC, "C");  // except for numbers to not break XML import

@@ -1,0 +1,47 @@
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -19,7 +19,7 @@
+ */
+ const DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com/anthropic/v1";
+ /** Default Anthropic-format model name (aligned with the repo's DeepSeek model vocabulary). */
+-const DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-flash";
++const DEEPSEEK_DEFAULT_MODEL = "deepseek-flash";
+ /** Default `anthropic-version` header value. */
+ const DEEPSEEK_DEFAULT_API_VERSION = "2023-06-01";
+ /** Default upper bound on generated tokens for the Messages request. */
+@@ -63,6 +63,10 @@
+ 	const snippets = citationSnippets(blocks);
+ 	const seen = /* @__PURE__ */ new Set();
+ 	const sources = [];
++	for (const block of resultBlocks) {
++		if (block.content?.type === "web_search_tool_result_error")
++			throw new WebError(`DeepSeek web search failed: ${block.content.error_code}`, "WEB_PROVIDER_ERROR");
++	}
+ 	for (const block of resultBlocks) for (const item of block.content ?? []) {
+ 		if (item.type !== "web_search_result" || item.url.length === 0 || seen.has(item.url)) continue;
+ 		seen.add(item.url);
+@@ -303,6 +307,15 @@
+ function resolveOptions(ctx, config) {
+ 	const apiKeyEnv = credentialRef(config.apiKeyEnv);
+ 	const literalApiKey = config.apiKey !== void 0 && config.apiKey.length > 0 ? config.apiKey : void 0;
++	const environment = launchEnvironmentOf(ctx);
++	const override = config.baseURL ?? environment.get(SEARCH_BASE_URL_ENV)?.value;
++	// Only inherit the chat route for its shared API key. A separate search
++	// credential or a signed-in account keeps its own configured destination.
++	const provider = ctx.get("agents")?.currentInitiator()?.session.requestContext()?.provider;
++	const sharedKey = !literalApiKey && apiKeyEnv === "DEEPSEEK_API_KEY" &&
++		(!provider || provider === "deepseek-official");
++	const chatBase = sharedKey && environment.getFrom("DEEPSEEK_BASE_URL", ["process", "user-env"])?.value.replace(/\/+$/u, "");
++	const baseURL = override ?? (chatBase ? (chatBase.endsWith("/v1") ? chatBase : chatBase + "/v1") : DEEPSEEK_DEFAULT_BASE_URL);
+ 	return {
+ 		...literalApiKey === void 0 ? {} : { apiKey: literalApiKey },
+ 		resolveAccountToken: async (endpoint) => {
+@@ -316,7 +329,7 @@
+ 			return ambient !== void 0 && ambient.value.length > 0 ? ambient.value : void 0;
+ 		},
+ 		apiKeyEnv,
+-		baseURL: config.baseURL ?? launchEnvironmentOf(ctx).get(SEARCH_BASE_URL_ENV)?.value ?? "https://api.deepseek.com/anthropic/v1",
++		baseURL: baseURL.replace(/\/+$/u, ""),
+ 		model: config.model,
+ 		apiVersion: config.apiVersion,
+ 		maxTokens: config.maxTokens,

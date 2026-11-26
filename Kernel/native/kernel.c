@@ -122,9 +122,11 @@ void kernel_main(void) {
     UART[0x30 / 4] = (1 << 8) | (1 << 9) | 1;
     early_mmu_init(build_memory_present());
     serial_text(KERNEL_BANNER "\n");
-    if (!mount_disk())
+    display_boot();
+    if (!mount_disk()) {
+        boot_splash_end();
         serial_text("Cannot mount system or build volume\n");
-    else {
+    } else {
         net_init();
         read_history();
         input_init();

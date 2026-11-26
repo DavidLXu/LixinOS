@@ -1,4 +1,5 @@
 #include "native.h"
+#include "identity.h"
 
 /* One bounded ring per connection. Each live endpoint owns a reference. */
 #define PIPE_BYTES 8192
@@ -94,7 +95,7 @@ enum { LOCAL_BOUND = 1, LOCAL_STREAM };
 #define LOCAL_BACKLOG 4
 #define LOCAL_NAMES 16
 struct local_socket {
-    unsigned kind;
+    unsigned kind,uid,gid;
     u64 pid;
     struct pipe *input, *output;
     unsigned size, backlog, count;
@@ -137,6 +138,7 @@ int local_pair(u64 left_pid, u64 right_pid, struct local_socket **left, struct l
     }
     a->input = ba; a->output = ab; a->pid = right_pid;
     b->input = ab; b->output = ba; b->pid = left_pid;
+    a->uid=b->uid=id_uid(task_active()); a->gid=b->gid=id_gid(task_active());
     *left = a; *right = b;
     return 0;
 }
@@ -159,6 +161,7 @@ int local_bind(const u8 *name, unsigned size, u64 pid, struct local_socket **out
     struct local_socket *socket = local_alloc(LOCAL_BOUND);
     if (!socket) return -105;
     socket->pid = pid;
+    socket->uid=id_uid(task_active());socket->gid=id_gid(task_active());
     socket->size = size;
     memcpy(socket->name, name, size);
     *out = socket;
@@ -176,7 +179,7 @@ int local_connect(const u8 *name, unsigned size, u64 pid, struct local_socket **
     if (!listener || !listener->backlog) return -111;
     if (listener->count >= listener->backlog) return -11;
     int result = local_pair(pid, listener->pid, out, &server);
-    if (!result) listener->pending[listener->count++] = server;
+    if (!result) { (*out)->uid=listener->uid; (*out)->gid=listener->gid; listener->pending[listener->count++]=server; }
     return result;
 }
 
@@ -248,7 +251,7 @@ long local_io(struct local_socket *socket, unsigned command, u8 *data, unsigned 
         }
         return 0;
     }
-    if (command == 9) return socket->pid;
+    if (command == 9) { if (argument==8) { ((u32 *)data)[0]=socket->uid; ((u32 *)data)[1]=socket->gid; } return socket->pid; }
     if (argument > 4096) return -22;
     return command == 6 ? local_read_rights(socket, data, argument, 0)
                         : local_write_rights(socket, data, argument, 0);

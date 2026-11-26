@@ -7,12 +7,17 @@ use core::ptr::{addr_of_mut, copy_nonoverlapping, write_bytes};
 
 global_asm!(include_str!("user.S"));
 unsafe extern "C" {
-    fn enter_user(path: usize, source: usize, len: usize, save: usize) -> i64;
+    #[link_name = "enter_user"]
+    fn enter_el0(path: usize, source: usize, len: usize, save: usize) -> i64;
+    fn kt_end_group(status: i64) -> i64;
     fn user_vectors();
 }
 #[repr(align(4096))]
 struct Table([u64; 512]);
-pub const BANKS: usize = crate::scheduler::CAPACITY;
+unsafe fn enter_user(a: usize,b: usize,c: usize,d: usize) -> i64 {
+    unsafe { kt_end_group(enter_el0(a,b,c,d)) }
+}
+pub const BANKS: usize = 16;
 #[repr(C)]
 struct Tables {
     root: Table,
@@ -72,7 +77,7 @@ pub(crate) fn git_mailbox() -> *mut u8 {
     (ALIAS + SCRIPT_OFFSET) as *mut u8
 }
 pub(crate) fn bank() -> usize {
-    crate::scheduler::active()
+    unsafe { crate::scheduler::kt_owner(crate::scheduler::active() as u32) as usize }
 }
 pub(crate) fn test_io_active() -> bool {
     unsafe { (&*TEST_IO.0.get())[bank()].is_some() }
@@ -182,6 +187,54 @@ pub fn setup_bank(bank: usize) -> Result<(), &'static str> {
     Ok(())
 }
 
+// Shared C code implements the same ARM64 descriptors on the guest-built kernel.
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct VmSpace {
+    dirs: [usize; 16],
+    hint: usize,
+}
+unsafe extern "C" {
+    fn vm_destroy(space: *mut VmSpace);
+    fn vm_sync();
+    pub(crate) fn vm_call(space: *mut VmSpace, bank: u32, op: u64, args: *const u64, file: *const u8, size: usize) -> i64;
+    pub(crate) fn vm_readable(space: *const VmSpace, addr: usize, len: usize) -> i32;
+}
+#[unsafe(no_mangle)]
+extern "C" fn vm_memory_low() -> i32 {
+    (crate::monitor::heap_usage().1 < (48 << 20)) as i32
+}
+#[unsafe(no_mangle)]
+extern "C" fn vm_allocate(bytes: usize) -> *mut u8 {
+    unsafe { alloc::alloc::alloc(core::alloc::Layout::from_size_align(bytes, 4096).unwrap()) }
+}
+#[unsafe(no_mangle)]
+unsafe extern "C" fn vm_release(ptr: *mut u8, bytes: usize) {
+    unsafe { alloc::alloc::dealloc(ptr, core::alloc::Layout::from_size_align(bytes, 4096).unwrap()); }
+}
+#[unsafe(no_mangle)]
+unsafe extern "C" fn vm_publish(bank: u32, space: *const VmSpace) {
+    unsafe {
+        for i in 0..16 {
+            let dir = space.as_ref().map_or(0, |s| s.dirs[i]);
+            (*tables(bank as usize)).root.0[96 + i] = if dir == 0 { 0 } else { dir as u64 | 3 };
+        }
+    }
+}
+impl VmSpace {
+    pub fn bind(&self, visible: bool) {
+        if self.dirs.iter().any(|&d| d != 0) {
+            unsafe {
+                vm_publish(bank() as u32, if visible { self } else { core::ptr::null() });
+                vm_sync();
+            }
+        }
+    }
+}
+impl Drop for VmSpace {
+    fn drop(&mut self) { unsafe { vm_destroy(self); } }
+}
+
 pub fn select_bank(bank: usize) {
     unsafe {
         asm!("dsb ish", "msr ttbr0_el1, {}", "isb", "tlbi vmalle1", "dsb ish", "ic iallu", "dsb ish", "isb",
@@ -230,7 +283,7 @@ fn replace_image(image: Option<ImageMemory>) -> Option<ImageMemory> {
         }
         asm!(
             "dsb ishst",
-            "tlbi vmalle1",
+            "tlbi vmalle1is",
             "dsb ish",
             "ic iallu",
             "dsb ish",
@@ -253,7 +306,7 @@ pub fn init() {
     setup_bank(0).expect("boot address space");
     unsafe {
         asm!("msr vbar_el1, {vectors}", "msr mair_el1, {attr}", "msr tcr_el1, {tcr}",
-            "msr ttbr0_el1, {table}", "dsb sy","isb","tlbi vmalle1","dsb sy","isb",
+            "msr ttbr0_el1, {table}", "dsb sy","isb","tlbi vmalle1is","dsb sy","isb",
             "mrs x9, sctlr_el1","orr x9,x9,#1","orr x9,x9,#4","orr x9,x9,#0x1000","msr sctlr_el1,x9","isb",
             "mrs x9,cpacr_el1","orr x9,x9,#(3<<20)","msr cpacr_el1,x9","isb",
             vectors=in(reg)user_vectors as *const () as usize,attr=in(reg)0xffu64,
@@ -419,13 +472,19 @@ pub(crate) fn launch_segments(image: &[u8], data: &[u8], script: Option<(&str, &
         copy_nonoverlapping(data.as_ptr(), (ALIAS + BLOCK) as *mut u8, data.len());
         let (path_ptr, source_ptr, len) = if let Some((path, source)) = script {
             let offset = path.len() + 1; // zeroed terminator
-            if offset + source.len() > SCRIPT_CAPACITY {
+            let (input, capacity) = if core::ptr::eq(image, TCC) {
+                // User/tcc/Makefile reserves the first 256 KiB of its RW data bank.
+                (BLOCK, 256 * 1024)
+            } else {
+                (SCRIPT_OFFSET, SCRIPT_CAPACITY)
+            };
+            if offset + source.len() >= capacity {
                 return Err("script exceeds launch buffer");
             }
-            let dest = (ALIAS + SCRIPT_OFFSET) as *mut u8;
+            let dest = (ALIAS + input) as *mut u8;
             copy_nonoverlapping(path.as_ptr(), dest, path.len());
             copy_nonoverlapping(source.as_ptr(), dest.add(offset), source.len());
-            let base = USER + SCRIPT_OFFSET;
+            let base = USER + input;
             (base, base + offset, source.len())
         } else {
             (0, 0, 0)
@@ -516,7 +575,7 @@ impl UserArena {
                 if visible {block.as_ptr() as u64 | 1 | AF | SH | USER_ACCESS | PXN
                     | if i < self.sealed { READ_ONLY } else { UXN }} else {0}; }
         }
-        unsafe { asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb"); }
+        unsafe { asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb"); }
     }
     // Publish a loaded program's text once. The remainder stays RW and NX.
     pub fn seal_text(&mut self, bytes: usize) -> bool {
@@ -554,7 +613,7 @@ impl UserArena {
             unsafe {
                 *self.entry(index) =
                     block.as_ptr() as u64 | 1 | AF | SH | USER_ACCESS | PXN | UXN;
-                asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
+                asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb");
             }
             self.blocks.push(block);
             unsafe { ARENA_BYTES[self.bank] += BLOCK; }
@@ -570,7 +629,7 @@ impl Drop for UserArena {
             for i in 0..self.blocks.len() {
                 *self.entry(i) = 0;
             }
-            asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
+            asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb");
             ARENA_BYTES[self.bank] -= self.blocks.len()*BLOCK;
             for block in self.blocks.drain(..) {
                 alloc::alloc::dealloc(block.as_ptr(), layout);
@@ -579,9 +638,10 @@ impl Drop for UserArena {
     }
 }
 
-use crate::shared_memory::{LIMIT as SHARED_LIMIT, MAPS as SHARED_MAPS, PAGE, Shared};
+use crate::shared_memory::{LIMIT as SHARED_LIMIT, APERTURE as SHARED_APERTURE, PAGE, Shared};
 
 struct SharedMapping {
+    first_block: usize,
     file: Shared,
     bytes: usize,
     tables: Vec<alloc::boxed::Box<Table>>,
@@ -595,17 +655,17 @@ impl Drop for SharedMapping {
 
 pub(crate) struct SharedMappings {
     bank: usize,
-    slots: [Option<SharedMapping>; SHARED_MAPS],
+    slots: Vec<SharedMapping>,
 }
 
 impl SharedMappings {
     pub fn new() -> Self {
-        Self { bank: bank(), slots: core::array::from_fn(|_| None) }
+        Self { bank: bank(), slots: Vec::new() }
     }
 
     fn publish(&self, slot: usize, mapped: bool) {
-        let Some(mapping) = &self.slots[slot] else { return; };
-        let first = slot * (SHARED_LIMIT / BLOCK);
+        let mapping = &self.slots[slot];
+        let first = mapping.first_block;
         for (i, table) in mapping.tables.iter().enumerate() {
             unsafe {
                 (*tables(self.bank)).shared.0[first + i] =
@@ -615,11 +675,11 @@ impl SharedMappings {
     }
 
     fn flush() {
-        unsafe { asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb"); }
+        unsafe { asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb"); }
     }
 
     pub fn set_mapped(&self, mapped: bool) {
-        if self.slots.iter().all(Option::is_none) { return; }
+        if self.slots.is_empty() { return; }
         for i in 0..self.slots.len() { self.publish(i, mapped); }
         Self::flush();
     }
@@ -636,8 +696,17 @@ impl SharedMappings {
             }
             f.physical() + offset
         };
-        let Some(slot) = self.slots.iter().position(Option::is_none) else { return -12; };
         let count = bytes.div_ceil(BLOCK);
+        let mut first_block = 0;
+        let mut slot = 0;
+        for mapping in &self.slots {
+            if first_block + count <= mapping.first_block { break; }
+            first_block = mapping.first_block + mapping.tables.len();
+            slot += 1;
+        }
+        if first_block + count > SHARED_APERTURE / BLOCK || self.slots.try_reserve(1).is_err() {
+            return -12;
+        }
         let mut entries = Vec::new();
         if entries.try_reserve_exact(count).is_err() { return -12; }
         for i in 0..count {
@@ -651,24 +720,21 @@ impl SharedMappings {
             entries.push(table);
         }
         file.borrow_mut().mappings += 1;
-        self.slots[slot] = Some(SharedMapping { file, bytes, tables: entries });
+        self.slots.insert(slot, SharedMapping { first_block, file, bytes, tables: entries });
         self.publish(slot, true);
         Self::flush();
-        (SHARED_BASE + slot * SHARED_LIMIT) as i64
+        (SHARED_BASE + first_block * BLOCK) as i64
     }
 
     pub fn unmap(&mut self, address: usize, bytes: usize) -> i64 {
         let Some(offset) = address.checked_sub(SHARED_BASE) else { return -22; };
-        if offset % SHARED_LIMIT != 0 || bytes == 0 || bytes > SHARED_LIMIT { return -22; }
-        let slot = offset / SHARED_LIMIT;
-        if self.slots.get(slot).and_then(Option::as_ref)
-            .is_none_or(|map| map.bytes != bytes.next_multiple_of(PAGE))
-        {
-            return -22;
-        }
+        if offset % BLOCK != 0 || bytes == 0 || bytes > SHARED_LIMIT { return -22; }
+        let Ok(slot) = self.slots.binary_search_by_key(&(offset / BLOCK), |m| m.first_block)
+            else { return -22; };
+        if self.slots[slot].bytes != bytes.next_multiple_of(PAGE) { return -22; }
         self.publish(slot, false);
         Self::flush();
-        self.slots[slot] = None;
+        self.slots.remove(slot);
         0
     }
 }

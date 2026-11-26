@@ -3,6 +3,7 @@
 #include "../console.h"
 #include "../file-time.h"
 #include <stdlib.h>
+#include <stdio.h>
 #include "../tcc/lixin.h"
 #include <stdint.h>
 #include <stddef.h>
@@ -46,8 +47,8 @@ typedef struct {
     int x, y, w, h;
 } Bounds;
 typedef struct {
-    Bounds rect, restored;
-    int open, shown, maximized;
+    Bounds rect, restored, before_fullscreen;
+    int open, shown, maximized, fullscreen;
 } Window;
 enum { ROW = 30, TITLE = 44, FILE_FOOTER = 41 };
 enum {
@@ -61,27 +62,12 @@ enum {
     OCHRE = 0xbc873f
 };
 static const char han[] = "文件夹上一级名称类型大小空目录页字节本编辑器终端";
-#ifdef __TINYC__
+#if defined(__TINYC__) || defined(LX_NETSURF)
 static unsigned char *desktop_font;
 void *malloc(unsigned long);
 static int load_font(void) {
-    const char *path = "/src/gui/menlo.gray";
-    long size = lx_stat(path);
-    if (size != (95 + (sizeof han - 1) / 3) * 18 * 22)
-        return -1;
-    int fd = lx_open(path);
-    if (fd < 0)
-        return -1;
-    desktop_font = malloc(size);
-    long offset = 0;
-    while (desktop_font && offset < size) {
-        int n = lx_read(fd, desktop_font + offset, size - offset);
-        if (n <= 0)
-            break;
-        offset += n;
-    }
-    lx_close(fd);
-    return offset == size ? 0 : -1;
+    desktop_font = lx_load_font_atlas("/src/gui/menlo.gray", (95 + (sizeof han - 1) / 3) * 18 * 22);
+    return desktop_font ? 0 : -1;
 }
 #else
 extern const unsigned char desktop_font[];
@@ -90,7 +76,8 @@ typedef struct {
     char *name;
     long size;
     unsigned modified;
-    int chosen;
+    int chosen, preview_checked;
+    uint32_t *preview;
 } Entry;
 enum FileColumn { BY_NAME, BY_TYPE, BY_SIZE, BY_DATE, FILE_COLUMNS };
 enum FileAction { F_OPEN, F_NEW_DIR, F_NEW_FILE, F_RENAME, F_COPY, F_CUT, F_PASTE,
@@ -110,10 +97,12 @@ typedef char FilePath[513];
 #include "file-history.h"
 typedef struct { FilePath source,target,origin; } FilePair;
 typedef struct { FilePair *items; int count,action,conflict; } FileBatch;
-enum AppGroup { GROUP_ALL, GROUP_SYSTEM, GROUP_EDIT, GROUP_TOOLS, GROUP_GAMES, GROUP_DEV, GROUP_OTHER, GROUP_COUNT };
-static const char *const group_labels[GROUP_COUNT] = {"全部","系统","编辑","工具","游戏","开发","其他"};
-enum LauncherIcon { ICON_FOLDER, ICON_GLOBE, ICON_CALC, ICON_TERMINAL, ICON_SHEET, ICON_PENCIL, ICON_STORE, ICON_GEAR, ICON_CHART, ICON_TILES, ICON_PLAY, ICON_CALENDAR, ICON_PIN, ICON_WATCH, ICON_PHOTO, ICON_MINE, ICON_MAHJONG, ICON_EYES, ICON_AGENT, ICON_CODE, ICON_COUNTER, ICON_WIDGETS, ICON_NUMBER };
-static const struct { unsigned color; unsigned short rows[16]; } launcher_icons[] = {
+enum AppGroup { GROUP_ALL, GROUP_SYSTEM, GROUP_EDIT, GROUP_TOOLS, GROUP_GAMES, GROUP_DEV, GROUP_TERMINAL, GROUP_OTHER, GROUP_COUNT };
+static const char *const group_labels[GROUP_COUNT] = {"全部","系统","编辑","工具","游戏","开发","终端","其他"};
+enum LauncherIcon { ICON_FOLDER, ICON_GLOBE, ICON_CALC, ICON_TERMINAL, ICON_SHEET, ICON_PENCIL, ICON_STORE, ICON_GEAR, ICON_CHART, ICON_TILES, ICON_PLAY, ICON_CALENDAR, ICON_PIN, ICON_WATCH, ICON_PHOTO, ICON_MINE, ICON_MAHJONG, ICON_EYES, ICON_AGENT, ICON_CODE, ICON_COUNTER, ICON_WIDGETS, ICON_NUMBER, ICON_RA2_RADAR, ICON_RA2_GEAR, ICON_RA2_TANK, ICON_YURI, ICON_WRITER, ICON_PDF, ICON_APPS, ICON_MEMORY, ICON_DISK, ICON_GIT, ICON_PYTHON, ICON_NODE, ICON_DOOM, ICON_CLASSICUBE, ICON_FREECAD, ICON_CODEX, ICON_PHYSICS, ICON_PAINT, ICON_NFS };
+static const struct { unsigned color; unsigned short rows[16]; } launcher_icons[ICON_NFS + 1] = {
+    [ICON_WRITER] = {0x3869ad, {0,0x0ff8,0x1818,0x3018,0x3ff8,0x2008,0x2fe8,0x2008,0x2fe8,0x2008,0x23e8,0x2008,0x3ff8,0,0,0}},
+    [ICON_PDF] = {0xb94c43, {0,0x0180,0x0240,0x0240,0x0240,0x0180,0x0380,0x0640,0x0c60,0x1ff0,0x63d8,0x40cc,0x003c,0x0018,0,0}},
     [ICON_FOLDER] = {0xe48c32, {0x0000,0x0000,0x0000,0x00fc,0x00fc,0x7ffe,0x7ffe,0x7ffe,0x7ffe,0x7ffe,0x7ffe,0x7ffe,0x7ffe,0x0000,0x0000,0x0000}},
     [ICON_GLOBE] = {0x247ab9, {0x0000,0x03c0,0x0ff0,0x1e78,0x342c,0x342c,0x6426,0x6426,0x7ffe,0x6426,0x342c,0x342c,0x1e78,0x0ff0,0x03c0,0x0000}},
     [ICON_CALC] = {0x378679, {0x0000,0x1ff8,0x1ff8,0x1818,0x1818,0x1818,0x1ff8,0x1ff8,0x1a58,0x1818,0x1818,0x1a58,0x1818,0x1ff8,0x1ff8,0x0000}},
@@ -137,20 +126,50 @@ static const struct { unsigned color; unsigned short rows[16]; } launcher_icons[
     [ICON_COUNTER] = {0xad6b44, {0x0000,0x0000,0x0380,0x03c0,0x03e0,0x0340,0x0300,0x0300,0x0300,0x0300,0x0300,0x0300,0x0300,0x0fe0,0x0fe0,0x0000}},
     [ICON_WIDGETS] = {0xb46f8c, {0x0000,0x0000,0x3e7c,0x3e7c,0x367c,0x3e7c,0x3e7c,0x0000,0x0000,0x3e7c,0x3e7c,0x3e6c,0x3e7c,0x3e7c,0x0000,0x0000}},
     [ICON_NUMBER] = {0xe2953d, {0x0000,0x0000,0x3e7c,0x3e7c,0x3e7c,0x3e7c,0x3e7c,0x0000,0x0000,0x3e7c,0x3e7c,0x3e7c,0x3e7c,0x3e7c,0x0000,0x0000}},
+    [ICON_RA2_RADAR] = {0x347052, {0x0000,0x07e0,0x1818,0x2004,0x4182,0x4242,0x8421,0x8811,0x8fc1,0x8001,0x8211,0x4182,0x2004,0x1818,0x07e0,0x0000}},
+    [ICON_RA2_GEAR] = {0x496886, {0x0000,0x0180,0x1998,0x1ff8,0x0ff0,0x3c3c,0x781e,0x719e,0x719e,0x781e,0x3c3c,0x0ff0,0x1ff8,0x1998,0x0180,0x0000}},
+    [ICON_RA2_TANK] = {0xa74438, {0x0000,0x0000,0x0180,0x07e0,0x07ff,0x07e0,0x1ff8,0x3ffc,0x7ffe,0x6006,0x6db6,0x6db6,0x3ffc,0x0000,0x0000,0x0000}},
+    [ICON_YURI] = {0x784a86, {0x0000,0x03c0,0x0660,0x0180,0x2184,0x318c,0x318c,0x318c,0x399c,0x1ff8,0x0ff0,0x0180,0x0180,0x03c0,0x07e0,0x0000}},
+    [ICON_APPS] = {0x37776d, {0x0000,0x0000,0x3e7c,0x3e7c,0x367c,0x3e7c,0x3e7c,0x0000,0x0000,0x3e7c,0x3e7c,0x3e6c,0x3e7c,0x3e7c,0x0000,0x0000}},
+    [ICON_MEMORY] = {0x2f7d62, {0x0000,0x3ffc,0x300c,0x37ec,0x37ec,0x300c,0x37ec,0x37ec,0x300c,0x37ec,0x37ec,0x300c,0x3ffc,0x0000,0x0000,0x0000}},
+    [ICON_DISK] = {0x5b6b74, {0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000}},
+    [ICON_GIT] = {0xb33a2f, {0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000}},
+    [ICON_PYTHON] = {0x356a92, {0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000}},
+    [ICON_NODE] = {0x437a3b, {0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000}},
+    [ICON_DOOM] = {0x5a4a44, {0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000}},
+    [ICON_CLASSICUBE] = {0x5f8f3b, {0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000}},
+    [ICON_FREECAD] = {0xa33a34, {0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000}},
+    [ICON_CODEX] = {0x1f2a30, {0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000}},
+    [ICON_PHYSICS] = {0x6b4aa0, {0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000}},
+    [ICON_PAINT] = {0xb35a7a, {0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000}},
+    [ICON_NFS] = {0xb3372f, {0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000}},
 };
-typedef struct { const char *file, *title; enum AppGroup group; enum LauncherIcon icon; } AppInfo;
+enum LaunchMode { LAUNCH_CLIENT, LAUNCH_TERMINAL = -4, LAUNCH_CANVAS = -5 };
+typedef struct {
+    const char *file, *title;
+    enum AppGroup group;
+    enum LauncherIcon icon;
+    enum LaunchMode mode;
+    const char *command;
+} AppInfo;
 static const AppInfo catalog[] = {
+#define PROGRAM(file,title,group,icon,mode,command) {file,title,group,icon,mode,command},
+#include "launcher-programs.def"
+#undef PROGRAM
+    {"dsh-gui.win3","DeepSeek 图形助手",GROUP_DEV,ICON_AGENT},
+    {"writer.win3","LibreOffice Writer",GROUP_EDIT,ICON_WRITER},
+    {"pdfview.win3","PDF 阅读器",GROUP_EDIT,ICON_PDF},
     {"app-store.win3","应用商店",GROUP_SYSTEM,ICON_STORE},
     {"settings.win3","系统设置",GROUP_SYSTEM,ICON_GEAR}, {"settings.win2","系统设置",GROUP_SYSTEM,ICON_GEAR},
     {"tasks.win2","任务管理器",GROUP_SYSTEM,ICON_CHART}, {"nautilus.win3","Nautilus",GROUP_SYSTEM,ICON_FOLDER},
     {"lite-xl.win3","Lite XL",GROUP_EDIT,ICON_PENCIL}, {"mousepad.win3","Mousepad",GROUP_EDIT,ICON_SHEET},
-    {"physics.win3","物理仿真器",GROUP_TOOLS,ICON_CHART},
+    {"physics.win3","物理仿真器",GROUP_TOOLS,ICON_PHYSICS}, {"freecad-part.win3","FreeCAD Part",GROUP_TOOLS,ICON_FREECAD}, {"simulate.win3","MuJoCo",GROUP_TOOLS,ICON_WIDGETS},
     {"video.win3","视频播放器",GROUP_TOOLS,ICON_PLAY}, {"calendar.win2","日历",GROUP_TOOLS,ICON_CALENDAR}, {"map.win2","地图",GROUP_TOOLS,ICON_PIN},
     {"stopwatch.win2","秒表",GROUP_TOOLS,ICON_WATCH}, {"ristretto.win3","Ristretto",GROUP_TOOLS,ICON_PHOTO},
     {"2048.win3","2048",GROUP_GAMES,ICON_NUMBER}, {"tetravex.win3","数字拼图",GROUP_GAMES,ICON_TILES},
     {"mines.win3","扫雷",GROUP_GAMES,ICON_MINE}, {"mahjongg.win3","麻将接龙",GROUP_GAMES,ICON_MAHJONG},
     {"nxeyes","Eyes",GROUP_GAMES,ICON_EYES}, {"agent.win3","Agent",GROUP_DEV,ICON_AGENT},
-    {"gtk3-demo.win3","GTK 3 示例",GROUP_DEV,ICON_CODE}, {"counter.win","计数器示例",GROUP_DEV,ICON_COUNTER},
+    {"gtk3-demo.win3","GTK 3 示例",GROUP_DEV,ICON_WIDGETS}, {"counter.win","计数器示例",GROUP_DEV,ICON_COUNTER},
     {"widgets-demo.win3","控件示例",GROUP_DEV,ICON_WIDGETS}
 };
 static const AppInfo dock_apps[] = {
@@ -167,19 +186,23 @@ static const AppInfo *app_info(const char *name) {
 typedef struct {
     uint32_t *pixels;
     int w, h, first, count, failed;
-    int capacity, sort_column, descending;
+    int capacity, sort_column, descending, file_grid;
     Window windows[APPS];
     WindowClient *clients;
     char client_path[CLIENT_LIMIT][513];
     int wallpaper, wallpaper_menu, wallpaper_x, wallpaper_y;
     uint32_t *wall_image;
     FilePath wall_file;
-    int client_grab;
+    int client_grab, secondary_grab, raw_buttons;
+    FilePath file_drag;
     int menu, app_count, app_capacity, app_scroll;
     int app_press_x, app_press_y, app_press_scroll, app_dragged;
     enum AppGroup app_group;
     unsigned app_totals[GROUP_COUNT];
     LauncherApp *apps;
+    int *matches, match_count, app_selected;
+    char query[192];
+    UiText search_input;
     int order[APPS], captured;
     char cwd[513];
     int mx, my, inside, down;
@@ -211,6 +234,63 @@ static uint32_t blend(uint32_t bg, uint32_t fg, unsigned a) {
     unsigned rb = (((bg & 0xff00ff) * (256 - a) + (fg & 0xff00ff) * a) >> 8) & 0xff00ff;
     unsigned g = (((bg & 0xff00) * (256 - a) + (fg & 0xff00) * a) >> 8) & 0xff00;
     return rb | g;
+}
+
+/* Optional full-colour icon bank, installed as /lib/netsurf/launcher-icons.bin.
+ * The desktop keeps the flat fallback glyphs when the file is absent. */
+static uint32_t *launcher_art;
+static unsigned launcher_art_count, launcher_art_grid, launcher_art_dock;
+static int load_launcher_art(void) {
+    int fd = lx_open("/lib/netsurf/launcher-icons.bin");
+    uint32_t head[4];
+    if (fd < 0) return -1;
+    if (lx_read(fd, head, sizeof head) != (int)sizeof head || head[0] != 0x3149584cU) {
+        lx_close(fd);
+        return -1;
+    }
+    unsigned count = head[1], grid = head[2], dock = head[3];
+    if (!count || count > 64 || grid < 32 || grid > 128 || dock < 16 || dock > 128) {
+        lx_close(fd);
+        return -1;
+    }
+    size_t bytes = (size_t)count * ((size_t)grid * grid + (size_t)dock * dock) * 4;
+    uint32_t *art = malloc(bytes);
+    size_t used = 0;
+    while (art && used < bytes) {
+        int n = lx_read(fd, (char *)art + used, bytes - used);
+        if (n <= 0) break;
+        used += (size_t)n;
+    }
+    lx_close(fd);
+    if (!art || used != bytes) { free(art); return -1; }
+    launcher_art = art;
+    launcher_art_count = count;
+    launcher_art_grid = grid;
+    launcher_art_dock = dock;
+    return 0;
+}
+static void draw_launcher_art(Desktop *d, int x, int y, int size, int icon) {
+    if (!launcher_art || icon < 0 || (unsigned)icon >= launcher_art_count) return;
+    const uint32_t *p = launcher_art;
+    if (size == (int)launcher_art_dock)
+        p += (size_t)launcher_art_count * launcher_art_grid * launcher_art_grid;
+    else if (size != (int)launcher_art_grid)
+        return;
+    p += (size_t)icon * size * size;
+    for (int j = 0; j < size; ++j) {
+        int row = y + j;
+        if (row < 0 || row >= d->h) { p += size; continue; }
+        uint32_t *out = d->pixels + (size_t)row * d->w;
+        for (int i = 0; i < size; ++i) {
+            uint32_t c = *p++;
+            unsigned a = c >> 24;
+            int column = x + i;
+            if (a && column >= 0 && column < d->w) {
+                uint32_t *q = out + column;
+                *q = a == 255 ? (c & 0xffffff) : blend(*q, c & 0xffffff, a);
+            }
+        }
+    }
 }
 static int label_advance(unsigned code, const unsigned char **latin) {
     if (han_slot(code) >= 0) return 18;
@@ -311,7 +391,30 @@ static void number(char *out, unsigned long n) {
         *out++ = rev[--i];
     *out = 0;
 }
-static int file_rows(Desktop *d) { return (d->windows[FILE_WIN].rect.h - FILE_FOOTER - 80) / ROW; }
+enum { TILE_HEIGHT=88, PREVIEW_W=74, PREVIEW_H=50 };
+static int sidebar(Bounds r);
+static int file_cols(Desktop *d) {
+    Bounds r=d->windows[FILE_WIN].rect;
+    int cols=(r.w-sidebar(r)-12)/110;
+    return d->file_grid && cols>1 ? cols : 1;
+}
+static int file_rows(Desktop *d) {
+    int height=d->windows[FILE_WIN].rect.h-FILE_FOOTER-80;
+    int rows=height/(d->file_grid?TILE_HEIGHT:ROW);
+    return (rows>0?rows:1)*file_cols(d);
+}
+static int file_slots(Desktop *d) {
+    int cols=file_cols(d);
+    return (d->count+cols-1)/cols*cols;
+}
+static int file_at(Desktop *d,Bounds r,int x,int y) {
+    int side=sidebar(r), cols=file_cols(d);
+    if (x<side || x>=r.w-12 || y<80 || y>=r.h-FILE_FOOTER) return -1;
+    int col=d->file_grid ? (x-side)/((r.w-side-12)/cols) : 0;
+    int i=(y-80)/(d->file_grid?TILE_HEIGHT:ROW)*cols+col;
+    if (col>=cols || i>=file_rows(d) || d->first+i>=d->count) return -1;
+    return d->first+i;
+}
 static unsigned fold_ascii(unsigned char c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
 static int name_matches(const char *name, const char *query) {
     for (; *name; ++name) {
@@ -372,21 +475,34 @@ static void sort_files(Desktop *d) {
     }
 }
 static void clear_files(Desktop *d) {
-    for (int i = 0; i < d->count; ++i) free(d->rows[i].name);
+    for (int i=0;i<d->count;i++) {
+        free(d->rows[i].name);
+        free(d->rows[i].preview);
+    }
     d->count = 0;
     d->marked = d->range_anchor = -1;
     d->chosen=0;
     d->clicked_at = -1;
 }
 static int scroll_files(Desktop *d, int first) {
-    int next = ui_list_top(first,d->count,file_rows(d));
+    int cols=file_cols(d);
+    int next=ui_list_top(first,file_slots(d),file_rows(d))/cols*cols;
     if (next == d->first) return 0;
+    int end=min(d->count,d->first+file_rows(d));
+    for (int i=d->first;i<end;i++) {
+        if (i>=next && i<next+file_rows(d)) continue;
+        free(d->rows[i].preview);
+        d->rows[i].preview=NULL;
+        d->rows[i].preview_checked=0;
+    }
     d->first = next;
     d->clicked_at = -1;
     return 1;
 }
 static void reveal_selection(Desktop *d) {
-    scroll_files(d,ui_list_reveal(d->first,d->marked,d->count,file_rows(d)));
+    int cols=file_cols(d);
+    int row=ui_list_reveal(d->first/cols,d->marked/cols,file_slots(d)/cols,file_rows(d)/cols);
+    scroll_files(d,row*cols);
 }
 static void load(Desktop *d) {
     clear_files(d);
@@ -481,6 +597,7 @@ static int window_app_name(const char *name) {
 static const char *window_name(Desktop *d, int id) {
     static const char *const builtins[] = {"Files", "Browser", "Calculator"};
     if (id < FIRST_CLIENT) return builtins[id];
+    if (d->clients[id-FIRST_CLIENT].title[0]) return d->clients[id-FIRST_CLIENT].title;
     const char *path = d->client_path[id - FIRST_CLIENT];
     const char *name = strrchr(path, '/') + 1;
     const AppInfo *info = app_info(name);
@@ -512,15 +629,31 @@ static void scan_apps(Desktop *d) {
         char name[513];
         long size = lx_dir("/bin", i, name);
         if (size == LX_END || size < LX_DIR) break;
+        const AppInfo *info = app_info(name);
         if (size == LX_DIR || !strcmp(name,"agent.win3")
-            || (!window_app_name(name) && strcmp(name, "nxeyes")) || strlen(name) > 507)
+            || (!info && !window_app_name(name)) || strlen(name) > 507)
             continue;
-        if (!list_app(d,name,app_info(name),-1)) goto full;
+        if (!list_app(d,name,info,-1)) goto full;
     }
     if (!d->app_totals[d->app_group]) d->app_group = GROUP_ALL;
     return;
 full:
     strcpy(d->message,"内存不足，应用列表未完整加载");
+}
+#include "launcher-search.h"
+static void filter_apps(Desktop *d) {
+    d->match_count=0;
+    d->app_selected=0;
+    d->app_scroll=0;
+    if (!d->matches) return;
+    char spelling[sizeof d->query];
+    normalize_query(d->query,spelling);
+    for (int i=0;i<d->app_count;i++) {
+        LauncherApp *app=&d->apps[i];
+        enum AppGroup group=app->info ? app->info->group : GROUP_OTHER;
+        if (d->app_group!=GROUP_ALL && group!=d->app_group) continue;
+        if (app_matches(app,d->query,spelling)) d->matches[d->match_count++]=i;
+    }
 }
 static void show_menu(Desktop *d, int menu) {
     d->menu = menu;
@@ -528,6 +661,11 @@ static void show_menu(Desktop *d, int menu) {
         d->app_scroll = 0;
         d->app_dragged = 1;
         scan_apps(d);
+        free(d->matches);
+        d->matches=malloc(d->app_count*sizeof *d->matches);
+        d->query[0]=0;
+        ui_text_begin(&d->search_input,d->query,0);
+        filter_apps(d);
     }
 }
 static int eye_window(Desktop *d) {
@@ -543,6 +681,8 @@ static int focus(Desktop *d);
 static void dock(Desktop *d) {
     static const char *const names[] = {"Files", "Browser", "Calc", "Terminal", "Nano", "Editor", "Eyes", "Apps"};
     static const unsigned colors[] = {0xd78938, 0x3275ab, 0x447e70, 0x44374d, 0x8e5064, 0x576aa1, 0x70568c, 0x37776d};
+    static const unsigned char icons[DOCK_ITEMS] = {ICON_FOLDER, ICON_GLOBE, ICON_CALC, ICON_TERMINAL,
+                                                    ICON_SHEET, ICON_PENCIL, ICON_EYES, ICON_APPS};
     box(d, 0, 0, DOCK, d->h, 0x281e2b);
     box(d, DOCK - 1, 0, 1, d->h, 0x5b4050);
     for (int i = 0; i < DOCK_ITEMS; i++) {
@@ -553,32 +693,36 @@ static void dock(Desktop *d) {
             if (d->windows[id].shown && focus(d) == id)
                 roundbox(d, 7, y - 2, 62, step(d) - 3, 8, 0x50404e);
         }
-        roundbox(d, x, y + 2, 40, 38, 8, colors[i]);
-        if (i == 0)
-            folder(d, x + 2, y + 8, 2);
-        else if (i == 1) {
-            disk(d, x + 20, y + 21, 13, 0xcbf0f1);
-            disk(d, x + 20, y + 21, 10, colors[i]);
-            box(d, x + 8, y + 20, 25, 2, 0xcbf0f1);
-            box(d, x + 19, y + 9, 2, 25, 0xcbf0f1);
-        } else if (i == 2) {
-            box(d, x + 9, y + 9, 22, 7, 0xeaf4e8);
-            for (int k = 0; k < 6; k++)
-                box(d, x + 9 + (k % 3) * 8, y + 20 + (k / 3) * 7, 5, 4, 0xeaf4e8);
-        } else if (i == 3)
-            label(d, x + 8, y + 10, 26, ">_", 0xf3e8eb);
-        else if (i == EYES_ICON) {
-            for (int dx = 12; dx <= 28; dx += 16) {
-                disk(d, x + dx, y + 21, 7, PAPER);
-                disk(d, x + dx + 2, y + 21, 3, INK);
-            }
-        } else if (i == APPS_ICON) {
-            for (int j = 0; j < 4; ++j)
-                box(d, x + 9 + 12 * (j % 2), y + 10 + 12 * (j / 2), 9, 9, PAPER);
+        if (launcher_art) {
+            draw_launcher_art(d, x - 1, y - 1, launcher_art_dock, icons[i]);
         } else {
-            box(d, x + 11, y + 8, 18, 24, PAPER);
-            for (int k = 0; k < 3; k++)
-                box(d, x + 14, y + 14 + 5 * k, 12 - 2 * k, 1, colors[i]);
+            roundbox(d, x, y + 2, 40, 38, 8, colors[i]);
+            if (i == 0)
+                folder(d, x + 2, y + 8, 2);
+            else if (i == 1) {
+                disk(d, x + 20, y + 21, 13, 0xcbf0f1);
+                disk(d, x + 20, y + 21, 10, colors[i]);
+                box(d, x + 8, y + 20, 25, 2, 0xcbf0f1);
+                box(d, x + 19, y + 9, 2, 25, 0xcbf0f1);
+            } else if (i == 2) {
+                box(d, x + 9, y + 9, 22, 7, 0xeaf4e8);
+                for (int k = 0; k < 6; k++)
+                    box(d, x + 9 + (k % 3) * 8, y + 20 + (k / 3) * 7, 5, 4, 0xeaf4e8);
+            } else if (i == 3)
+                label(d, x + 8, y + 10, 26, ">_", 0xf3e8eb);
+            else if (i == EYES_ICON) {
+                for (int dx = 12; dx <= 28; dx += 16) {
+                    disk(d, x + dx, y + 21, 7, PAPER);
+                    disk(d, x + dx + 2, y + 21, 3, INK);
+                }
+            } else if (i == APPS_ICON) {
+                for (int j = 0; j < 4; ++j)
+                    box(d, x + 9 + 12 * (j % 2), y + 10 + 12 * (j / 2), 9, 9, PAPER);
+            } else {
+                box(d, x + 11, y + 8, 18, 24, PAPER);
+                for (int k = 0; k < 3; k++)
+                    box(d, x + 14, y + 14 + 5 * k, 12 - 2 * k, 1, colors[i]);
+            }
         }
         label(d, (DOCK - label_width(names[i])) / 2, y + min(41, step(d) - 21), DOCK, names[i], 0xf7f0f2);
     }
@@ -688,7 +832,11 @@ static Bounds action_rect(Bounds r, int a) {
     return (Bounds){r.x+12+a%3*w,r.y+50+a/3*h,w-4,h-2};
 }
 /* Column positions are shared by painting and header hit testing. */
-static void file_columns(int width, int x[FILE_COLUMNS+1]) {
+static void file_columns(int width,int grid,int x[FILE_COLUMNS+1]) {
+    if (grid) {
+        for (int c=0;c<=FILE_COLUMNS;c++) x[c]=50+(width-62)*c/FILE_COLUMNS;
+        return;
+    }
     x[FILE_COLUMNS] = width-12;
     x[BY_DATE] = x[FILE_COLUMNS] - (width >= 640 ? 159 : 97);
     x[BY_SIZE] = x[BY_DATE] - (width >= 400 ? 83 : 65);
@@ -712,8 +860,37 @@ static void format_size(char out[32], long bytes) {
 static Bounds file_thumb(Desktop *d, Bounds r) {
     int height = r.h - 80 - FILE_FOOTER;
     int visible = file_rows(d);
-    UiThumb thumb=ui_list_thumb(d->first,d->count,visible,height);
+    UiThumb thumb=ui_list_thumb(d->first,file_slots(d),visible,height);
     return (Bounds){r.x+r.w-8,r.y+80+thumb.start,5,thumb.length};
+}
+static uint32_t *load_scaled_image(const char *path,int width,int height,int fit);
+static int image_name(const char *name) {
+    const char *ext=strrchr(name,'.');
+    return ext && (!compare_text(ext,".png") || !compare_text(ext,".jpg") || !compare_text(ext,".jpeg"));
+}
+static void file_tile(Desktop *d,Entry *e,Bounds tile) {
+    if (e->chosen) roundbox(d,tile.x+2,tile.y+1,tile.w-4,tile.h-2,7,0xcde5df);
+    int cx=tile.x+tile.w/2,y=tile.y+6;
+    if (!e->preview_checked) {
+        e->preview_checked=1;
+        if (e->size>0 && image_name(e->name)) {
+            FilePath path;
+            int n=snprintf(path,sizeof path,"%s%s%s",d->path,strcmp(d->path,"/")?"/":"",e->name);
+            if (n>=0 && n<(int)sizeof path) e->preview=load_scaled_image(path,PREVIEW_W,PREVIEW_H,1);
+        }
+    }
+    if (e->preview) {
+        int left=cx-PREVIEW_W/2;
+        for (int j=0;j<PREVIEW_H;j++)
+            if (left>=0 && left+PREVIEW_W<=d->w && y+j>=0 && y+j<d->h)
+                memcpy(d->pixels+(y+j)*d->w+left,e->preview+j*PREVIEW_W,PREVIEW_W*sizeof(uint32_t));
+    } else if (e->size==LX_DIR) folder(d,cx-18,y+12,2);
+    else {
+        roundbox(d,cx-16,y+5,32,41,4,image_name(e->name)?0x6887a0:0x819b98);
+        for (int j=0;j<3;j++) box(d,cx-10,y+15+6*j,j==2?11:20,2,PAPER);
+    }
+    int width=min(tile.w-10,label_width(e->name));
+    label(d,cx-width/2,tile.y+60,width,e->name,INK);
 }
 static void draw_files(Desktop *d, Bounds r) {
     int l = r.x, t = r.y, w = r.w, bottom = t + r.h - 41;
@@ -745,11 +922,14 @@ static void draw_files(Desktop *d, Bounds r) {
     l += side;
     w -= side;
     int col[FILE_COLUMNS+1];
-    file_columns(w,col);
+    file_columns(w,d->file_grid,col);
+    if (d->file_grid) label(d,l+8,t+51,40,"排序",MUTED);
     static const char *const headers[] = {"名称","类型","大小","修改日期"};
     for (int c = 0; c < FILE_COLUMNS; ++c) {
-        int x = l+col[c]+(c == BY_NAME ? 15 : 3);
-        const char *title = headers[c];
+        int x = l+col[c]+(d->file_grid?6:c==BY_NAME?15:3);
+        const char *title = d->file_grid && c==BY_DATE ? "日期" : headers[c];
+        if (d->file_grid && d->sort_column==c)
+            roundbox(d,l+col[c],t+47,col[c+1]-col[c]-4,26,6,BAR);
         label(d,x,t+51,col[c+1]-col[c]-8,title,d->sort_column == c ? INK : MUTED);
         if (d->sort_column == c) {
             int tip = x+label_width(title)+3;
@@ -760,6 +940,11 @@ static void draw_files(Desktop *d, Bounds r) {
     box(d, l, t + 77, w, 1, LINE);
     int end = min(d->count,d->first + file_rows(d));
     for (int i = d->first; i < end; ++i) {
+        if (d->file_grid) {
+            int cols=file_cols(d), width=(w-12)/cols, idx=i-d->first;
+            file_tile(d,&d->rows[i],(Bounds){l+idx%cols*width,t+80+idx/cols*TILE_HEIGHT,width,TILE_HEIGHT});
+            continue;
+        }
         int y = t + 80 + (i-d->first) * ROW;
         Entry *e = &d->rows[i];
         if (e->chosen) roundbox(d,l+3,y,w-15,ROW-1,4,0xcde5df);
@@ -794,7 +979,9 @@ static void draw_files(Desktop *d, Bounds r) {
     roundbox(d, l+8, bottom+6, 64, 28, 5, 0xd4e4d9);
     label(d, l+20, bottom+9, 48, "操作", INK);
     label(d, l+82, bottom+9, 54, "筛选", INK);
-    label(d, l+139, bottom+9, w-278, d->filter, MUTED);
+    roundbox(d,l+138,bottom+6,56,28,5,BAR);
+    label(d,l+148,bottom+9,40,d->file_grid?"列表":"图标",INK);
+    label(d,l+202,bottom+9,w-344,d->filter,MUTED);
     char total[96];
     if (d->chosen) {
         unsigned long bytes=0;
@@ -802,7 +989,7 @@ static void draw_files(Desktop *d, Bounds r) {
         strcpy(total,"已选 "); number(total+strlen(total),d->chosen); strcat(total," 项，共 ");
         format_size(total+strlen(total),bytes);
     } else { number(total,d->count); strcat(total," 项"); }
-    int room=w-148,width=min(room,label_width(total));
+    int room=w-207,width=min(room,label_width(total));
     label(d,l+w-12-width,bottom+9,width,total,MUTED);
 }
 static Bounds button_rect(Bounds r, int i) {
@@ -839,7 +1026,7 @@ static Bounds grid_cell(Desktop *d, int index) {
                     GRID_TOP + index / columns * GRID_ROW - d->app_scroll, width, GRID_ROW};
 }
 static int grid_limit(Desktop *d) {
-    int cols = grid_columns(d), rows = (d->app_totals[d->app_group] + cols - 1) / cols;
+    int cols = grid_columns(d), rows = (d->match_count + cols - 1) / cols;
     int limit = GRID_TOP + rows * GRID_ROW + 12 - d->h;
     return limit > 0 ? limit : 0;
 }
@@ -848,9 +1035,6 @@ static int grid_scroll(Desktop *d, int offset) {
     if (next == d->app_scroll) return 0;
     d->app_scroll = next;
     return 1;
-}
-static int grid_visible(Desktop *d, LauncherApp *app) {
-    return d->app_group == GROUP_ALL || d->app_group == (app->info ? app->info->group : GROUP_OTHER);
 }
 static Bounds group_button(Desktop *d, int group) {
     int count = 0, index = 0;
@@ -864,29 +1048,40 @@ static Bounds group_button(Desktop *d, int group) {
 static void grid_icon(Desktop *d, LauncherApp *app, Bounds cell) {
     const AppInfo *info = app->info;
     int icon = info ? info->icon : ICON_WIDGETS;
-    unsigned color = launcher_icons[icon].color;
-    int x = cell.x + cell.w/2 - 37, y = cell.y + 10;
-    roundbox(d,x,y+3,74,74,17,0x183344);
-    roundbox(d,x,y,74,74,17,color);
-    for (int row = 0; row < 16; ++row) {
-        unsigned bits = launcher_icons[icon].rows[row];
-        for (int col = 0; col < 16; ++col)
-            if (bits & (1u << col)) box(d,x+13+3*col,y+13+3*row,3,3,0xfffcf2);
+    int x = cell.x + cell.w/2 - 38, y = cell.y + 8;
+    if (launcher_art) {
+        draw_launcher_art(d,x,y,launcher_art_grid,icon);
+    } else {
+        unsigned color = launcher_icons[icon].color;
+        roundbox(d,x,y+3,74,74,17,0x183344);
+        roundbox(d,x,y,74,74,17,color);
+        for (int row = 0; row < 16; ++row) {
+            unsigned bits = launcher_icons[icon].rows[row];
+            for (int col = 0; col < 16; ++col)
+                if (bits & (1u << col)) box(d,x+13+3*col,y+13+3*row,3,3,0xfffcf2);
+        }
     }
     const char *title = info ? info->title : app->name;
     int width = min(cell.w-8,label_width(title));
     label(d,cell.x+(cell.w-width)/2,y+82,width,title,0xf4f8fa);
+    if (info && info->mode == LAUNCH_TERMINAL) {
+        width = min(cell.w-8,label_width(info->command));
+        label(d,cell.x+(cell.w-width)/2,y+104,width,info->command,0xcadadd);
+    }
 }
 static void draw_launcher(Desktop *d) {
     for (int y = 0; y < d->h; y += 4)
         box(d,0,y,d->w,4,blend(0x203f51,0x294d5e,y*255/d->h));
-    int shown = 0;
-    for (int i = 0; i < d->app_count; ++i) {
-        if (!grid_visible(d,&d->apps[i])) continue;
-        Bounds cell = grid_cell(d,shown++);
-        if (cell.y >= d->h) break;
-        if (cell.y + GRID_ROW > GRID_TOP) grid_icon(d,&d->apps[i],cell);
+    for (int i=0;i<d->match_count;i++) {
+        Bounds cell=grid_cell(d,i);
+        if (cell.y>=d->h) break;
+        if (cell.y+GRID_ROW<=GRID_TOP) continue;
+        if ((d->query[0] || d->app_selected) && i==d->app_selected)
+            roundbox(d,cell.x+4,cell.y+5,cell.w-8,GRID_ROW-9,12,0x3b6173);
+        grid_icon(d,&d->apps[d->matches[i]],cell);
     }
+    if (!d->match_count) label(d,GRID_PAD,GRID_TOP+24,d->w-2*GRID_PAD,
+        d->matches ? "没有匹配的应用" : "内存不足",PAPER);
     int limit = grid_limit(d);
     if (limit) {
         int track = d->h-GRID_TOP-12, thumb = track*track/(track+limit);
@@ -894,7 +1089,22 @@ static void draw_launcher(Desktop *d) {
         box(d,d->w-10,GRID_TOP+(track-thumb)*d->app_scroll/limit,3,thumb,0x87a6ae);
     }
     box(d,0,0,d->w,GRID_TOP,0x203f51);
-    label(d,GRID_PAD,20,120,"应用程序",PAPER);
+    int sx=d->w>=580 ? 140 : GRID_PAD;
+    if (sx>GRID_PAD) label(d,GRID_PAD,20,110,"应用程序",PAPER);
+    int sw=min(440,d->w-160-sx);
+    if (sw>36) {
+        roundbox(d,sx,12,sw,36,12,0x36596a);
+        const char *str=d->query;
+        disk(d,sx+15,27,6,0xc6e4dc);
+        disk(d,sx+15,27,4,0x36596a);
+        for (int i=0;i<5;i++) box(d,sx+19+i,31+i,2,2,0xc6e4dc);
+        while (*str && label_width(str)>sw-41) utf8_next(&str);
+        if (d->query[0] && d->search_input.caret!=d->search_input.anchor)
+            box(d,sx+29,17,label_width(str),26,0x4c788b);
+        label(d,sx+29,19,sw-39,d->query[0]?str:"搜索应用 · 中文 / 拼音",PAPER);
+        if (d->query[0] && d->search_input.caret==d->search_input.anchor)
+            box(d,sx+30+label_width(str),20,1,21,0xc6e4dc);
+    }
     roundbox(d,d->w-148,14,60,32,12,0x34576a);
     label(d,d->w-136,19,40,"窗口",PAPER);
     roundbox(d,d->w-78,14,60,32,12,0x426978);
@@ -1070,9 +1280,10 @@ static void render(Desktop *d) {
 #endif
         if (id >= FIRST_CLIENT) {
             WindowClient *client = &d->clients[id - FIRST_CLIENT];
-            titlebar(d, r.x, r.y, r.w, window_name(d, id), 0);
+            if (!win->fullscreen) titlebar(d, r.x, r.y, r.w, window_name(d, id), 0);
             draw_surface(d, client, r);
         }
+        if (win->fullscreen) continue;
         controls(d, r);
         for (int n = 0; n < 3; n++)
             box(d, r.x + r.w - 5 - n * 3, r.y + r.h - 4, 2, 2, 0x87938e);
@@ -1165,7 +1376,7 @@ static void launch(Desktop *d, int action) {
     }
 #endif
     d->terminals = mail[0];
-    if (!action || d->selected > d->terminals)
+    if (!action || action == LAUNCH_TERMINAL || d->selected > d->terminals)
         d->selected = d->terminals;
     unsigned n = 0;
     while (n + 1 < sizeof(d->message) && ((char *)(mail + 2))[n]) {
@@ -1213,6 +1424,7 @@ static void close_window(Desktop *d, int id) {
     if (id >= FIRST_CLIENT)
         client_close(&d->clients[id - FIRST_CLIENT]);
     if (d->client_grab == id) d->client_grab = -1;
+    if (d->secondary_grab == id) d->secondary_grab = -1;
 #ifndef __TINYC__
     if (id == WEB_WIN)
         desk_web_close();
@@ -1223,7 +1435,22 @@ static void configure_window(Desktop *d, int id) {
     WindowClient *c = &d->clients[id - FIRST_CLIENT];
     Bounds r = d->windows[id].rect;
     if (c->adaptive) client_event(c, (WindowEvent){WINDOW_CLIENT_CONFIGURE, r.w, r.h-TITLE,
-        c->extended ? WINDOW_CLIENT_RIGHT_CLICK_AVAILABLE : 0});
+        c->extended ? WINDOW_CLIENT_RIGHT_CLICK_AVAILABLE | WINDOW_CLIENT_VIEWER_AVAILABLE | WINDOW_CLIENT_FILE_DROP_AVAILABLE |
+#ifdef LX_NETSURF
+            WINDOW_CLIENT_OPEN_URL_AVAILABLE |
+#endif
+            (d->raw_buttons ? WINDOW_CLIENT_RAW_BUTTONS_AVAILABLE : 0) : 0});
+}
+static void toggle_maximize(Desktop *d,int id) {
+    Window *win=&d->windows[id];
+    if (win->maximized)
+        win->rect = win->restored;
+    else {
+        win->restored = win->rect;
+        win->rect = (Bounds){DOCK, 0, d->w - DOCK, d->h};
+    }
+    win->maximized = !win->maximized;
+    configure_window(d, id);
 }
 static int install_agent_window(void) {
     static const char arguments[] = "/\0/bin/tcc\0tcc\0/src/desktop/agent-panel.c\0-o\0/bin/agent.win3";
@@ -1245,8 +1472,9 @@ static void open_client(Desktop *d, const char *path, const char *argument) {
             return;
         }
         int id = FIRST_CLIENT + i;
-        int w = min(client->extended ? 720 : 360, d->w - DOCK - 12);
-        int h = min(client->extended ? 480 : 246, d->h - 12);
+        int viewer = !strcmp(path,"/bin/simulate.win3");
+        int w = min(viewer ? 1120 : client->extended ? 720 : 360, d->w - DOCK - 12);
+        int h = min(viewer ? 740 : client->extended ? 480 : 246, d->h - 12);
         int x = DOCK + (d->w - DOCK - w) / 2, y = (d->h - h) / 2;
         d->windows[id] = (Window){.rect = {min(x + i*28, d->w-w), min(y + i*28, d->h-h), w, h},
                                   .open = 1, .shown = 1};
@@ -1259,6 +1487,21 @@ static void open_client(Desktop *d, const char *path, const char *argument) {
     strcpy(d->message, "All four application windows are in use");
 }
 static int click(Desktop *d, int x, int y);
+static void launch_app(Desktop *d,LauncherApp *app) {
+    d->menu = MENU_CLOSED;
+    if (app->dock_id >= 0) click(d,DOCK/2,8+app->dock_id*step(d)+20);
+    else if (app->info && app->info->mode != LAUNCH_CLIENT) {
+        if (app->info->mode == LAUNCH_CANVAS) {
+            strcpy(d->filename,"/bin/");
+            strcat(d->filename,app->name);
+        } else strcpy(d->filename,app->info->command);
+        launch(d,app->info->mode);
+    } else {
+        FilePath path = "/bin/";
+        strcat(path,app->name);
+        open_client(d,path,NULL);
+    }
+}
 static void menu_click(Desktop *d, int x, int y) {
     if (d->menu == MENU_APPS) {
         if (y >= 14 && y < 46 && x >= d->w-148 && x < d->w-88)
@@ -1269,25 +1512,17 @@ static void menu_click(Desktop *d, int x, int y) {
             for (int i = 0; i < GROUP_COUNT; ++i) {
                 if (d->app_totals[i] && contains(group_button(d,i),x,y)) {
                     d->app_group = i;
-                    d->app_scroll = 0;
+                    filter_apps(d);
                     break;
                 }
             }
         } else {
-            int index = 0;
-            for (int i = 0; i < d->app_count; ++i) {
-                LauncherApp *app = &d->apps[i];
-                if (!grid_visible(d,app)) continue;
-                Bounds cell = grid_cell(d,index++);
-                Bounds tile = {cell.x+4,cell.y+8,cell.w-8,106};
+            for (int i=0;i<d->match_count;i++) {
+                LauncherApp *app=&d->apps[d->matches[i]];
+                Bounds cell=grid_cell(d,i);
+                Bounds tile = {cell.x+4,cell.y+8,cell.w-8,124};
                 if (!contains(tile,x,y)) continue;
-                d->menu = MENU_CLOSED;
-                if (app->dock_id >= 0) click(d,DOCK/2,8+app->dock_id*step(d)+20);
-                else {
-                    FilePath path = "/bin/";
-                    strcat(path,app->name);
-                    open_client(d,path,NULL);
-                }
+                launch_app(d,app);
                 break;
             }
         }
@@ -1446,12 +1681,53 @@ static int video_filename(const char *name) {
         if (!strcmp(lower,types[i])) return 1;
     return 0;
 }
+static int mujoco_document(const char *path,const char *ext) {
+    if (!ext) return 0;
+    if (!strcmp(ext,"mjb") || !strcmp(ext,"mjz") || !strcmp(ext,"urdf")) return 1;
+    if (strcmp(ext,"xml")) return 0;
+    char buf[2049];
+    int fd=lx_open(path);
+    if (fd<0) return 0;
+    int count=lx_read(fd,buf,sizeof buf-1);
+    lx_close(fd);
+    if (count<=0) return 0;
+    buf[count]=0;
+    const char *p=buf;
+    while ((p=strchr(p,'<'))) {
+        if (!strncmp(p,"<!--",4)) {
+            p+=4;
+            while (*p && strncmp(p,"-->",3)) ++p;
+            if (!*p) return 0;
+            p+=3;
+            continue;
+        }
+        if (p[1]=='?' || p[1]=='!') { ++p; continue; }
+        int n=!strncmp(p,"<mujoco",7) ? 7 : !strncmp(p,"<robot",6) ? 6 : 0;
+        return n && (p[n]=='>' || p[n]=='/' || p[n]==' ' || p[n]=='\n' || p[n]=='\r' || p[n]=='\t');
+    }
+    return 0;
+}
+
 static void open_marked(Desktop *d) {
     Entry *e = &d->rows[d->marked];
     if (!child_path(d,d->filename,d->path,e->name)) return;
     if (e->size == LX_DIR) { navigate(d,d->filename,-1); return; }
     if (window_app_name(e->name)) {
         open_client(d, d->filename, NULL);
+        return;
+    }
+    const char *ext = extension(e->name);
+    if (ext && !compare_text(ext,"pdf") && lx_stat("/bin/pdfview.win3") >= 0) {
+        open_client(d, "/bin/pdfview.win3", d->filename);
+        return;
+    }
+    if (ext && (!compare_text(ext,"odt") || !compare_text(ext,"docx") ||
+                !compare_text(ext,"doc") || !compare_text(ext,"rtf")) && lx_stat("/bin/writer.win3") >= 0) {
+        open_client(d, "/bin/writer.win3", d->filename);
+        return;
+    }
+    if (mujoco_document(d->filename,ext) && lx_stat("/bin/simulate.win3") >= 0) {
+        open_client(d,"/bin/simulate.win3",d->filename);
         return;
     }
     if (video_filename(e->name) && lx_stat("/bin/video.win3") >= 0) {
@@ -1531,8 +1807,8 @@ static int file_key(Desktop *d, int key) {
             switch (lx_timed_byte(30)) {
             case 'A': key = 'k'; break;
             case 'B': key = 'j'; break;
-            case 'D': file_action(d,F_BACK); return 1;
-            case 'C': file_action(d,F_FORWARD); return 1;
+            case 'D': if (d->file_grid) {key=UI_LEFT; break;} file_action(d,F_BACK); return 1;
+            case 'C': if (d->file_grid) {key=UI_RIGHT; break;} file_action(d,F_FORWARD); return 1;
             default: return 1;
             }
         }
@@ -1540,9 +1816,9 @@ static int file_key(Desktop *d, int key) {
     int command=ui_command_for_key(actions,F_COUNT,key==10 ? 13 : key);
     if (command>=0) { file_action(d,command); return 1; }
     switch (key) {
-    case 'j': case 'k':
+    case UI_LEFT: case UI_RIGHT: case 'j': case 'k':
         if (d->action_menu || !d->count) break;
-        select_row(d,d->marked<0 ? d->first : clamp(d->marked+(key=='j'?1:-1),d->count-1),0);
+        select_row(d,d->marked<0 ? d->first : clamp(d->marked+(key==UI_LEFT?-1:key==UI_RIGHT?1:key=='j'?file_cols(d):-file_cols(d)),d->count-1),0);
         reveal_selection(d);
         d->clicked_at = -1;
         break;
@@ -1556,6 +1832,38 @@ static int file_key(Desktop *d, int key) {
     return 1;
 }
 
+static int launcher_key(Desktop *d,int key) {
+    if (key<0 || key>255) return 0;
+    int delta=0;
+    if (key==27) {
+        int prefix=lx_timed_byte(20);
+        if (prefix=='[' || prefix=='O') {
+            int arrow=lx_timed_byte(30);
+            if (arrow=='A' || arrow=='B') delta=(arrow=='A'?-1:1)*grid_columns(d);
+            else if (arrow=='C' || arrow=='D') delta=arrow=='C'?1:-1;
+            else return 0;
+        } else if (d->query[0]) {
+            d->query[0]=0;
+            ui_text_begin(&d->search_input,d->query,0);
+            filter_apps(d);
+        } else d->menu=MENU_CLOSED;
+    } else if (key==9) delta=1;
+    else if (key==10 || key==13) {
+        if (d->match_count) launch_app(d,&d->apps[d->matches[d->app_selected]]);
+    } else {
+        int starting=!d->query[0];
+        if (!ui_text_key(&d->search_input,d->query,sizeof d->query,key)) return 0;
+        if (starting && d->query[0]) d->app_group=GROUP_ALL;
+        filter_apps(d);
+    }
+    if (delta && d->match_count) {
+        d->app_selected=clamp(d->app_selected+delta,d->match_count-1);
+        Bounds b=grid_cell(d,d->app_selected);
+        if (b.y<GRID_TOP) grid_scroll(d,d->app_scroll+b.y-GRID_TOP);
+        else if (b.y+b.h>d->h) grid_scroll(d,d->app_scroll+b.y+b.h-d->h);
+    }
+    return 1;
+}
 static int click(Desktop *d, int x, int y) {
     if (d->naming) {
         int dx = x - d->dialog_x, dy = y - d->dialog_y;
@@ -1585,7 +1893,8 @@ static int click(Desktop *d, int x, int y) {
         menu_click(d, x, y);
         return 1;
     }
-    if (x < DOCK) {
+    int hit=window_at(d,x,y);
+    if (x < DOCK && (hit<0 || !d->windows[hit].fullscreen)) {
         if (d->terminals && y >= d->h - 40 && y < d->h - 8) {
             if (x < 25)
                 d->selected = d->selected > 1 ? d->selected - 1 : d->terminals;
@@ -1671,14 +1980,7 @@ static int click(Desktop *d, int x, int y) {
         if (control == 0)
             win->shown = 0;
         else if (control == 1) {
-            if (win->maximized)
-                win->rect = win->restored;
-            else {
-                win->restored = r;
-                win->rect = (Bounds){DOCK, 0, d->w - DOCK, d->h};
-            }
-            win->maximized = !win->maximized;
-            configure_window(d, id);
+            toggle_maximize(d,id);
             if (id == FILE_WIN) scroll_files(d,d->first);
         } else if (id >= FIRST_CLIENT && d->clients[id - FIRST_CLIENT].extended) {
             WindowClient *client = &d->clients[id - FIRST_CLIENT];
@@ -1710,7 +2012,7 @@ static int click(Desktop *d, int x, int y) {
         slash[slash == parent] = 0;
         navigate(d, parent,-1);
         return 1;
-    } else if (!win->maximized && (y < TITLE || (x >= r.w - 18 && y >= r.h - 18))) {
+    } else if (!win->fullscreen && !win->maximized && (y < TITLE || (x >= r.w - 18 && y >= r.h - 18))) {
         d->captured = id;
         d->dragging = y < TITLE ? 1 : 3;
         d->grab_x = y < TITLE ? x : r.w - x;
@@ -1759,9 +2061,15 @@ static int click(Desktop *d, int x, int y) {
         if (!sidebar(r) && d->places_open) d->places_open=0;
         else if (x < 76) d->action_menu = 1;
         else if (x < 138) file_action(d,F_FIND);
+        else if (x>=138 && x<194) {
+            d->file_grid=!d->file_grid;
+            scroll_files(d,d->first);
+            if (d->marked>=0) reveal_selection(d);
+            d->clicked_at=-1;
+        }
     } else if (y >= TITLE && y < 78 && x >= sidebar(r)) {
         int columns[FILE_COLUMNS+1];
-        file_columns(r.w-sidebar(r),columns);
+        file_columns(r.w-sidebar(r),d->file_grid,columns);
         int local = x-sidebar(r);
         for (int c = 0; c < FILE_COLUMNS; ++c) {
             if (local < columns[c] || local >= columns[c+1]) continue;
@@ -1778,14 +2086,17 @@ static int click(Desktop *d, int x, int y) {
         d->dragging = 4;
         d->grab_y = ay >= thumb.y && ay < thumb.y+thumb.h ? ay-thumb.y : thumb.h/2;
         int travel = r.h-80-FILE_FOOTER-thumb.h;
-        scroll_files(d,ui_list_drag(y-80-d->grab_y,travel,d->count,file_rows(d)));
-    } else if (y >= 80 && y < 80 + ROW*min(file_rows(d),d->count-d->first)) {
-        int row = d->first + (y - 80) / ROW;
+        scroll_files(d,ui_list_drag(y-80-d->grab_y,travel,file_slots(d),file_rows(d)));
+    } else if (y>=80 && y<r.h-FILE_FOOTER) {
+        int row=file_at(d,r,x,y);
+        if (row<0) { select_row(d,-1,0); return 1; }
         long now = console_call(38,0);
         int twice = !d->modifiers && d->chosen==1 && d->marked == row && d->clicked_at >= 0 && now - d->clicked_at <= 550;
         select_row(d,row,d->modifiers);
         d->clicked_at = d->modifiers ? -1 : now;
         if (twice) file_action(d,F_OPEN);
+        else if (!d->modifiers && d->rows[row].size!=LX_DIR)
+            child_path(d,d->file_drag,d->path,d->rows[row].name);
     } else if (y>=80) select_row(d,-1,0);
     return 1;
 }
@@ -1806,6 +2117,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (argc > (browser ? 2 : 1)) { lx_error("usage: desktop | netsurf [URL]\n"); return 2; }
+    if (load_font() < 0) { lx_error("desktop: could not load font\n"); return 1; }
     char current[513], url[1040];
     const char *cwd = getcwd(current,sizeof(current)) ? current : "/";
     if (browser && argc == 2) {
@@ -1830,6 +2142,7 @@ __attribute__((noreturn)) void desktop_start(const char *cwd, const char *args, 
         lx_error("usage: desktop\n");
         finish(2);
     }
+    load_launcher_art();
     long size = console_call(19, 0);
     if (size <= 0) {
         lx_error("desktop: open a QEMU graphical window with at least 42 columns and 20 rows per pane\n");
@@ -1843,6 +2156,8 @@ __attribute__((noreturn)) void desktop_start(const char *cwd, const char *args, 
     memset(clients, 0, sizeof clients);
     d.clients = clients;
     d.client_grab = -1;
+    d.secondary_grab = -1;
+    d.raw_buttons = console_call(29,11) >= 0;
     d.w = size & 65535;
     d.h = size >> 16;
     restore_wallpaper(&d);
@@ -1923,6 +2238,8 @@ __attribute__((noreturn)) void desktop_start(const char *cwd, const char *args, 
                     break;
                 }
             }
+        } else if (d.menu==MENU_APPS) {
+            if (launcher_key(&d,key)) render(&d);
         } else if (d.menu) {
             if (key == 27) { d.menu = MENU_CLOSED; render(&d); }
         } else if (focus(&d) >= FIRST_CLIENT && key >= 0 && key < 256) {
@@ -1931,7 +2248,7 @@ __attribute__((noreturn)) void desktop_start(const char *cwd, const char *args, 
                 close_window(&d, id);
                 render(&d);
             } else
-                client_event(&clients[id - FIRST_CLIENT], (WindowEvent){WINDOW_CLIENT_KEY, 0, 0, key});
+                client_event(&clients[id - FIRST_CLIENT], (WindowEvent){WINDOW_CLIENT_KEY, clients[id-FIRST_CLIENT].modifiers ? (d.raw_buttons ? (int)console_call(29,11) : d.modifiers) : 0, 0, key});
         } else if (focus(&d) == CALC_WIN && key >= 0 && key < 256) {
             if (key == 'q' || key == 27)
                 close_window(&d, CALC_WIN);
@@ -1961,6 +2278,33 @@ __attribute__((noreturn)) void desktop_start(const char *cwd, const char *args, 
         int repaint = 0;
         for (int i = 0; i < CLIENT_LIMIT; ++i) {
             int update = client_tick(&clients[i], d.windows[FIRST_CLIENT + i].shown);
+#ifdef LX_NETSURF
+            if (clients[i].url_ready) {
+                clients[i].url_ready = 0;
+                Window *web = &d.windows[WEB_WIN];
+                lixin_initial_url(clients[i].clipboard);
+                if (desk_web_open(d.pixels, d.w, d.h, d.cwd, web->rect.w, web->rect.h)) {
+                    web->open = web->shown = 1;
+                    raise_window(&d, WEB_WIN);
+                } else {
+                    strcpy(d.message, "Could not open browser");
+                }
+                repaint = 1;
+            }
+#endif
+            if (clients[i].title_changed) { repaint=1; clients[i].title_changed=0; }
+            if (update >= 0 && !clients[i].busy && clients[i].toggle_fullscreen) {
+                clients[i].toggle_fullscreen=0;
+                Window *win=&d.windows[FIRST_CLIENT+i];
+                if (win->fullscreen) win->rect=win->before_fullscreen;
+                else {
+                    win->before_fullscreen=win->rect;
+                    win->rect=(Bounds){0,-TITLE,d.w,d.h+TITLE};
+                }
+                win->fullscreen=!win->fullscreen;
+                configure_window(&d,FIRST_CLIENT+i);
+                repaint=1;
+            }
             if (update < 0) {
                 if (clients[i].overflow) strcpy(d.message, "Application closed: input queue full");
                 else if (clients[i].error) strcpy(d.message, clients[i].error);
@@ -1975,7 +2319,7 @@ __attribute__((noreturn)) void desktop_start(const char *cwd, const char *args, 
         int active = focus(&d);
         long pointer_options = d.naming && d.name.caret != d.name.anchor ? LX_COPY_ENABLED : 0;
         int target = !d.naming && !d.menu && active >= FIRST_CLIENT && clients[active - FIRST_CLIENT].extended ?
-            active - FIRST_CLIENT : d.naming ? -2 : -1;
+            active - FIRST_CLIENT : d.naming ? -2 : d.menu==MENU_APPS ? -3 : -1;
         if (target != clipboard_client) {
             console_call(35, 1);
             clipboard_client = target;
@@ -1983,6 +2327,16 @@ __attribute__((noreturn)) void desktop_start(const char *cwd, const char *args, 
         if (target >= 0) {
             pointer_options |= LX_PASTE_BLOCK | LX_COPY_ENABLED;
             client_collect_paste(&clients[target]);
+        } else if (d.menu==MENU_APPS) {
+            pointer_options |= LX_PASTE_BLOCK;
+            long n=console_call(35,0);
+            int starting=!d.query[0];
+            if (n>0 && n<=4096 && ui_text_paste(&d.search_input,d.query,sizeof d.query,
+                    (const unsigned char *)0x443d8000UL,n)) {
+                if (starting) d.app_group=GROUP_ALL;
+                filter_apps(&d);
+                render(&d);
+            }
         } else if (d.naming) {
             pointer_options |= LX_PASTE_BLOCK;
             long n=console_call(35,0);
@@ -2000,11 +2354,16 @@ __attribute__((noreturn)) void desktop_start(const char *cwd, const char *args, 
 #ifndef __TINYC__
                 desk_web_cancel_pointer();
 #endif
+                if (d.secondary_grab >= FIRST_CLIENT) {
+                    client_event(&clients[d.secondary_grab-FIRST_CLIENT], (WindowEvent){WINDOW_CLIENT_POINTER,-1,-1,0});
+                    d.secondary_grab=-1;
+                }
                 if (d.client_grab >= FIRST_CLIENT) {
                     WindowClient *client = &clients[d.client_grab - FIRST_CLIENT];
                     client_event(client, (WindowEvent){WINDOW_CLIENT_POINTER, client->extended ? -1 : client->pointer_x, client->extended ? -1 : client->pointer_y, 0});
                     d.client_grab = -1;
                 }
+                d.file_drag[0]=0;
                 d.dragging = d.down = d.name_drag = 0;
                 continue;
             }
@@ -2013,7 +2372,8 @@ __attribute__((noreturn)) void desktop_start(const char *cwd, const char *args, 
             d.my = (e >> 12) & 4095;
             d.inside = (e >> 25) & 1;
             int down = (e >> 24) & 1, changed = 0;
-            d.modifiers=(e>>32)&3;
+            int mods=(e>>32)&7;
+            d.modifiers=mods&3;
             if (d.menu == MENU_APPS) {
                 int wheel = ((e >> 26) & 1) - ((e >> 27) & 1);
                 if (wheel && d.inside) {
@@ -2039,6 +2399,24 @@ __attribute__((noreturn)) void desktop_start(const char *cwd, const char *args, 
                 else cursor(&d,1);
                 continue;
             }
+            int secondary=(e>>35)&3;
+            int hovered=d.inside && !d.naming && !d.menu ? window_at(&d,d.mx,d.my) : -1;
+            if (d.raw_buttons && secondary && d.secondary_grab<0 && hovered>=FIRST_CLIENT &&
+                clients[hovered-FIRST_CLIENT].modifiers && d.my>=d.windows[hovered].rect.y+TITLE) {
+                raise_window(&d,hovered);
+                d.secondary_grab=hovered;
+                render(&d);
+            }
+            if (d.secondary_grab>=FIRST_CLIENT) {
+                int id=d.secondary_grab;
+                Bounds r=d.windows[id].rect;
+                client_event(&clients[id-FIRST_CLIENT], (WindowEvent){WINDOW_CLIENT_POINTER,
+                    d.mx-r.x,d.my-r.y-TITLE,down | (mods<<1) | (secondary<<4)});
+                if (!secondary) d.secondary_grab=-1;
+                d.down=down;
+                cursor(&d,1);
+                continue;
+            }
             if(e & LX_RIGHT_PRESS) {
                 d.wallpaper_menu=0;
                 int id = d.inside && !d.naming && !d.menu ? window_at(&d,d.mx,d.my) : -1;
@@ -2062,8 +2440,8 @@ __attribute__((noreturn)) void desktop_start(const char *cwd, const char *args, 
                     Bounds r=d.windows[FILE_WIN].rect;
                     int y=d.my-r.y;
                     if (y>=80 && y<r.h-FILE_FOOTER && d.mx>=r.x+sidebar(r)) {
-                        int row=d.first+(y-80)/ROW;
-                        if (row>=d.count) select_row(&d,-1,0);
+                        int row=file_at(&d,r,d.mx-r.x,y);
+                        if (row<0) select_row(&d,-1,0);
                         else if (!d.rows[row].chosen) select_row(&d,row,0);
                     }
                     raise_window(&d,FILE_WIN); d.action_menu=1; d.clicked_at=-1; render(&d);
@@ -2074,6 +2452,15 @@ __attribute__((noreturn)) void desktop_start(const char *cwd, const char *args, 
                 continue;
             }
             int was_modal = d.menu || d.naming || d.wallpaper_menu;
+            if (!down && d.file_drag[0]) {
+                if (!was_modal && hovered>=FIRST_CLIENT && d.my>=d.windows[hovered].rect.y+TITLE &&
+                    client_drop_file(&clients[hovered-FIRST_CLIENT],d.file_drag)) {
+                    raise_window(&d,hovered);
+                    d.clicked_at=-1;
+                    changed=1;
+                }
+                d.file_drag[0]=0;
+            }
             if(d.wallpaper_menu && down && !d.down) {
                 int x=d.mx-d.wallpaper_x,y=d.my-d.wallpaper_y;
                 if(d.inside && x>=0 && x<WALL_WIDTH && y>=WALL_ROW && y<WALL_HEIGHT) {
@@ -2107,7 +2494,7 @@ __attribute__((noreturn)) void desktop_start(const char *cwd, const char *args, 
                     if (d.count > file_rows(&d)) {
                         int travel = r.h-80-FILE_FOOTER-file_thumb(&d,r).h;
                         int offset = clamp(d.my-r.y-80-d.grab_y,travel);
-                        scroll_files(&d,ui_list_drag(offset,travel,d.count,file_rows(&d)));
+                        scroll_files(&d,ui_list_drag(offset,travel,file_slots(&d),file_rows(&d)));
                     }
                 } else if (d.dragging == 2) {
                     d.dialog_x = clamp(d.mx - d.grab_x, d.w - 440);
@@ -2139,7 +2526,7 @@ __attribute__((noreturn)) void desktop_start(const char *cwd, const char *args, 
                     if (d.mx-r.x<sidebar(r) || (!sidebar(r) && d.places_open)) {
                         d.places->first=ui_list_top(d.places->first-wheel,place_count(&d),place_rows(r));
                         changed=1;
-                    } else changed=scroll_files(&d,d.first-wheel);
+                    } else changed=scroll_files(&d,d.first-wheel*file_cols(&d));
                 }
 #ifndef __TINYC__
                 if (id == WEB_WIN && (wheel || (!down && d.down)) && focus(&d) == WEB_WIN &&
@@ -2164,7 +2551,7 @@ __attribute__((noreturn)) void desktop_start(const char *cwd, const char *args, 
                     int y = clamp((d.my - r.y - TITLE) * h / (r.h - TITLE), h - 1);
                     if (clients[target-FIRST_CLIENT].extended && (!d.inside || d.mx<r.x || d.mx>=r.x+r.w ||
                         d.my<r.y+TITLE || d.my>=r.y+r.h)) x=y=-1;
-                    client_event(&clients[target - FIRST_CLIENT], (WindowEvent){WINDOW_CLIENT_POINTER, x, y, down});
+                    client_event(&clients[target - FIRST_CLIENT], (WindowEvent){WINDOW_CLIENT_POINTER, x, y, down | (clients[target-FIRST_CLIENT].modifiers ? mods<<1 : 0)});
                     int wheel = ((e >> 26) & 1) - ((e >> 27) & 1);
                     if (wheel && clients[target - FIRST_CLIENT].extended)
                         client_event(&clients[target - FIRST_CLIENT], (WindowEvent){WINDOW_CLIENT_WHEEL, x, y, wheel});

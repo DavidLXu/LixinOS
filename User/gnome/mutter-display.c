@@ -13,6 +13,9 @@ typedef struct {
     ClutterVirtualInputDevice *pointer;
     ClutterVirtualInputDevice *keyboard;
     guint input_source;
+    char escape[12];
+    unsigned escape_size;
+    gint64 escape_time;
     int last_x, last_y;
     gboolean left_button;
     gboolean needs_full_frame;
@@ -81,7 +84,6 @@ static void send_pointer(LxMutterDisplay *display, const struct lx_pointer *poin
 
 static uint32_t to_keysym(int byte) {
     switch (byte) {
-    case 8:
     case 127: return XKB_KEY_BackSpace;
     case 9: return XKB_KEY_Tab;
     case 10:
@@ -89,6 +91,56 @@ static uint32_t to_keysym(int byte) {
     case 27: return XKB_KEY_Escape;
     default: return (byte >= 32 && byte < 127) ? (uint32_t)byte : 0;
     }
+}
+
+static void send_key(LxMutterDisplay *display, uint64_t now, uint32_t key, gboolean ctrl) {
+    if (ctrl)
+        clutter_virtual_input_device_notify_keyval(display->keyboard, now, XKB_KEY_Control_L, CLUTTER_KEY_STATE_PRESSED);
+    clutter_virtual_input_device_notify_keyval(display->keyboard, now, key, CLUTTER_KEY_STATE_PRESSED);
+    clutter_virtual_input_device_notify_keyval(display->keyboard, now, key, CLUTTER_KEY_STATE_RELEASED);
+    if (ctrl)
+        clutter_virtual_input_device_notify_keyval(display->keyboard, now, XKB_KEY_Control_L, CLUTTER_KEY_STATE_RELEASED);
+}
+
+static void keyboard_byte(LxMutterDisplay *display, uint64_t now, int byte) {
+    static const struct { const char *seq; uint32_t key; } navigation[] = {
+        {"[A", XKB_KEY_Up}, {"[B", XKB_KEY_Down}, {"[C", XKB_KEY_Right}, {"[D", XKB_KEY_Left},
+        {"[H", XKB_KEY_Home}, {"[F", XKB_KEY_End}, {"[2~", XKB_KEY_Insert}, {"[3~", XKB_KEY_Delete},
+        {"[5~", XKB_KEY_Page_Up}, {"[6~", XKB_KEY_Page_Down},
+        {"[15~", XKB_KEY_F5}, {"[17~", XKB_KEY_F6}, {"[18~", XKB_KEY_F7},
+        {"[19~", XKB_KEY_F8}, {"[20~", XKB_KEY_F9}
+    };
+    if (display->escape_size) {
+        if (display->escape_size > 1 || byte == '[' || byte == 'O') {
+            if (display->escape_size < sizeof(display->escape) - 1) {
+                display->escape[display->escape_size++] = byte;
+                display->escape[display->escape_size] = 0;
+                if (display->escape_size == 2 || (byte >= '0' && byte <= '9') || byte == ';')
+                    return;
+                // Application cursor mode sends SS3 in place of CSI.
+                if (display->escape[1] == 'O') display->escape[1] = '[';
+                for (unsigned i = 0; i < G_N_ELEMENTS(navigation); i++)
+                    if (!strcmp(display->escape + 1, navigation[i].seq)) {
+                        send_key(display, now, navigation[i].key, FALSE);
+                        break;
+                    }
+            }
+            display->escape_size = 0;
+            return;
+        }
+        display->escape_size = 0;
+        send_key(display, now, XKB_KEY_Escape, FALSE);
+    }
+    if (byte == 27) {
+        display->escape_size = 1;
+        display->escape_time = now;
+        return;
+    }
+    uint32_t key = to_keysym(byte);
+    if (key)
+        send_key(display, now, key, FALSE);
+    else if (byte >= 1 && byte <= 26)
+        send_key(display, now, XKB_KEY_a + byte - 1, TRUE);
 }
 
 static gboolean dispatch_input(gpointer data) {
@@ -99,13 +151,14 @@ static gboolean dispatch_input(gpointer data) {
         send_pointer(display, &pointer, now);
     for (unsigned i = 0; i < 16; ++i) {
         int byte = lx_timed_byte(0);
-        if (byte < 0)
+        if (byte < 0 || byte > 255)
             break;
-        uint32_t key = to_keysym(byte);
-        if (key) {
-            clutter_virtual_input_device_notify_keyval(display->keyboard, now, key, CLUTTER_KEY_STATE_PRESSED);
-            clutter_virtual_input_device_notify_keyval(display->keyboard, now, key, CLUTTER_KEY_STATE_RELEASED);
-        }
+        keyboard_byte(display, now, byte);
+    }
+    if (display->escape_size && now - display->escape_time > 50000) {
+        if (display->escape_size == 1)
+            send_key(display, now, XKB_KEY_Escape, FALSE);
+        display->escape_size = 0;
     }
     return G_SOURCE_CONTINUE;
 }

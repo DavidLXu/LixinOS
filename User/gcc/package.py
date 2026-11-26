@@ -28,7 +28,9 @@ def tool(package, name, elf, library="/lib/gcc", launcher_flag="-DLX_GCC", build
     segments = [struct.unpack_from("<II6Q", data, phoff+i*phsize) for i in range(n)]
     rx, rw = [p for p in segments if p[0] == 1]
     if (rx[1:4] != (5, 0, 0x78000000) or rw[1] != 6 or rw[3] % (2<<20)
-        or not rx[3] <= entry < rx[3]+rx[5] <= rw[3] or rw[3]+rw[6]+(2<<20) >= 0x80000000):
+        # Large-memory kernels extend the libc arena to the separate program
+        # arena at 0xa0000000. SVC 37 checks the running kernel's actual limit.
+        or not rx[3] <= entry < rx[3]+rx[5] <= rw[3] or rw[3]+rw[6]+(2<<20) >= 0xa0000000):
         raise ValueError(f"invalid load image for {name}")
     layout = build_dir/f"launch-{elf.stem}"
     layout.mkdir(exist_ok=True)

@@ -1,0 +1,103 @@
+diff --git a/runtime/recomp32/recomp_types.h b/runtime/recomp32/recomp_types.h
+index de5b226..6ce6182 100644
+--- a/runtime/recomp32/recomp_types.h
++++ b/runtime/recomp32/recomp_types.h
+@@ -230,7 +230,8 @@ extern RECOMP_HOSTDATA ptrdiff_t g_mem_base;
+  * misses it. */
+ #define ADDR(va)     ((uintptr_t)(uint32_t)(va) + (uintptr_t)(RECOMP_MEM_BASE))
+ #else
+-#define ADDR(va)     ((uintptr_t)(uint32_t)(va) + g_mem_base)
++extern uintptr_t lixin_guest_ptr(uint32_t);
++#define ADDR(va) lixin_guest_ptr((uint32_t)(va))
+ #endif
+ 
+ /* Thread-relative segment bases. In Win32, fs: points at the TIB/TEB; gs is
+diff --git a/runtime/win32hle/guest_mem.c b/runtime/win32hle/guest_mem.c
+index fb5e250..9dab6fc 100644
+--- a/runtime/win32hle/guest_mem.c
++++ b/runtime/win32hle/guest_mem.c
+@@ -156,39 +156,12 @@ uint32_t hle_va_bad(const void *p) {
+     return 0;
+ }
+ 
+-static void mem_init_once(void) {
+-    g_host_page = (size_t)getpagesize();
+-    /* Nothing is accessible until reserved, page zero included: a guest NULL
+-     * (or a VA nobody handed out) faults, as it would on Windows. */
+-#ifdef RECOMP_MEM_BASE
+-    /* The lift adds RECOMP_MEM_BASE as a constant (recomp_types.h): the block
+-     * goes there or nowhere. Asked for, not forced, so nothing the host has
+-     * mapped is replaced (Linux says so with NOREPLACE; macOS honours a free
+-     * hint). */
+-    void *want = (void *)(uintptr_t)(RECOMP_MEM_BASE);
+-    void *p = mmap(want, SPAN, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
+-#ifdef __linux__
+-                   | MAP_FIXED_NOREPLACE
+-#endif
+-                   , -1, 0);
+-    if (p != want) hle_fatal("cannot reserve the guest's 4 GB at %p (RECOMP_MEM_BASE): the range is in use", want);
+-#else
+-    void *p = mmap(NULL, SPAN, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+-    if (p == MAP_FAILED) hle_fatal("cannot reserve the guest's 4 GB");
+-#endif
+-    g_mem_base = (ptrdiff_t)p;
+-}
+-void hle_mem_init(void) {
+-    static pthread_once_t once = PTHREAD_ONCE_INIT;
+-    pthread_once(&once, mem_init_once);
+-}
+-
+-static uint8_t *host(uint32_t va) { return (uint8_t *)g_mem_base + va; }
+-
+-/* Fresh zero pages over [va, va+size), host-page aligned, with prot. */
++extern int lixin_guest_map(uint32_t va, uint64_t size, int prot);
++extern uint32_t lixin_guest_va(const void *);
++void hle_mem_init(void) {}
++static uint8_t *host(uint32_t va) { return (uint8_t *)ADDR(va); }
+ static int remap(uint32_t va, uint64_t size, int prot) {
+-    void *p = mmap(host(va), (size_t)size, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | (prot ? 0 : MAP_NORESERVE), -1, 0);
+-    return p == (void *)host(va) ? 0 : -1;
++    return lixin_guest_map(va, size, prot);
+ }
+ 
+ static int overlaps(uint64_t lo, uint64_t hi) {
+@@ -267,12 +240,7 @@ void hle_vm_release(uint32_t va, uint32_t size) {
+ /* Decommit: the range reads as zero when touched again. Whole host pages are
+  * replaced (dropping their memory); the partial ones at either end cleared. */
+ void hle_vm_zero(uint32_t va, uint32_t size) {
+-    uint64_t lo = va, hi = (uint64_t)va + size;
+-    uint64_t plo = (lo + g_host_page - 1) & ~(uint64_t)(g_host_page - 1), phi = hi & ~(uint64_t)(g_host_page - 1);
+-    if (plo >= phi) { memset(host(va), 0, size); return; }
+-    memset(host((uint32_t)lo), 0, (size_t)(plo - lo));
+-    remap((uint32_t)plo, phi - plo, PROT_READ | PROT_WRITE);
+-    memset(host((uint32_t)phi), 0, (size_t)(hi - phi));
++    if (size) memset(host(va), 0, size);
+ }
+ 
+ /* ---- the heap ----
+@@ -495,8 +463,7 @@ int hle_guest_format(char *out, size_t n, const char *fmt, uint32_t args) {
+ uint32_t hle_guest_str_or_atom(const char *s) {
+     if ((uintptr_t)s < 0x10000u) return (uint32_t)(uintptr_t)s;
+ #ifndef HLE_FLAT
+-    uintptr_t off = (uintptr_t)s - (uintptr_t)g_mem_base;
+-    if ((uint64_t)off >> 32) return hle_scratch_copy(s, (uint32_t)strlen(s) + 1);
++    if (!lixin_guest_va(s)) return hle_scratch_copy(s, (uint32_t)strlen(s) + 1);
+ #endif
+     return hle_va(s);
+ }
+diff --git a/runtime/win32hle/win32hle.h b/runtime/win32hle/win32hle.h
+index 240ed24..f684ac0 100644
+--- a/runtime/win32hle/win32hle.h
++++ b/runtime/win32hle/win32hle.h
+@@ -52,8 +52,9 @@ uint32_t hle_va_bad(const void *p);            /* fatal: a host pointer handed t
+ static inline void *hle_ptr(uint32_t va) { return va ? (void *)ADDR(va) : NULL; }
+ static inline uint32_t hle_va(const void *p) {
+     if (!p) return 0;
+-    uintptr_t off = (uintptr_t)p - (uintptr_t)g_mem_base;
+-    return (uint64_t)off >> 32 ? hle_va_bad(p) : (uint32_t)off;
++    extern uint32_t lixin_guest_va(const void *);
++    uint32_t va = lixin_guest_va(p);
++    return va ? va : hle_va_bad(p);
+ }
+ #endif
+ 

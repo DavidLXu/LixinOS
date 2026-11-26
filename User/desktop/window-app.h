@@ -1,5 +1,6 @@
 #pragma once
 #include <lixin.h>
+#include "../gui/cell-font.h"
 #ifdef __TINYC__
 #include "/src/desktop/window-client.h"
 #else
@@ -38,6 +39,7 @@ static inline void app_rect(AppWindow *s, int x, int y, int w, int h, unsigned s
 static inline void app_text(AppWindow *s, int x, int y, const char *label, unsigned short color) {
     static unsigned char atlas[95 * 18 * 22];
     static int ready;
+    if (!ready && lx_cell_face(atlas) == 0) ready = 1;
     if (!ready) {
         int fd = lx_open("/src/gui/menlo.gray");
         if (fd < 0) { ready = -1; return; }
@@ -50,13 +52,26 @@ static inline void app_text(AppWindow *s, int x, int y, const char *label, unsig
         ready = 1;
     }
     if (ready < 0) return;
-    for (; *label && x < s->width; x += 11, ++label) {
-        unsigned glyph = (unsigned char)*label;
+    while (*label && x < s->width) {
+        unsigned glyph = utf8_next(&label);
+        int slot = han_slot(glyph);
+        if (slot >= 0) {
+            const unsigned char *bits = lx_gui_han_bitmap(slot);
+            if (bits) {
+                for (int j=0; j<16 && y+j+3<s->height; ++j)
+                    for (int i=0; i<16 && x+i<s->width; ++i)
+                        if (x+i>=0 && y+j+3>=0 && (bits[j*2+i/8] & (128u>>(i%8))))
+                            s->pixels[(y+j+3)*s->width+x+i] = color;
+                x += 16;
+                continue;
+            }
+        }
         if (glyph < 32 || glyph > 126) glyph = '?';
         for (int j = 0; j < 22 && y + j < s->height; ++j)
             for (int i = 0; i < 11 && x + i < s->width; ++i)
                 if (x + i >= 0 && y + j >= 0 && atlas[(glyph-32)*18*22+j*18+i] >= 128)
                     s->pixels[(y+j)*s->width + x+i] = color;
+        x += 11;
     }
 }
 

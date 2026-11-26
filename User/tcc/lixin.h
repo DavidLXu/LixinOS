@@ -48,6 +48,7 @@ int lx_timed_byte(unsigned ms);
 #define LX_TCP_AGAIN (-2)
 int lx_tcp_connect(const char *host, int port);
 int lx_tcp_read(int fd, void *data, int count);
+int lx_tcp_peek(int fd, void *data, int count);
 int lx_tcp_write(int fd, const void *data, int count);
 int lx_tcp_close(int fd);
 

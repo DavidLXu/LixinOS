@@ -1,11 +1,12 @@
 """Open Settings from Apps on disposable desktop disks and check the real consumers."""
-from launcher_grid import installed_apps, select_icon
+from launcher_grid import installed_apps
 import argparse
 import json
 import os
 from pathlib import Path
 import runpy
 import subprocess
+import tempfile
 import time
 
 from disk_image import boot_preferences
@@ -32,7 +33,7 @@ def exercise(guest, control, directory):
     guest.expect(b"echo 'export SAMPLE=unchanged' >> /home/lixin/.profile\r", prompt)
     guest.send(b"ls -1 /bin | cat\r")
     names = installed_apps(guest.until(prompt))
-    index = names.index(b"settings.win3")
+    assert b"settings.win3" in names
     guest.send(b"desktop\r")
     frame = directory / "screen.ppm"
     width, height = 720, 436
@@ -62,78 +63,98 @@ def exercise(guest, control, directory):
             time.sleep(.05)
         raise AssertionError((x, y, color, data[pos:pos+3].hex(), guest.buffer[-500:]))
 
+    def category(index):
+        click(left+84, body+104+44*index)
+
     def row(index):
-        click(left+90, body+45+27*index)
+        click(left+270, body+146+48*index)
 
     def back():
-        click(left+18, body+14)
+        click(left+212, body+29)
 
-    def saved():
-        wait(left+1, body+38, "187068")
+    def saved(index=0):
+        wait(left+192, body+146+48*index, "b84418")
 
     def edit():
-        wait(left+width-14, body+height-51, "187068")
+        wait(left+width-24, body+221, "b84418")
 
     wait(75, 2, "5b4050")
     guest.send(b"\x07")
     wait(82, 6, "203f51")
-    select_icon(click,qmp,1177,682,index+6,len(names)+6)
+    # Select from System so an unrelated installed CLI never shifts the target.
+    click(120,77)
+    qmp("screendump", filename=str(frame))
+    data = frame.read_bytes().split(b"\n", 3)[3]
+    for index in range(18):
+        x, y = 118+(index%6)*188, 125+(index//6)*136
+        pos = (44+2*y)*(len(data)//1408) + 6*x
+        if data[pos:pos+3].hex() == "647c8c":
+            click(x,y+20)
+            break
+    else:
+        raise AssertionError("Settings icon missing from System")
     saved()
     # Wheel scrolling moves the viewport while preserving the selected row.
-    row(1)
+    category(1)
     saved()
     point(left+200,body+100)
     button("wheel-down",True)
     button("wheel-down",False)
-    wait(left+1,body+38,"f8fcf8")
+    wait(left+192,body+146,"f8fcf8")
     button("wheel-up",True)
     button("wheel-up",False)
     saved()
-    back()
-    row(0)
+    category(0)
     row(0)
     edit()
     guest.send(b"kilo")
-    point(left+width-40,body+height-50)
+    point(left+width-60,body+221)
     button("left",True)
-    point(left+width-130,body+height-50)
+    point(left+width-130,body+221)
     button("left",False)
     edit()
     guest.send(b"\r")
     saved()
-    back()
-    row(2)
+    category(2)
     row(0)
     edit()
     guest.send(b"61\r")
     edit()
     guest.send(b"\x1537\r")
     saved()
-    back()
-    row(3)
+    category(3)
     row(0)
     edit()
     guest.send(b"\t \t\r")
     saved()
     row(1)
     edit()
-    click(left+43, body+height-50)
-    click(left+width-40, body+height-50)
-    wait(left+1, body+65, "187068")
+    click(left+234, body+221)
+    click(left+width-60, body+221)
+    saved(1)
     for index, keys in ((2, b"\t \t\r"), (3, b"2233\r"), (4, b"test-model\r")):
         row(index)
         edit()
         guest.send(keys)
-        wait(left+1, body+38+27*index, "187068")
-    back()
-    row(4)
+        saved(index)
+    category(4)
     row(0)
     back()
     # Maximize the focused settings window and return to its original layout.
     click(left+width-52,body-22)
-    wait(76+1,44+38,"187068")
+    wait(76+172+(1177-76-172-700)//2+2,44+146,"b84418")
     click(1177-52,22)
     saved()
+    # Shrink the window and navigate through the compact category list.
+    point(left+width-3,body+height-3)
+    button("left",True)
+    point(left+420-3,body+height-3)
+    button("left",False)
+    wait(left+20,body+146,"b84418")
+    click(left+30,body+29)
+    wait(left+20,body+146+4*48,"b84418")
+    click(left+110,body+146)
+    wait(left+20,body+146,"b84418")
     guest.send(b"\x1b")
     time.sleep(.3)
     guest.send(b"\x1b")
@@ -157,13 +178,8 @@ if __name__ == "__main__":
     release = args.release
     if release == "latest":
         release = subprocess.check_output(["python3", here / "kernel-release.py", "latest"], text=True).strip()
-    os.environ["LIXINOS_TEST_SEED"] = str(args.disk.resolve(strict=True))
-    boot = panes["serial"]["boot"]
-    panes["serial"]["boot"] = lambda disk, cmd: boot(disk, [*cmd, "--kernel", args.kernel, "--release", release], prompt=b"$ ")
-
     def verify(guest, control, directory):
         exercise(guest, control, directory)
-        disk = directory / "disk.img"
         assert boot_preferences(disk) == "split UTC tcc 2233 test-model"
         # Inspect the effective QEMU invocation of the normal launcher after shutdown.
         stub = directory / "qemu-system-aarch64"
@@ -175,6 +191,7 @@ if __name__ == "__main__":
         command = [here / "run-kernel.sh", "--kernel", "rust", "--release", release]
         def arguments(extra, environment):
             return subprocess.check_output([*command, *extra], env=environment, text=True).splitlines()
+        env["LIXINOS_GPU"] = "ramfb"
         default = arguments([], env)
         assert "virt,gic-version=3" in default and "name=opt/lixinos/clock-offset,string=+0000" in default
         assert "test-model" in default
@@ -182,5 +199,8 @@ if __name__ == "__main__":
         assert "virt" in forced and "name=opt/lixinos/clock-offset,string=+0900" in forced
         assert "override" in forced
 
-    panes["test"](verify, "--window")
+    with tempfile.TemporaryDirectory(dir="/tmp") as temp:
+        disk = Path(temp) / "disk.img"
+        subprocess.run(["cp", "-c", args.disk.resolve(strict=True), disk], check=True)
+        panes["test"](verify, "--window", disk, ("--kernel", args.kernel, "--release", release), prompt=b"$ ")
     print(f"Settings UI, persistence and boot preferences passed on {args.kernel}, {release}.")

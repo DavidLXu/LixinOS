@@ -1,0 +1,16 @@
+--- a/src/wayland/meta-wayland-keyboard.c
++++ b/src/wayland/meta-wayland-keyboard.c
+@@ -540,6 +540,13 @@
+                                      &pressed,
+                                      &latched,
+                                      &locked);
++#ifdef __lixinos__
++  /* A console chord queues press and release together. The seat can
++   * already be on the release when Wayland dispatches the press. Use
++   * the pressed modifiers from processed events in protocol order. */
++  pressed = xkb_state_serialize_mods (keyboard->xkb_info.state,
++                                      XKB_STATE_MODS_DEPRESSED);
++#endif
+ 
+   if (keyboard->xkb_info.modifiers.pressed != pressed ||
+       keyboard->xkb_info.modifiers.latched != latched ||

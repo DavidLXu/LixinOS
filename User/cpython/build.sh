@@ -11,7 +11,7 @@ src="$work/Python-3.14.5"
 musl="$work/musl-1.2.5"
 sysroot="$work/sysroot"
 cache=$(dirname "$work")
-build_key=$(cat "$cache/links-port/anchors.h" "$port/../links/tls.c" "$port"/*.c "$port"/*.h "$port"/*.S "$port"/*.py "$port"/*.ld "$port"/build.sh "$port"/../{console.h,tcc/api.c,tcc/lixin.h,file-time.h,ls/link.ld} "$port/../../Kernel/native/ipc.h" | shasum -a 256)
+build_key=$(cat "$cache/links-port/anchors.h" "$port/../links/tls.c" "$port"/*.c "$port"/*.h "$port"/*.S "$port"/*.py "$port"/*.ld "$port"/build.sh "$port"/../{console.h,tcc/api.c,tcc/lixin.h,file-time.h,ls/link.ld} "$port"/../../Kernel/native/{ipc,vm,kthread}.h | shasum -a 256)
 if [[ -s cpython.pkg && -f complete && $(cat complete) == "$build_key" && -s package/bin/python3 ]]; then exit 0; fi
 
 unpack() {
@@ -126,7 +126,7 @@ flags=(-Os -ffunction-sections -fdata-sections -I. -I"$src/Include")
 # Compile the statically registered _ssl with CPython's built-in module flags.
 "$work/cc" "${flags[@]}" -D_GNU_SOURCE -DPy_BUILD_CORE_BUILTIN \
     -I"$src/Include/internal" -I"$ssl/include" -c "$src/Modules/_ssl.c" -o lxssl.o
-"$work/cc" "${flags[@]}" -nostdlib -static -Wl,--gc-sections,--build-id=none,-z,max-page-size=4096,-T,"$port/program.ld" \
+"$work/cc" "${flags[@]}" -DLX_THREADED_API -mno-outline-atomics -nostdlib -static -Wl,--gc-sections,--build-id=none,-z,max-page-size=4096,-T,"$port/program.ld" \
     "$sysroot/lib/crt1.o" "$port"/{main,memory,posix,interrupt,threads,spawn}.c "$port/switch.S" "$port/../tcc/api.c" lxplatform.o \
     -Dtls_free=lx_bearssl_free -I"$cache/bearssl-0.6/inc" -I"$cache/links-port" "$port/transport.c" "$port/../links/tls.c" \
     lxssl.o \

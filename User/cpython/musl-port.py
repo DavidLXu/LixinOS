@@ -52,6 +52,22 @@ if "lx_main_stack" not in text:
         td->stack = __end_image + lx_main_stack;
     }"""))
 
+text = init.read_text()
+if "lx_stack_top" not in text:
+    text = text.replace("int r = __set_thread_area", """/* The dynamic ELF bootstrap supplies the main stack top in auxv. */
+    if (!__end_image && libc.auxv) {
+        for (size_t *aux = libc.auxv; aux[0]; aux += 2) {
+            if (aux[0] == 0x6c780001UL) {
+                size_t lx_stack_top = aux[1];
+                td->stack = (void *)lx_stack_top;
+                td->stack_size = 2UL << 20;
+                break;
+            }
+        }
+    }
+    int r = __set_thread_area""")
+    init.write_text(text)
+
 (root / "src/thread/aarch64/__unmapself.s").write_text(".global __unmapself\n.hidden __unmapself\n__unmapself:\n b lx_thread_exit\n")
 # The guest allocates stacks in the same paged arena as interpreter memory.
 p = root / "src/thread/pthread_create.c"

@@ -29,6 +29,8 @@ FreeType faces for different sizes and weights share the same open font file.
 Native plugins and extensions that start subprocesses require further
 runtime support.
 
+The local Ctrl+C and Ctrl+V shortcuts also share up to 1 MiB of UTF-8 text with LixinOS Code and the guest `clip` command through `/tmp/.lixinos-clipboard`. Large selections use that channel in full. Short selections also use the existing Win3 desktop clipboard.
+
 ## Build and install
 
 Run from the repository root on macOS with CMake and the usual LixinOS

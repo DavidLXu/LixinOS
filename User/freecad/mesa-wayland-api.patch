@@ -1,0 +1,17 @@
+--- a/src/loader/loader_wayland_helper.h
++++ b/src/loader/loader_wayland_helper.h
+@@ -24,6 +24,14 @@
+ #define LOADER_WAYLAND_HELPER_HEADER_H
+ 
+ #include <wayland-client.h>
++#ifdef __lixinos__
++#include <wayland-version.h>
++#include <util/timespec.h>
++#if WAYLAND_VERSION_MAJOR == 1 && WAYLAND_VERSION_MINOR >= 24
++#define HAVE_WL_DISPATCH_QUEUE_TIMEOUT 1
++#define HAVE_WL_CREATE_QUEUE_WITH_NAME 1
++#endif
++#endif
+ 
+ #ifndef HAVE_WL_DISPATCH_QUEUE_TIMEOUT
+ 

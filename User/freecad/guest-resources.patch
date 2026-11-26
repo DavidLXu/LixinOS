@@ -1,0 +1,13 @@
+--- a/src/App/Application.cpp
++++ b/src/App/Application.cpp
+@@ -2497,9 +2497,7 @@
+ void Application::initConfig(int argc, char ** argv)
+ {
+     // find the home path....
+-    mConfig["AppHomePath"] = Base::FileInfo::pathToString(
+-        ApplicationDirectories::findHomePath(argv[0])
+-    );
++    mConfig["AppHomePath"] = "/lib/freecad-desktop/";
+ 
+     // Version of the application extracted from SubWCRef into src/Build/Version.h
+     // We only set these keys if not yet defined. Therefore it suffices to search

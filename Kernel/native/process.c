@@ -1,5 +1,10 @@
+#include "record-lock.h"
+#include "ipc.h"
 #include "native.h"
+#include "identity.h"
 #include "smp.h"
+#include "kthread.h"
+#include "vm.h"
 #include "version.h"
 #include "build-memory.h"
 
@@ -75,8 +80,44 @@ static struct frame_map {
     unsigned count, sealed;
 } heaps[BANKS][ARENAS];
 static unsigned mapped[2][ARENAS];
-static void map_frame(unsigned kind, unsigned i, u64 value) {
-    struct cpu_tables *t = &cpu_tables[smp_cpu()];
+static unsigned mapped_owner[2]={BANKS,BANKS};
+static struct vm_space vm_spaces[BANKS];
+static void vm_bind_cpu(unsigned cpu, const struct vm_space *space) {
+    for (unsigned i = 0; i < LX_VM_DIRS; ++i)
+        cpu_tables[cpu].root[(LX_VM_BASE / GIB) + i] =
+            space && space->dirs[i] ? (u64)space->dirs[i] | 3 : 0;
+}
+void vm_publish(unsigned owner, const struct vm_space *space) {
+    for (unsigned cpu = 0; cpu < 2; ++cpu)
+        if (mapped_owner[cpu] == owner) vm_bind_cpu(cpu, space);
+}
+int vm_memory_low(void) {
+    unsigned free = 0;
+    for (unsigned i=0; i<HEAP_FRAMES && free<16; ++i) free += !heap_used[i];
+    return free < 16;
+}
+void *vm_allocate(u64 bytes) {
+    if (bytes != BLOCK) return file_buffer(bytes);
+    for (unsigned steps = 0; steps < HEAP_FRAMES; ++steps) {
+        if (frame_hint >= HEAP_FRAMES) frame_hint = 0;
+        unsigned frame = frame_hint++;
+        if (!heap_used[frame]) {
+            heap_used[frame] = 1;
+            return (void *)frame_address(frame);
+        }
+    }
+    return 0;
+}
+void vm_release(void *ptr, u64 bytes) {
+    if (bytes != BLOCK) { release_buffer(ptr, bytes); return; }
+    u64 pa = (u64)ptr;
+    unsigned frame = build_volume ? (pa - BUILD_FRAMES) / BLOCK :
+        pa >= 0x98000000UL ? 80 + (pa - 0x98000000UL) / BLOCK :
+        pa >= 0x70000000UL ? 16 + (pa - 0x70000000UL) / BLOCK : (pa - 0x66000000UL) / BLOCK;
+    heap_used[frame] = 0;
+}
+static void map_frame(unsigned cpu,unsigned kind, unsigned i, u64 value) {
+    struct cpu_tables *t = &cpu_tables[cpu];
     u64 addr = arena_base[kind] + i * BLOCK;
     u64 *entries = addr >= 64 * GIB  ? t->wide_tables[(addr - 64 * GIB) / GIB]
                    : addr >= 3 * GIB ? t->extended
@@ -84,17 +125,21 @@ static void map_frame(unsigned kind, unsigned i, u64 value) {
                                      : t->ram;
     entries[(addr % GIB) / BLOCK] = value;
 }
-static void map_heap(unsigned id) {
+static void map_heap_cpu(unsigned cpu,unsigned id) {
     for (unsigned kind = 0; kind < ARENAS; kind++) {
         struct frame_map *h = &heaps[id][kind];
         for (unsigned i = 0; i < h->count; i++)
-            map_frame(kind, i,
+            map_frame(cpu,kind, i,
                       frame_address(h->frames[i]) | NORMAL | EL0 | PXN |
                           (i < h->sealed ? RO : UXN));
-        for (unsigned i = h->count; i < mapped[smp_cpu()][kind]; i++)
-            map_frame(kind, i, 0);
-        mapped[smp_cpu()][kind] = h->count;
+        for (unsigned i = h->count; i < mapped[cpu][kind]; i++)
+            map_frame(cpu,kind, i, 0);
+        mapped[cpu][kind] = h->count;
     }
+}
+static void map_heap(unsigned id) {
+    for (unsigned cpu=0; cpu<2; cpu++)
+        if (mapped_owner[cpu]==id) map_heap_cpu(cpu,id);
 }
 static long grow_heap(unsigned kind, u64 size) {
     unsigned limit = build_volume ? build_blocks[kind] : kind <= PROGRAM_ARENA ? 64 : 0;
@@ -134,8 +179,10 @@ void smp_bind_kernel(void) {
 void select_bank(unsigned id) {
     if (id >= NATIVE_TASKS) return;
     smp_bind_kernel();
-    map_heap(id);
+    mapped_owner[smp_cpu()]=id;
+    map_heap_cpu(smp_cpu(),id);
     shared_switch(id);
+    vm_bind_cpu(smp_cpu(), &vm_spaces[id]);
     u64 pa = (u64)physical();
     cpu_tables[smp_cpu()].ram[32] = pa | NORMAL | EL0 | RO | PXN;
     cpu_tables[smp_cpu()].ram[33] = (pa + BLOCK) | NORMAL | EL0 | PXN | UXN;
@@ -149,10 +196,10 @@ struct redirected_file {
     char path[513];
 };
 static struct redirected_file redirected[2 * BANKS];
-#define HANDLE_COUNT 32
-#define FD_LIMIT (3 + HANDLE_COUNT)
+#define FD_LIMIT LX_DESCRIPTOR_LIMIT
+#define HANDLE_COUNT (FD_LIMIT - 3)
 struct process {
-    u32 gpu_context;
+    u32 gpu_context, audio_stream;
     char cwd[513], path[513], args[32768];
     char executable[513], start_args[32768], git_meta[513];
     unsigned start_used, start_argc, pane, start_flags;
@@ -182,6 +229,7 @@ struct process {
     } sessions[BANKS];
     long status;
     const char *error;
+    unsigned long record_owner;
     struct {
         struct file file;
         unsigned pos;
@@ -625,6 +673,7 @@ int display_busy(void) {
 int editing_file(void) { return !!processes[bank].edit_path[0]; }
 int canvas_clipboard_options(void) { return processes[bank].canvas ? processes[bank].clipboard_options : 0; }
 static int readable(u64 address, u64 size) {
+    if (vm_readable(&vm_spaces[bank], address, size)) return 1;
     if (address >= USER + BLOCK && address <= UTILITY && size <= UTILITY - address)
         return 1;
     for (unsigned kind = 0; kind < ARENAS; kind++) {
@@ -887,6 +936,13 @@ static long local_call(struct process *p, u64 value, u8 *mail) {
 static long shared_call(struct process *p, u64 value, u8 *mail) {
     unsigned command = value >> 56, fd = (value >> 32) & 255, argument = (u32)value;
     const u64 *words = (const u64 *)mail;
+    if (command == LX_SHARED_SPACE) {
+        unsigned free_chunks = 0;
+        for (unsigned i = 0; i < CHUNKS; i++) free_chunks += !chunks_used[i];
+        ((u64 *)mail)[0] = (u64)CHUNKS * CHUNK;
+        ((u64 *)mail)[1] = (u64)free_chunks * CHUNK;
+        return 0;
+    }
     if (command == 5) return shared_unmap(bank, words[0], words[1]);
     struct shared_file *file = fd >= 3 && fd < FD_LIMIT ? p->handles[fd - 3].shared : 0;
     if (command == 0 || command == 1) {
@@ -917,7 +973,7 @@ static long syscall_service(u64 value, u64 op) {
     unsigned fd = value >> 32, n = (u32)value;
     struct file f;
     if (p->agent_child && equal(p->executable,"/bin/agent-run") && op != 12) return -1;
-    if (p->scope[0] && ((op>=19 && op<=21) || (op>=25 && op<=28) || op==48 || op==58 || op==59 || op==60 ||
+    if (p->scope[0] && ((op>=19 && op<=21) || (op>=25 && op<=28) || op==48 || op==58 || op==59 || op==60 || op==63 ||
         op==33 || op==34 || op==35 || (op==18 && ((u32)value==3 || (u32)value==16 ||
         (u32)value==17 || ((u32)value==18 && ((value>>32)&4)))))) return -1;
     if (p->test.deadline) {
@@ -937,6 +993,38 @@ static long syscall_service(u64 value, u64 op) {
         }
     }
     switch (op) {
+    case 65: {
+        if (value == LX_LOCK_PROBE) return LX_LOCK_VERSION;
+        if (fd < 3 || fd >= FD_LIMIT || !p->handles[fd-3].path[0]) return -9;
+        const char *name = p->handles[fd-3].path;
+        return record_call(&p->record_owner, name, length(name, 513), !p->handles[fd-3].file.data,
+                           n, (struct lx_record_request *)mail);
+    }
+    case 64:
+        if (value==18) return disk_checkpoint()?0:-5;
+        if (value>=12 && value<=17) {
+            char canonical[513];
+            if (length((char *)mail+16,513)>512 || !resolve(p->cwd,(char *)mail+16,canonical)) return -22;
+            return disk_mode(canonical,value,(unsigned *)mail);
+        }
+        return id_call(task_active(),value,(unsigned *)mail);
+    case 63: return audio_call(&p->audio_stream, value, (const u8 *)mail);
+    case 62: {
+        u64 args[6];
+        memcpy(args, mail, sizeof(args));
+        struct file source = {0};
+        if (value == LX_VM_FILE) {
+            if (args[4] < 3 || args[4] >= FD_LIMIT) return -9;
+            unsigned index = args[4] - 3;
+            if (p->handles[index].path[0] && !p->handles[index].file.data) {
+                if (!vfs_lookup(p->handles[index].path, &source) || source.size == 0xffffffff) return -9;
+            } else {
+                source = p->handles[index].file;
+                if (!source.data) return -9;
+            }
+        }
+        return vm_call(&vm_spaces[bank], bank, value, args, source.data, source.size);
+    }
     case 58: return local_call(p, value, (u8 *)mail);
     case 60: return gpu_call(&p->gpu_context, value, (u8 *)0x443d8000UL);
     case 59: return shared_call(p, value, (u8 *)mail);
@@ -1047,10 +1135,14 @@ static long syscall_service(u64 value, u64 op) {
         return i + 3;
     }
     case 26:
-    case 27:
+    case 27: {
+        int peek = op == 26 && (n & LX_TCP_PEEK_FLAG);
+        if (peek) n &= ~LX_TCP_PEEK_FLAG;
         if (fd < 3 || fd >= FD_LIMIT || n > 4096 || !p->handles[fd - 3].socket)
             return -1;
-        return socket_io(p->handles[fd - 3].socket - 1, op == 27, (u8 *)mail, n);
+        enum socket_operation action = op == 27 ? SOCKET_WRITE : peek ? SOCKET_PEEK : SOCKET_READ;
+        return socket_io(p->handles[fd - 3].socket - 1, action, (u8 *)mail, n);
+    }
     case 28:
         if (fd < 3 || fd >= FD_LIMIT || !p->handles[fd - 3].socket)
             return -1;
@@ -1059,6 +1151,7 @@ static long syscall_service(u64 value, u64 op) {
     case 30:
         return value <= 4096 ? entropy_read((u8 *)mail, value) : -1;
     case 29:
+        if (value == 11) return input_modifiers();
         if (value == 10) return smp_cpu();
         if (value == 9) return task_resources((u64 *)mail);
         if (value == 0)
@@ -1133,12 +1226,12 @@ static long syscall_service(u64 value, u64 op) {
             return -1;
         if (p->handles[fd - 3].socket) {
             long sent;
-            while ((sent = socket_io(p->handles[fd - 3].socket - 1, 1, (u8 *)mail, n)) == -2 && !task_stopped())
+            while ((sent = socket_io(p->handles[fd - 3].socket - 1, SOCKET_WRITE, (u8 *)mail, n)) == -2 && !task_stopped())
                 schedule();
             return sent;
         }
         fd -= 3;
-        if (!p->handles[fd].path[0] || !vfs_lookup(p->handles[fd].path, &f) || f.size > NATIVE_FILE_LIMIT)
+        if (p->handles[fd].file.data || !p->handles[fd].path[0] || !vfs_lookup(p->handles[fd].path, &f) || f.size > NATIVE_FILE_LIMIT)
             return -1;
         unsigned off = p->handles[fd].append ? f.size : p->handles[fd].pos;
         if (off > NATIVE_FILE_LIMIT - n)
@@ -1192,6 +1285,7 @@ static long syscall_service(u64 value, u64 op) {
                     return -1;
                 memcpy(bytes, f.data, f.size);
                 p->handles[i].file = (struct file){bytes, f.size};
+                memcpy(p->handles[i].path, path, length(path, 513) + 1);
                 p->handles[i].pos = 0;
                 return i + 3;
             }
@@ -1205,11 +1299,11 @@ static long syscall_service(u64 value, u64 op) {
         }
         if (fd >= 3 && fd < FD_LIMIT && n <= 4096 && p->handles[fd - 3].socket) {
             long got;
-            while ((got = socket_io(p->handles[fd - 3].socket - 1, 0, (u8 *)mail, n)) == -2 && !task_stopped())
+            while ((got = socket_io(p->handles[fd - 3].socket - 1, SOCKET_READ, (u8 *)mail, n)) == -2 && !task_stopped())
                 schedule();
             return got;
         }
-        if (n <= 4096 && fd >= 3 && fd < FD_LIMIT && p->handles[fd - 3].path[0]) {
+        if (n <= 4096 && fd >= 3 && fd < FD_LIMIT && p->handles[fd - 3].path[0] && !p->handles[fd - 3].file.data) {
             if (!vfs_lookup(p->handles[fd-3].path, &f) || f.size == 0xffffffff) return -1;
             unsigned pos = p->handles[fd-3].pos;
             if (pos >= f.size) return 0;
@@ -1269,6 +1363,9 @@ static long syscall_service(u64 value, u64 op) {
     case 14:
         return console_read(value > 1000 ? 1000 : value);
     case 19: {
+        if (value == 2)
+            return p->canvas && !p->background && process_pane() == focused_pane() && popup_tab_input()
+                       ? (long)canvas_navigation_keys() : -1;
         u64 size = canvas_size();
         unsigned mode = value ? CANVAS_RESIZABLE : CANVAS_FIXED;
         if (!popup_tab_input() || value > 1 || (p->canvas && p->canvas != mode) ||
@@ -1387,7 +1484,7 @@ static long syscall_service(u64 value, u64 op) {
         fd &= 0x7fffffff;
         if (fd < 3 || fd >= FD_LIMIT)
             return -1;
-        if (!p->handles[fd-3].path[0] && ((value >> 63) || !p->handles[fd-3].file.data)) return -1;
+        if (!p->handles[fd-3].path[0] || ((value >> 63) && p->handles[fd-3].file.data)) return -1;
         if (!(value >> 63)) { p->handles[fd-3].pos = n; return 0; }
         const char *name = p->handles[fd-3].path;
         if (n > NATIVE_FILE_LIMIT || !vfs_lookup(name, &f) || f.size == 0xffffffff) return -1;
@@ -1417,7 +1514,7 @@ static long syscall_service(u64 value, u64 op) {
         p->env_result = value+1;
         return 0;
     case 55: return task_stop_child(value);
-    case 54: return task_pid();
+    case 54: return task_query(value);
     case 53:
         if (p->env_result) memcpy((void *)MAIL,p->environment,p->env_result-1);
         return p->env_result;
@@ -1492,9 +1589,9 @@ static int load_elf(struct file f, u64 code_end, u64 data_end) {
 
 static long start_desktop_child(struct process *p, int action, const char *request, int *child_slot) {
     const char *image = action == -3   ? "/bin/text-editor"
-                        : action == -2 ? request
+                        : (action == -2 || action == -5) ? request
                         : action == -1 ? "/bin/nano"
-                        : action == 0  ? "/bin/bash"
+                        : (action == 0 || action == -4) ? "/bin/bash"
                                        : 0;
     if (!image || !resolve(p->cwd, image, p->path))
         return -1;
@@ -1509,15 +1606,20 @@ static long start_desktop_child(struct process *p, int action, const char *reque
         arg = add_text(arg, action == -2 ? "-g" : request) + 1;
         p->argc++;
     }
+    if (action == -4) {
+        arg = add_text(arg, "--launch") + 1;
+        arg = add_text(arg, request) + 1;
+        p->argc += 2;
+    }
     p->used = arg - p->args;
     int slot = task_slot();
-    int popup = action != -2 && action != -3;
+    int popup = action != -2 && action != -3 && action != -5;
     u64 canvas = canvas_size();
     unsigned tw = ((unsigned *)MAIL)[1];
     if (slot < 0 || (popup && (!readable(ARENA, (canvas & 65535) * 44 * 4UL) ||
                                !popup_open(slot, tw, (const u32 *)ARENA, action == -1))))
         return -1;
-    if (action == 0) popup_mark_tab(slot);
+    if (action == 0 || action == -4) popup_mark_tab(slot);
     long pid = spawn(p, 8);
     if (pid < 0) {
         if (popup) popup_hide(slot, 0);
@@ -1535,10 +1637,10 @@ static void remove_tab(struct process *p, unsigned index) {
             (p->windows - index) * sizeof(p->sessions[0]));
 }
 
-static int add_tab(struct process *p, int previous) {
+static int add_tab(struct process *p, int previous, const char *command) {
     if (p->windows >= TERMINAL_TABS) return -1;
     int slot;
-    long pid = start_desktop_child(p, 0, "", &slot);
+    long pid = start_desktop_child(p, command ? -4 : 0, command ? command : "", &slot);
     if (pid < 0) return -1;
     if (previous >= 0) popup_position(slot, previous);
     unsigned index = p->windows++;
@@ -1547,14 +1649,14 @@ static int add_tab(struct process *p, int previous) {
     return index;
 }
 
-static long terminal_tabs(struct process *p, int action) {
+static long terminal_tabs(struct process *p, int action, const char *request) {
     for (unsigned i = 0; i < p->windows;) {
         if (task_wait_mode(p->sessions[i].pid, 1) == -2) i++;
         else remove_tab(p, i);
     }
     int active;
-    if (!action) {
-        active = add_tab(p, -1);
+    if (!action || action == -4) {
+        active = add_tab(p, -1, action == -4 ? request : 0);
     } else if (p->windows) {
         active = action > (int)p->windows ? p->windows - 1 : action - 1;
         if (!popup_show(p->sessions[active].slot)) return -1;
@@ -1588,7 +1690,7 @@ static long terminal_tabs(struct process *p, int action) {
         } else if (click == TAB_NEW || (click > 0 && click != active + 1)) {
             popup_hide(slot, 1);
             if (click == TAB_NEW) {
-                int new_tab = add_tab(p, slot);
+                int new_tab = add_tab(p, slot, 0);
                 if (new_tab >= 0) {
                     active = new_tab;
                 } else if (!popup_show(slot)) return -1;
@@ -1620,7 +1722,7 @@ static long desktop_child(struct process *p) {
     int action = *(int *)MAIL;
     const char *request = (const char *)(MAIL + 8);
     if (length(request, 513) > 512) return -1;
-    if (action >= 0) return terminal_tabs(p, action);
+    if (action >= 0 || action == -4) return terminal_tabs(p, action, request);
     int slot;
     long pid = start_desktop_child(p, action, request, &slot);
     if (pid < 0) return -1;
@@ -1632,7 +1734,7 @@ static long desktop_child(struct process *p) {
 
 static long launch(const char *name, const char *args, unsigned n, unsigned argc, unsigned flags) {
     struct file f;
-    if (!vfs_lookup(name, &f) || !argc || n > 32768)
+    if (!disk_can_execute(name) || !vfs_lookup(name, &f) || !argc || n > 32768)
         return -1;
     for (unsigned depth = 0; magic(f, "LXalias1\n", 9); depth++) {
         if (depth == 8 || f.size <= 9 || f.size > 521)
@@ -1640,7 +1742,7 @@ static long launch(const char *name, const char *args, unsigned n, unsigned argc
         char target[513];
         memcpy(target, f.data + 9, f.size - 9);
         target[f.size - 9] = 0;
-        if (!canonical_path(target) || !vfs_lookup(target, &f))
+        if (!canonical_path(target) || !disk_can_execute(target) || !vfs_lookup(target, &f))
             return -1;
     }
     struct process *active=&processes[bank];
@@ -1670,6 +1772,7 @@ static long launch(const char *name, const char *args, unsigned n, unsigned argc
     if (active->scope[0] && magic(f,"LXcmd1\n",7) &&
         !(magic(f,"LXcmd1\ngit",10) && f.size==10)) return 1;
     if (magic(f, "LXcmd1\nshutdown", 15) && f.size == 15 && argc == 1) {
+        if (id_uid(task_active())) return 1;
         if (!disk_checkpoint()) {
             serial_text("Build disk checkpoint failed\n");
             return 1;
@@ -1810,6 +1913,9 @@ static long launch(const char *name, const char *args, unsigned n, unsigned argc
         if (!batch_begin(bank))
             return -1;
     }
+    if (f.size != 0xffffffff && musl_program(f.data,f.size)) {
+        if (!vfs_lookup("/bin/ld-musl", &f) || f.size == 0xffffffff) return -1;
+    }
     u8 *image = physical(), *argument = image + (MAIL - USER);
     memset(image, 0, 2 * BLOCK);
     u64 a, b, c, d;
@@ -1852,23 +1958,23 @@ static long launch(const char *name, const char *args, unsigned n, unsigned argc
         d = 0;
     }
     sync_image();
-    long status = enter_el0(a, b, c, d);
+    long status = kt_end_group(enter_el0(a, b, c, d));
     while (status == 256) {
         struct process *parent = &processes[bank];
         if (parent->agent_child && equal(name, "/bin/agent-run") && !parent->argc) {
-            status = enter_el0(0,0,0,65536);
+            status = kt_end_group(enter_el0(0,0,0,65536));
             continue;
         }
         if (parent->canvas && !parent->argc) {
             long child = desktop_child(parent);
             *(int *)MAIL = parent->windows;
             add_text((char *)(MAIL + 8), child ? "Application failed" : "");
-            status = enter_el0(0, 0, 0, 65536);
+            status = kt_end_group(enter_el0(0, 0, 0, 65536));
             continue;
         }
         long pid = spawn(parent, 8);
         parent->status = pid < 0 ? -1 : task_wait(pid);
-        status = enter_el0(0, 0, 0, 0);
+        status = kt_end_group(enter_el0(0, 0, 0, 0));
     }
     if (self->agent) display_agent_bar(0,"");
     return git ? git_finish(bank, status) : status;
@@ -1942,7 +2048,14 @@ fail:
 }
 
 long native_syscall(u64 value, u64 op) {
-    long result = syscall_service(value,op);
+    long result;
+    if (op==61) result=smp_clock_allowed() ? kt_call(value) : -1;
+    else if (op==38 || op==43) result=syscall_service(value,op);
+    else {
+        kt_service_enter();
+        result=syscall_service(value,op);
+        kt_service_leave();
+    }
     int stop = task_stopped();
     return stop == 137 ? -4094 : stop == 130 ? -4095 : result;
 }
@@ -1969,8 +2082,14 @@ long run_task(unsigned slot) {
     redirect_close(p->input, 0);
     for (unsigned i = 0; i < HANDLE_COUNT; i++)
         close_handle(p, i);
+    record_release(p->record_owner);
+    p->record_owner = 0;
     gpu_close(&p->gpu_context);
+    audio_close(&p->audio_stream);
     shared_clear(slot);
+    vm_publish(slot, 0);
+    vm_sync();
+    vm_destroy(&vm_spaces[slot]);
     for (unsigned kind = 0; kind < ARENAS; kind++) {
         struct frame_map *heap = &heaps[slot][kind];
         heap->sealed = 0;
@@ -1983,6 +2102,22 @@ long run_task(unsigned slot) {
     }
     p->canvas = p->foreground = 0;
     return status;
+}
+
+static void fault_word(u64 value) {
+    const char *digits="0123456789abcdef";
+    char text[19];
+    char *p=text+sizeof(text);
+    *--p=0;
+    do { *--p=digits[value&15]; value >>= 4; } while(value);
+    *--p='x'; *--p='0';
+    serial_text(p);
+}
+void report_user_fault(u64 syndrome, u64 pc, u64 address, u64 link) {
+    serial_text("User fault: ESR="); fault_word(syndrome);
+    serial_text(" PC="); fault_word(pc);
+    serial_text(" FAR="); fault_word(address);
+    serial_text(" LR="); fault_word(link); serial_text("\n");
 }
 
 void fatal_vector(void) {

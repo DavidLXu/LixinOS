@@ -1,0 +1,13 @@
+fontFile Helvetica /lib/gtk3/fonts/FiraSans-Regular.ttf
+fontFile Helvetica-Bold /lib/gtk3/fonts/FiraSans-Regular.ttf
+fontFile Helvetica-Oblique /lib/gtk3/fonts/FiraSans-Regular.ttf
+fontFile Helvetica-BoldOblique /lib/gtk3/fonts/FiraSans-Regular.ttf
+fontFile Times-Roman /lib/gtk3/fonts/FiraSans-Regular.ttf
+fontFile Times-Bold /lib/gtk3/fonts/FiraSans-Regular.ttf
+fontFile Times-Italic /lib/gtk3/fonts/FiraSans-Regular.ttf
+fontFile Times-BoldItalic /lib/gtk3/fonts/FiraSans-Regular.ttf
+fontFile Courier /lib/gtk3/fonts/JetBrainsMono-Regular.ttf
+fontFile Courier-Bold /lib/gtk3/fonts/JetBrainsMono-Regular.ttf
+fontFile Courier-Oblique /lib/gtk3/fonts/JetBrainsMono-Regular.ttf
+fontFile Courier-BoldOblique /lib/gtk3/fonts/JetBrainsMono-Regular.ttf
+fontFileCC Adobe-GB1 /lib/gtk3/fonts/NotoSansMonoCJKsc-Regular.otf

@@ -1,0 +1,40 @@
+--- GCS.cpp
++++ GCS.cpp
+@@ -4900,9 +4900,7 @@
+         //
+         // identifyDependentParametersDenseQR(J, jacobianconstraintmap, pdiagnoselist, true)
+         //
+-        auto fut = std::async(
+-            &System::identifyDependentParametersDenseQR,
+-            this,
++        identifyDependentParametersDenseQR(
+             J,
+             jacobianconstraintmap,
+             pdiagnoselist,
+@@ -4920,7 +4918,6 @@
+         // identifyDependentGeometryParametersInTransposedJacobianDenseQRDecomposition( qrJT,
+         // pdiagnoselist, paramsNum, rank);
+ 
+-        fut.wait();  // wait for the execution of identifyDependentParametersSparseQR to finish
+ 
+         dofs = paramsNum - rank;  // unless overconstraint, which will be overridden below
+ 
+@@ -4977,9 +4974,7 @@
+         // auto fut =
+         // std::async(std::launch::deferred,&System::identifyDependentParametersSparseQR, this,
+         // J, jacobianconstraintmap, pdiagnoselist, false);
+-        auto fut = std::async(
+-            &System::identifyDependentParametersSparseQR,
+-            this,
++        identifyDependentParametersSparseQR(
+             J,
+             jacobianconstraintmap,
+             pdiagnoselist,
+@@ -4999,7 +4994,6 @@
+         int paramsNum = SqrJT.rows();
+         int constrNum = SqrJT.cols();
+ 
+-        fut.wait();  // wait for the execution of identifyDependentParametersSparseQR to finish
+ 
+         dofs = paramsNum - rank;  // unless overconstraint, which will be overridden below
+ 
