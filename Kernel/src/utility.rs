@@ -173,7 +173,7 @@ impl Streams {
 }
 
 enum Handle {
-    File { path: String, data: Vec<u8>, position: usize },
+    File { path: String, data: Rc<Vec<u8>>, position: usize },
     Writable {
         path: String,
         position: usize,
@@ -228,13 +228,33 @@ unsafe extern "C" {
     fn record_call(owner: &mut u64, path: *const u8, length: u32, writable: i32,
                    query: u32, request: *mut u8) -> i64;
     fn record_release(owner: u64);
+    fn guest_read_req(addr: u64, out: *mut u64) -> i32;
+    fn guest_call(bank: u32, req: *const u64, file_data: *const u8, file_size: usize) -> i64;
+    fn guest_cleanup_bank(bank: u32);
+    fn guest_get_bound(bank: u32) -> u64;
+    fn guest_set_bound(bank: u32, space_id: u64);
 }
 impl Drop for RecordLocks {
     fn drop(&mut self) { unsafe { record_release(self.0); } }
 }
 
+struct GuestOwner {
+    bank: u32,
+    used: bool,
+    bound: u64,
+}
+impl GuestOwner {
+    fn new() -> Self { Self { bank: user::bank() as u32, used: false, bound: 0 } }
+}
+impl Drop for GuestOwner {
+    fn drop(&mut self) {
+        if self.used { unsafe { guest_cleanup_bank(self.bank); } }
+    }
+}
+
 pub(super) struct Context {
     locks: RecordLocks,
+    guest: GuestOwner,
     audio: AudioStream,
     #[cfg(feature = "retina")]
     gpu: GpuContext,
@@ -309,6 +329,7 @@ impl Context {
             vm: Default::default(),
             audio: Default::default(),
             locks: Default::default(),
+            guest: GuestOwner::new(),
             shared: user::SharedMappings::new(),
             executable: String::new(),
             connections: Default::default(), peeked:None,cursor: None, volume, cwd: cwd.into(), streams, handles: (3..256).map(|_| None).collect(), fs_batch: None }
@@ -326,9 +347,18 @@ impl Context {
         self.wide.set_mapped(true);
         self.shared.set_mapped(true);
         self.vm.bind(true);
+        if self.guest.bound != 0 {
+            unsafe { guest_set_bound(self.guest.bank, self.guest.bound); }
+        }
         unsafe { *slot = Some(self); }
         let result = launch();
-        let io = unsafe { (*slot).take().unwrap() };
+        let mut io = unsafe { (*slot).take().unwrap() };
+        if io.guest.used {
+            io.guest.bound = unsafe { guest_get_bound(io.guest.bank) };
+            if io.guest.bound != 0 {
+                unsafe { guest_set_bound(io.guest.bank, 0); }
+            }
+        }
         io.heap.set_mapped(false);
         io.extended.set_mapped(false);
         io.program.set_mapped(false);
@@ -552,6 +582,31 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
         59 => Some(shared_memory(context, value) as u64),
         63 if !crate::process::agent_noninteractive() =>
             Some(unsafe { audio_call(&mut context.audio.0, value, user::utility_mailbox()) } as u64),
+        66 if !crate::process::agent_noninteractive() => {
+            let mut req = [0u64; 8];
+            if unsafe { guest_read_req(value, req.as_mut_ptr()) } == 0 {
+                return Some((-14i64) as u64);
+            }
+            if req[0] != 0 {
+                context.guest.used = true;
+            }
+            if req[0] == 5 {
+                let volume = context.volume.borrow();
+                let bytes: &[u8] = match (req[5] as usize).checked_sub(3).and_then(|fd| context.handles.get(fd))
+                    .and_then(Option::as_ref) {
+                    Some(Handle::File { data, .. }) => data,
+                    Some(Handle::Writable { path, .. }) => match volume.files.get(path) {
+                        Some(Some(data)) => data,
+                        _ => return Some((-9i64) as u64),
+                    },
+                    _ => return Some((-9i64) as u64),
+                };
+                return Some(unsafe {
+                    guest_call(user::bank() as u32, req.as_ptr(), bytes.as_ptr(), bytes.len()) as u64
+                });
+            }
+            Some(unsafe { guest_call(user::bank() as u32, req.as_ptr(), core::ptr::null(), 0) as u64 })
+        }
         62 => {
             let words = unsafe { *user::utility_mailbox().cast::<[u64; 6]>() };
             let volume = context.volume.borrow();
@@ -734,7 +789,7 @@ pub fn io(value: u64, operation: u64) -> Option<u64> {
                 .and_then(|name| {
                     let volume = context.volume.borrow();
                     let path = volume.resolve(&context.cwd, name).ok()?;
-                    volume.read_file(&path).ok().map(|bytes| (path, bytes))
+                    volume.read_file_rc(&path).ok().map(|bytes| (path, bytes))
                 });
             let fd = context.handles.iter().position(Option::is_none);
             Some(match (data, fd) {

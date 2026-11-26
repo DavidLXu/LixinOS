@@ -123,6 +123,9 @@ smp_irq_vector:
     bl smp_kernel_enter
     mov x0,sp
     bl smp_timer_irq
+    mov x0,sp
+    bl guest_irq_check
+    cbnz x0,guest_unwind_to_host
     bl smp_check_stop
     cbz x0,smp_restore
     add sp,sp,#816
@@ -183,43 +186,11 @@ smp_enter_preserved:
     stp x14,x15,[sp,#-16]!
     stp x16,x17,[sp,#-16]!
     stp x18,x30,[sp,#-16]!
-    PUSHQ(0,1)
-    PUSHQ(2,3)
-    PUSHQ(4,5)
-    PUSHQ(6,7)
-    PUSHQ(8,9)
-    PUSHQ(10,11)
-    PUSHQ(12,13)
-    PUSHQ(14,15)
-    PUSHQ(16,17)
-    PUSHQ(18,19)
-    PUSHQ(20,21)
-    PUSHQ(22,23)
-    PUSHQ(24,25)
-    PUSHQ(26,27)
-    PUSHQ(28,29)
-    PUSHQ(30,31)
-    add x0,sp,#656 // x0 saved above 512 SIMD bytes and nine GPR pairs
+    add x0,sp,#144 // x0 saved above nine GPR pairs
     mov x1,x8
     RD(2,REG(3,0,5,2,0))
     bl smp_enter_svc
     .long 0xf100001f // cmp x0,#0
-    POPQ(30,31)
-    POPQ(28,29)
-    POPQ(26,27)
-    POPQ(24,25)
-    POPQ(22,23)
-    POPQ(20,21)
-    POPQ(18,19)
-    POPQ(16,17)
-    POPQ(14,15)
-    POPQ(12,13)
-    POPQ(10,11)
-    POPQ(8,9)
-    POPQ(6,7)
-    POPQ(4,5)
-    POPQ(2,3)
-    POPQ(0,1)
     ldp x18,x30,[sp],#16
     ldp x16,x17,[sp],#16
     ldp x14,x15,[sp],#16
@@ -420,6 +391,11 @@ vm_retry_user:
     RD(0,REG(3,0,5,2,0))
     RD(1,REG(3,0,6,0,0))
     bl vm_handle_fault
+    cbnz x0,vm_retry_done
+    RD(0,REG(3,0,5,2,0))
+    RD(1,REG(3,0,6,0,0))
+    bl guest_handle_fault
+vm_retry_done:
     .long 0xf100001f // cmp x0,#0
     POPQ(30,31)
     POPQ(28,29)

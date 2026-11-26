@@ -2,6 +2,7 @@
 #include "runtime.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +56,26 @@ struct guest_events {
 };
 static struct guest_events *tables;
 static u64 next_key;
+static int event_epoch;
+static void wake_events(void) {
+    __atomic_add_fetch(&event_epoch, 1, __ATOMIC_RELEASE);
+    thread_futex_wake(&event_epoch, INT_MAX);
+}
+static long wait_events(CPU *cpu, int snap, int has_native, long rem_ms) {
+    struct timespec ts;
+    const struct timespec *timeout = NULL;
+    if (has_native) {
+        long wait_ms = (rem_ms >= 0 && rem_ms < 1) ? rem_ms : 1;
+        ts.tv_sec = wait_ms / 1000;
+        ts.tv_nsec = (wait_ms % 1000) * 1000000L;
+        timeout = &ts;
+    } else if (rem_ms >= 0) {
+        ts.tv_sec = rem_ms / 1000;
+        ts.tv_nsec = (rem_ms % 1000) * 1000000L;
+        timeout = &ts;
+    }
+    return thread_futex_wait(cpu, &event_epoch, snap, 0, timeout);
+}
 u64 event_key(unsigned fd) {
     u64 *key = &guest_process->event_table->keys[fd];
     if (!*key)
@@ -118,6 +139,7 @@ static void release_side(struct pair *p, unsigned side) {
         free(c);
     }
     q->count = 0;
+    wake_events();
     if (!p->open[side ^ 1])
         free(p);
 }
@@ -263,11 +285,6 @@ static void close_slot(struct guest_events *t, unsigned fd) {
 }
 void event_closed(unsigned fd) { close_slot(guest_process->event_table, fd); }
 
-static void pause_guest(CPU *cpu) {
-    thread_pause();
-    usleep(1000);
-    thread_resume(cpu);
-}
 int event_ready(int fd, short requested) {
     if (fd < 0)
         return 0;
@@ -342,6 +359,7 @@ long channel_shutdown(int fd, u64 how) {
         p->read_closed[side] = p->write_closed[side ^ 1] = 1;
     if (how != SHUT_RD)
         p->write_closed[side] = p->read_closed[side ^ 1] = 1;
+    wake_events();
     return 0;
 }
 // Store credentials when a datagram is queued. A later recvmsg may run in a
@@ -466,6 +484,7 @@ static long channel_transfer(int fd, struct iovec *iov, size_t count, size_t siz
     }
     if (writing) {
         q->count += bytes + hdr;
+        wake_events();
         return bytes;
     }
     if (msg) {
@@ -510,6 +529,7 @@ static long channel_transfer(int fd, struct iovec *iov, size_t count, size_t siz
         size_t used = hdr ? hdr + packet.bytes : bytes;
         q->count -= used;
         memmove(q->data, q->data + used, q->count);
+        wake_events();
     }
     return hdr && (flags & MSG_TRUNC) ? packet.bytes : bytes;
 }
@@ -519,6 +539,7 @@ static long channel_call(CPU *cpu, int fd, u64 addr, u64 size, int writing, int 
     if (flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL | MSG_PEEK | MSG_TRUNC | MSG_CMSG_CLOEXEC))
         return -ENOTSUP;
     for (;;) {
+        int snap = __atomic_load_n(&event_epoch, __ATOMIC_ACQUIRE);
         if (event_fd(fd) != CHANNEL)
             return -EBADF;
         struct msghdr guest = {0};
@@ -568,7 +589,8 @@ static long channel_call(CPU *cpu, int fd, u64 addr, u64 size, int writing, int 
             }
             return result;
         }
-        pause_guest(cpu);
+        if (wait_events(cpu, snap, 0, -1) == -EINTR)
+            return -EINTR;
     }
 }
 long channel_io(CPU *c, int fd, u64 addr, u64 size, int writing, int flags) {
@@ -583,6 +605,7 @@ long event_io(CPU *cpu, int fd, u64 addr, size_t size, int writing) {
     if (size < 8 || event_fd(fd) != COUNTER)
         return -EINVAL;
     for (;;) {
+        int snap = __atomic_load_n(&event_epoch, __ATOMIC_ACQUIRE);
         if (event_fd(fd) != COUNTER)
             return -EBADF;
         struct event *e = &event_slots[fd];
@@ -596,17 +619,20 @@ long event_io(CPU *cpu, int fd, u64 addr, size_t size, int writing) {
                 return -EINVAL;
             if (UINT64_MAX - 1 - e->monitor->count >= value) {
                 e->monitor->count += value;
+                wake_events();
                 return 8;
             }
         } else if (e->monitor->count) {
             value = (e->monitor->flags & EFD_SEMAPHORE) ? 1 : e->monitor->count;
             e->monitor->count -= value;
             memcpy(p, &value, 8);
+            wake_events();
             return 8;
         }
         if (e->monitor->flags & EFD_NONBLOCK)
             return -EAGAIN;
-        pause_guest(cpu);
+        if (wait_events(cpu, snap, 0, -1) == -EINTR)
+            return -EINTR;
     }
 }
 long event_fcntl(int fd, int cmd, long arg) {
@@ -712,6 +738,8 @@ long event_service(CPU *c) {
     }
     u64 start = millis();
     for (;;) {
+        int snap = __atomic_load_n(&event_epoch, __ATOMIC_ACQUIRE);
+        int has_native = 0;
         size_t ready = 0;
         if (pollset) {
             if (event_fd(a[0]) != POLLSET)
@@ -727,6 +755,8 @@ long event_service(CPU *c) {
                 if (saved->event_table->keys[fd] != w->key)
                     fd = locate_key(w->key, &owner);
                 guest_process = owner;
+                if (fd >= 0 && !event_fd(fd))
+                    has_native = 1;
                 unsigned bits = fd < 0 ? 0 : event_ready(fd, w->ev.events);
                 guest_process = saved;
                 if (!bits)
@@ -745,6 +775,8 @@ long event_service(CPU *c) {
             if (!guest_copy(a[0], fds, bytes, 0))
                 return -EFAULT;
             for (size_t i = 0; i < count; i++) {
+                if (fds[i].fd >= 0 && !event_fd(fds[i].fd))
+                    has_native = 1;
                 fds[i].revents = event_ready(fds[i].fd, fds[i].events);
                 ready += !!fds[i].revents;
             }
@@ -753,9 +785,11 @@ long event_service(CPU *c) {
         }
         if (!ready && signal_ready())
             return -EINTR;
-        if (ready || (ms >= 0 && millis() - start >= (u64)ms))
+        u64 elapsed = millis() - start;
+        if (ready || (ms >= 0 && elapsed >= (u64)ms))
             return ready;
-        pause_guest(c);
+        long rem = ms >= 0 ? (long)((u64)ms - elapsed) : -1;
+        wait_events(c, snap, has_native, rem);
     }
 }
 

@@ -281,9 +281,14 @@ static long status(u64 guest_fd, u64 dest) {
 // The native file ABI transfers at most one page per call. A guest buffer of
 // this size can straddle two independently backed virtual pages.
 static long file_io(int fd, u64 addr, u64 length, int writing, const u64 *offset) {
-    size_t size = length < PAGE ? (size_t)length : PAGE;
+    size_t cap = native_el0 ? (64 * PAGE) : PAGE;
+    size_t size = length < cap ? (size_t)length : cap;
     int access = writing ? PROT_READ : PROT_WRITE;
     void *data = size ? guest_ptr(addr, size, access) : NULL;
+    if (size > PAGE && !data) {
+        size = PAGE;
+        data = guest_ptr(addr, size, access);
+    }
     unsigned char buffer[PAGE];
     size_t first_size = PAGE - addr % PAGE;
     void *first = NULL, *second = NULL;
@@ -984,6 +989,8 @@ long service(CPU *c) {
         int *word = guest_ptr(a[0], sizeof(*word), PROT_READ);
         if (!word)
             return -EFAULT;
+        struct guest_memory *fowner = NULL;
+        void *fkey = guest_futex_key(a[0], &fowner);
         // FUTEX_WAKE_OP atomically updates the second word before deciding
         // which wait queues to wake. The interpreter holds the guest CPU lock.
         if (cmd == 5) {
@@ -992,6 +999,8 @@ long service(CPU *c) {
             unsigned *second = guest_ptr(a[4], 4, PROT_READ | PROT_WRITE);
             if (!second)
                 return -EFAULT;
+            struct guest_memory *sowner = NULL;
+            void *skey = guest_futex_key(a[4], &sowner);
             unsigned encoded = a[5], op = encoded >> 28, cmp = (encoded >> 24) & 15;
             int arg = (int)(encoded << 8) >> 20, ref = (int)(encoded << 20) >> 20;
             if (op & 8) {
@@ -1022,10 +1031,10 @@ long service(CPU *c) {
             }
             int v = (int)old;
             int condition[] = {v == ref, v != ref, v<ref, v <= ref, v> ref, v >= ref};
-            long first = thread_futex_wake(word, (int)a[2]);
+            long first = thread_futex_wake_key(fowner, fkey, (int)a[2]);
             if (first < 0 || !condition[cmp])
                 return first;
-            return first + thread_futex_wake((int *)second, (int)a[3]);
+            return first + thread_futex_wake_key(sowner, skey, (int)a[3]);
         }
         const struct timespec *timeout = NULL;
         if ((cmd == 0 || (cmd & ~256u) == 9) && a[3]) {
@@ -1043,8 +1052,8 @@ long service(CPU *c) {
             timeout = &deadline;
         }
         if (cmd == 1)
-            return thread_futex_wake(word, (int)a[2]);
-        return thread_futex_wait(c, word, (int)a[2], (int)a[1], timeout);
+            return thread_futex_wake_key(fowner, fkey, (int)a[2]);
+        return thread_futex_wait_key(c, fowner, fkey, word, (int)a[2], (int)a[1], timeout);
     }
     case SYS_clone:
         return clone_thread(c);

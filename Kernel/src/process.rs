@@ -134,6 +134,14 @@ impl Volume {
         }
     }
 
+    pub(crate) fn read_file_rc(&self, path: &str) -> Result<Rc<Vec<u8>>> {
+        match self.entry(path).ok_or("file not found")? {
+            Entry::Directory => Err("is a directory"),
+            Entry::File(file) => file.try_as_rc(),
+            Entry::ProcFile(file) => Ok(Rc::new(file.read().into_bytes())),
+        }
+    }
+
     pub(crate) fn children(&self, path: &str, prefix: &str, after: Option<&str>)
         -> impl Iterator<Item = (&str, Entry<'_>)> {
         let readable=crate::permissions::allowed(self,path,5);

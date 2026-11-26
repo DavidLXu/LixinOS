@@ -1,5 +1,8 @@
 #include "mmu.h"
 #include "runtime.h"
+#include "../console.h"
+#define LX_USER_GUEST_ONLY
+#include "../../Kernel/native/guest.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -8,6 +11,89 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 #include <unistd.h>
+
+extern int lx_kernel_fd(int fd);
+int native_el0;
+static u64 bound_space;
+
+static long guest_svc(u64 op, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6, u64 a7) {
+    u64 req[8] = {op, a1, a2, a3, a4, a5, a6, a7};
+    return console_call(LX_GUEST_SVC_NR, (long)req);
+}
+void guest_vm_probe(void) {
+    if (getenv("LIXINOS_INTERP")) {
+        native_el0 = 0;
+        return;
+    }
+    native_el0 = guest_svc(LX_GUEST_QUERY, 0, 0, 0, 0, 0, 0, 0) == LX_GUEST_ABI_VER;
+}
+long guest_vm_map_anon(u64 space, u64 va, u64 len, int prot) {
+    return guest_svc(LX_GUEST_MAP_ANON, space, va, len, (u64)(unsigned)prot, 0, 0, 0);
+}
+long guest_vm_map_file(u64 space, u64 va, u64 len, int prot, int host_fd, u64 off, u64 file_bytes) {
+    int kfd = lx_kernel_fd(host_fd);
+    if (kfd < 0) return -EBADF;
+    return guest_svc(LX_GUEST_MAP_FILE, space, va, len, (u64)(unsigned)prot, (u64)kfd, off, file_bytes);
+}
+long guest_vm_map_shared(u64 space, u64 va, u64 len, int prot, u64 shared_va) {
+    return guest_svc(LX_GUEST_MAP_SHARED, space, va, len, (u64)(unsigned)prot, shared_va, 0, 0);
+}
+long guest_vm_protect(u64 space, u64 va, u64 len, int prot) {
+    return guest_svc(LX_GUEST_PROTECT, space, va, len, (u64)(unsigned)prot, 0, 0, 0);
+}
+long guest_vm_unmap(u64 space, u64 va, u64 len) {
+    return guest_svc(LX_GUEST_UNMAP, space, va, len, 0, 0, 0, 0);
+}
+long guest_vm_discard(u64 space, u64 va, u64 len) {
+    return guest_svc(LX_GUEST_DISCARD, space, va, len, 0, 0, 0, 0);
+}
+long guest_vm_run(u64 space, void *ctx, u64 slice_ticks) {
+    bound_space = space;
+    return guest_svc(LX_GUEST_RUN, space, (u64)(uintptr_t)ctx, slice_ticks, 0, 0, 0, 0);
+}
+
+/* Read-only file segment cache: shares physical pages across execve/dlopen. */
+enum { RO_CACHE_MAX = 256 };
+struct ro_cache_entry {
+    u64 dev, inode, fsize, off, len, file_bytes, cache_va;
+    struct timespec mtime;
+    int prot;
+};
+static u64 cache_space;
+static u64 cache_cursor = LX_GUEST_HIGH_BASE;
+static struct ro_cache_entry ro_cache[RO_CACHE_MAX];
+static unsigned ro_cache_count;
+
+static int map_ro_cached(u64 dst_space, u64 dst_va, u64 map_len, int prot,
+                         struct backing *f, u64 off, u64 file_bytes) {
+    for (unsigned i = 0; i < ro_cache_count; ++i) {
+        struct ro_cache_entry *e = &ro_cache[i];
+        if (e->dev == f->dev && e->inode == f->inode && e->fsize == f->size &&
+            e->mtime.tv_sec == f->modified.tv_sec && e->mtime.tv_nsec == f->modified.tv_nsec &&
+            e->off == off && e->len == map_len && e->file_bytes == file_bytes && e->prot == prot) {
+            return guest_svc(LX_GUEST_MAP_ALIAS, dst_space, dst_va, map_len,
+                             (u64)(unsigned)prot, cache_space, e->cache_va, 0) == 0;
+        }
+    }
+    if (ro_cache_count >= RO_CACHE_MAX || map_len > LX_GUEST_HIGH_END - cache_cursor)
+        return 0;
+    if (!cache_space) {
+        long id = guest_svc(LX_GUEST_SPACE_CREATE, 0, 0, 0, 0, 0, 0, 0);
+        if (id <= 0) return 0;
+        cache_space = (u64)id;
+    }
+    u64 cva = cache_cursor;
+    if (guest_vm_map_file(cache_space, cva, map_len, prot, f->fd, off, file_bytes) < 0)
+        return 0;
+    cache_cursor += map_len;
+    ro_cache[ro_cache_count++] = (struct ro_cache_entry){
+        .dev = f->dev, .inode = f->inode, .fsize = f->size, .off = off,
+        .len = map_len, .file_bytes = file_bytes, .cache_va = cva,
+        .mtime = f->modified, .prot = prot,
+    };
+    return guest_svc(LX_GUEST_MAP_ALIAS, dst_space, dst_va, map_len,
+                     (u64)(unsigned)prot, cache_space, cva, 0) == 0;
+}
 
 enum { PRESENT = 8, RESIDENT = 16, BEYOND_EOF = 32, SHARED_READONLY = 64 };
 struct page {
@@ -19,12 +105,41 @@ struct page {
 struct guest_memory {
     unsigned char *arena;
     struct page *table;
+    u64 space_id;
+    unsigned char *nflags;
     u64 cursor, brk, data_bytes;
     unsigned refs;
 };
 #define ram (guest_process->memory->arena)
 #define pages (guest_process->memory->table)
+#define nflags_tbl (guest_process->memory->nflags)
 #define next_map (guest_process->memory->cursor)
+static inline size_t nidx(u64 addr) { return (addr - MAIN_BASE) / PAGE; }
+static inline size_t ncount(void) { return (ARENA - MAIN_BASE) / PAGE; }
+u64 guest_space_id(void) { return guest_process->memory->space_id; }
+void guest_ensure_bound(void) {
+    u64 id = guest_process->memory->space_id;
+    if (bound_space != id) {
+        if (guest_svc(LX_GUEST_BIND, id, 0, 0, 0, 0, 0, 0) < 0)
+            fail("cannot bind guest address space");
+        bound_space = id;
+    }
+}
+void *guest_futex_key(u64 addr, struct guest_memory **owner_out) {
+    if (!native_el0) {
+        *owner_out = NULL;
+        return guest_ptr(addr, 4, PROT_READ);
+    }
+    if (addr >= ARENA) {
+        void *sk = high_shared_key(addr);
+        if (sk) {
+            *owner_out = NULL;
+            return sk;
+        }
+    }
+    *owner_out = guest_process->memory;
+    return (void *)(uintptr_t)addr;
+}
 static unsigned long file_faults, file_bytes_read;
 static unsigned live_files, native_limit = 35;
 static struct backing *all_files;
@@ -92,6 +207,20 @@ int memory_create(struct guest_process *process) {
     m->cursor = MMAP_BASE;
     m->brk = BRK_BASE;
     m->refs = 1;
+    if (native_el0) {
+        long id = guest_svc(LX_GUEST_SPACE_CREATE, 0, 0, 0, 0, 0, 0, 0);
+        if (id <= 0) {
+            memory_destroy(process);
+            return id < 0 ? (int)id : -ENOMEM;
+        }
+        m->space_id = (u64)id;
+        m->nflags = calloc(ncount(), 1);
+        if (!m->nflags) {
+            memory_destroy(process);
+            return -ENOMEM;
+        }
+        return 0;
+    }
     m->arena = mmap(NULL, ARENA, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     m->table = calloc(ARENA / PAGE, sizeof *m->table);
     if (m->arena == MAP_FAILED || !m->table) {
@@ -121,6 +250,12 @@ void memory_destroy(struct guest_process *process) {
     process->memory = NULL;
     if (!m || --m->refs)
         return;
+    if (m->space_id) {
+        if (bound_space == m->space_id)
+            bound_space = 0;
+        guest_svc(LX_GUEST_SPACE_DESTROY, m->space_id, 0, 0, 0, 0, 0, 0);
+    }
+    free(m->nflags);
     if (m->table) {
         for (size_t i = 0; i < ARENA / PAGE; ++i)
             release_backing(m->table[i].file);
@@ -132,6 +267,29 @@ void memory_destroy(struct guest_process *process) {
     process->memory = NULL;
 }
 int memory_clone(struct guest_process *child) {
+    if (native_el0) {
+        struct guest_memory *m = calloc(1, sizeof *m);
+        if (!m)
+            return -ENOMEM;
+        child->memory = m;
+        m->cursor = next_map;
+        m->data_bytes = guest_process->memory->data_bytes;
+        m->brk = guest_process->memory->brk;
+        m->refs = 1;
+        long id = guest_svc(LX_GUEST_SPACE_CLONE, guest_process->memory->space_id, 0, 0, 0, 0, 0, 0);
+        if (id <= 0) {
+            memory_destroy(child);
+            return id < 0 ? (int)id : -ENOMEM;
+        }
+        m->space_id = (u64)id;
+        m->nflags = malloc(ncount());
+        if (!m->nflags) {
+            memory_destroy(child);
+            return -ENOMEM;
+        }
+        memcpy(m->nflags, nflags_tbl, ncount());
+        return 0;
+    }
     int rc = memory_create(child);
     if (rc)
         return rc;
@@ -180,6 +338,8 @@ static void page_in(size_t i) {
 // Before the native descriptor table fills up, finish reading
 // the smallest closed mapping so its fd can be reused without reopening its path.
 static int make_fd_available(void) {
+    if (native_el0)
+        return 0;
     struct backing *smallest = NULL;
     for (size_t i = 0; i < ARENA / PAGE; i++) {
         struct backing *f = pages[i].file;
@@ -204,6 +364,19 @@ void *guest_ptr(u64 addr, u64 len, int access) {
         return high_ptr(addr, len, access);
     if (addr < MAIN_BASE || addr >= ARENA || len > ARENA - addr)
         return NULL;
+    if (native_el0) {
+        if (len) {
+            const unsigned required = PRESENT | access;
+            unsigned char *nf = nflags_tbl;
+            size_t first = nidx(addr), last = nidx(addr + len - 1);
+            for (size_t i = first; i <= last; i++) {
+                if ((nf[i] & required) != required || (nf[i] & BEYOND_EOF))
+                    return NULL;
+            }
+        }
+        guest_ensure_bound();
+        return (void *)(uintptr_t)addr;
+    }
     if (len) {
         const unsigned required = PRESENT | access;
         for (size_t i = addr / PAGE; i <= (addr + len - 1) / PAGE; i++) {
@@ -242,7 +415,7 @@ static int account_pages(u64 start, u64 end, int prot) {
     long delta = 0;
     int writable = prot >= 0 && (prot & (PROT_WRITE | PROT_EXEC)) == PROT_WRITE;
     for (u64 pos = start; pos < end; pos += PAGE) {
-        int old = pages[pos / PAGE].flags;
+        int old = native_el0 ? nflags_tbl[nidx(pos)] : pages[pos / PAGE].flags;
         delta += PAGE * (long)(writable - ((old & (PRESENT | PROT_WRITE | PROT_EXEC |
                                                    SHARED_READONLY)) == (PRESENT | PROT_WRITE)));
     }
@@ -269,8 +442,53 @@ int set_mapping(u64 start, u64 length, int prot, struct backing *f, u64 off, u64
     if (length > ARENA || !valid_range(start, start + length) || (prot & ~7) ||
         off > INT64_MAX - ARENA || file_bytes > length)
         return -EINVAL;
-    if (account_pages(start, start + length, prot))
+    u64 map_len = (length + PAGE - 1) & ~(u64)(PAGE - 1);
+    if (start + map_len > ARENA)
+        return -EINVAL;
+    if (account_pages(start, start + map_len, prot))
         return -ENOMEM;
+    if (native_el0) {
+        u64 space = guest_space_id();
+        if (tracing && f && (prot & PROT_EXEC))
+            fprintf(stderr, "linux-run: code %s va=%#lx offset=%#lx size=%#lx\n", f->path,
+                    (unsigned long)start, (unsigned long)off, (unsigned long)length);
+        long rc = 0;
+        if (!f || !file_bytes) {
+            rc = guest_vm_map_anon(space, start, map_len, prot);
+        } else {
+            u64 valid_file = off < f->size ? (file_bytes < f->size - off ? file_bytes : f->size - off) : 0;
+            u64 valid_pages = (valid_file + PAGE - 1) & ~(u64)(PAGE - 1);
+            u64 req_pages = (file_bytes + PAGE - 1) & ~(u64)(PAGE - 1);
+            if (valid_pages > map_len) valid_pages = map_len;
+            if (req_pages > map_len) req_pages = map_len;
+            if (valid_pages) {
+                if (!(prot & PROT_WRITE) && prot && valid_pages == map_len &&
+                    map_ro_cached(space, start, valid_pages, prot, f, off, valid_file)) {
+                    rc = 0;
+                } else {
+                    rc = guest_vm_map_file(space, start, valid_pages, prot, f->fd, off, valid_file);
+                }
+            }
+            if (!rc && req_pages > valid_pages)
+                rc = guest_vm_unmap(space, start + valid_pages, req_pages - valid_pages);
+            if (!rc && map_len > req_pages)
+                rc = guest_vm_map_anon(space, start + req_pages, map_len - req_pages, prot);
+        }
+        if (rc < 0)
+            return (int)rc;
+        unsigned char *nf = nflags_tbl;
+        for (u64 pos = 0; pos < map_len; pos += PAGE) {
+            unsigned char fl = PRESENT | (unsigned char)prot;
+            if (f && pos < file_bytes) {
+                if (off + pos >= f->size)
+                    fl |= BEYOND_EOF;
+                else
+                    fl |= RESIDENT; /* marks file-backed page for madvise check */
+            }
+            nf[nidx(start + pos)] = fl;
+        }
+        return 0;
+    }
     struct backing *mapped_file = mapping_backing(f);
     if (mapped_file)
         ++mapped_file->refs;
@@ -302,6 +520,17 @@ long discard_pages(u64 start, u64 length) {
     if (start < MAIN_BASE || length > ARENA - start)
         return -ENOMEM;
     u64 end = (start + length + PAGE - 1) & ~(u64)(PAGE - 1);
+    if (native_el0) {
+        unsigned char *nf = nflags_tbl;
+        for (u64 pos = start; pos < end; pos += PAGE) {
+            unsigned char fl = nf[nidx(pos)];
+            if (!(fl & PRESENT))
+                return -ENOMEM;
+            if (fl & (RESIDENT | BEYOND_EOF | SHARED_READONLY))
+                return -ENOTSUP;
+        }
+        return guest_vm_discard(guest_space_id(), start, end - start);
+    }
     for (size_t i = start / PAGE; i < end / PAGE; ++i) {
         if (!(pages[i].flags & PRESENT))
             return -ENOMEM;
@@ -316,16 +545,53 @@ long discard_pages(u64 start, u64 length) {
 int page_update(u64 start, u64 end, int prot, int require_mapped) {
     if (!valid_range(start, end) || (prot >= 0 && (prot & ~7)))
         return -EINVAL;
+    u64 map_end = (end + PAGE - 1) & ~(u64)(PAGE - 1);
+    if (map_end > ARENA)
+        return -EINVAL;
     if (require_mapped) {
-        for (size_t i = start / PAGE; i <= (end - 1) / PAGE; i++) {
-            if (!(pages[i].flags & PRESENT))
+        for (u64 pos = start; pos < map_end; pos += PAGE) {
+            unsigned char fl = native_el0 ? nflags_tbl[nidx(pos)] : pages[pos / PAGE].flags;
+            if (!(fl & PRESENT))
                 return -ENOMEM;
-            if (prot >= 0 && (prot & PROT_WRITE) && (pages[i].flags & SHARED_READONLY))
+            if (prot >= 0 && (prot & PROT_WRITE) && (fl & SHARED_READONLY))
                 return -EACCES;
         }
     }
-    if (account_pages(start, end, prot))
+    if (account_pages(start, map_end, prot))
         return -ENOMEM;
+    if (native_el0) {
+        u64 space = guest_space_id();
+        unsigned char *nf = nflags_tbl;
+        if (prot < 0) {
+            long rc = guest_vm_unmap(space, start, map_end - start);
+            if (rc < 0) return (int)rc;
+            memset(nf + nidx(start), 0, (map_end - start) / PAGE);
+        } else {
+            for (u64 pos = start; pos < map_end;) {
+                unsigned char fl = nf[nidx(pos)];
+                int mapped = !!(fl & PRESENT);
+                int eof = !!(fl & BEYOND_EOF);
+                u64 run = pos;
+                while (pos < map_end && !!(nf[nidx(pos)] & PRESENT) == mapped &&
+                       !!(nf[nidx(pos)] & BEYOND_EOF) == eof) {
+                    pos += PAGE;
+                }
+                if (!eof) {
+                    long rc = mapped ? guest_vm_protect(space, run, pos - run, prot)
+                                     : guest_vm_map_anon(space, run, pos - run, prot);
+                    if (rc < 0) return (int)rc;
+                }
+                for (u64 p = run; p < pos; p += PAGE) {
+                    size_t idx = nidx(p);
+                    nf[idx] = PRESENT | (unsigned char)prot |
+                              (nf[idx] & (RESIDENT | BEYOND_EOF | SHARED_READONLY));
+                }
+            }
+        }
+        if (prot < 0 && start >= MMAP_BASE && start < next_map)
+            next_map = start;
+        return 0;
+    }
     for (size_t i = start / PAGE; i <= (end - 1) / PAGE; i++) {
         if (prot < 0)
             forget(i);
@@ -368,7 +634,14 @@ u64 map_linux(u64 addr, u64 length, unsigned prot, unsigned flags, struct backin
         addr = next_map;
         while (addr < STACK_BASE && size <= STACK_BASE - addr) {
             size_t p;
-            for (p = 0; p < size / PAGE && !(pages[addr / PAGE + p].flags & PRESENT); p++) {
+            if (native_el0) {
+                unsigned char *nf = nflags_tbl;
+                size_t base = nidx(addr);
+                for (p = 0; p < size / PAGE && !(nf[base + p] & PRESENT); p++) {
+                }
+            } else {
+                for (p = 0; p < size / PAGE && !(pages[addr / PAGE + p].flags & PRESENT); p++) {
+                }
             }
             if (p == size / PAGE)
                 break;
@@ -383,9 +656,15 @@ u64 map_linux(u64 addr, u64 length, unsigned prot, unsigned flags, struct backin
     int rc = set_mapping(addr, size, prot, (flags & MAP_ANONYMOUS) ? NULL : file, off, size);
     if (rc < 0)
         return rc;
-    if (shared_file)
-        for (size_t i = addr / PAGE; i < (addr + size) / PAGE; ++i)
-            pages[i].flags |= SHARED_READONLY;
+    if (shared_file) {
+        if (native_el0) {
+            for (u64 pos = addr; pos < addr + size; pos += PAGE)
+                nflags_tbl[nidx(pos)] |= SHARED_READONLY;
+        } else {
+            for (size_t i = addr / PAGE; i < (addr + size) / PAGE; ++i)
+                pages[i].flags |= SHARED_READONLY;
+        }
+    }
     if (!(flags & MAP_FIXED))
         next_map = addr + size;
     return addr;

@@ -20,7 +20,8 @@ struct linux_thread {
     struct linux_thread *next;
     struct guest_process *process;
     int tid;
-    int *futex_word;
+    struct guest_memory *futex_owner;
+    void *futex_key;
     int futex_result;
     char name[16];
     u64 clear_tid;
@@ -39,7 +40,15 @@ static struct linux_thread leader = {.process = &root_process};
 static struct linux_thread *current, *active_threads;
 static pthread_mutex_t cpu_lock = PTHREAD_MUTEX_INITIALIZER;
 static int threads_alive, next_tid;
+static int proc_event_epoch;
 extern void lx_schedule(void);
+void wake_proc_waiters(void) {
+    __atomic_add_fetch(&proc_event_epoch, 1, __ATOMIC_RELEASE);
+    thread_futex_wake(&proc_event_epoch, INT_MAX);
+}
+u64 thread_preempt_ticks(void) {
+    return threads_alive > 1 ? current->cpu.cntfrq / 100 : 0;
+}
 void thread_slice(CPU *cpu) {
     if (threads_alive > 1) {
         thread_pause();
@@ -59,47 +68,57 @@ void thread_resume(CPU *c) {
 // Register under the guest CPU lock and sleep on a private native word. An
 // exit or signal can then wake this thread without a race at the sleep boundary.
 static void finish_futex(struct linux_thread *t, int result) {
-    t->futex_word = NULL;
+    t->futex_owner = NULL;
+    t->futex_key = NULL;
     __atomic_store_n(&t->futex_result, result, __ATOMIC_RELEASE);
     syscall(SYS_futex, &t->futex_result, 1, 1, NULL, NULL, 0);
 }
-int thread_futex_wake(int *word, int count) {
+int thread_futex_wake_key(struct guest_memory *owner, void *key, int count) {
     if (count < 0)
         return -EINVAL;
     int woken = 0;
     for (struct linux_thread *t = active_threads; t && woken < count; t = t->next) {
-        if (t->futex_word == word) {
+        if (t->futex_key == key && t->futex_owner == owner) {
             finish_futex(t, 1);
             ++woken;
         }
     }
     return woken;
 }
+int thread_futex_wake(int *word, int count) {
+    return thread_futex_wake_key(NULL, word, count);
+}
 static void interrupt_futexes(struct guest_process *p, int sig) {
     for (struct linux_thread *t = active_threads; t; t = t->next) {
-        if (t->process == p && t->futex_word && (!sig || !(t->mask & (1ULL << (sig - 1))))) {
+        if (t->process == p && t->futex_key && (!sig || !(t->mask & (1ULL << (sig - 1))))) {
             finish_futex(t, -EINTR);
             if (sig)
                 break;
         }
     }
 }
-long thread_futex_wait(CPU *cpu, int *word, int expected, int op, const struct timespec *timeout) {
+long thread_futex_wait_key(CPU *cpu, struct guest_memory *owner, void *key, int *word,
+                           int expected, int op, const struct timespec *timeout) {
     if (__atomic_load_n(word, __ATOMIC_RELAXED) != expected)
         return -EAGAIN;
     if (signal_ready())
         return -EINTR;
     struct linux_thread *t = current;
     t->futex_result = 0;
-    t->futex_word = word;
+    t->futex_owner = owner;
+    t->futex_key = key;
     thread_pause();
     long rc = syscall(SYS_futex, &t->futex_result, op, 0, timeout, NULL, ~0u);
     int error = errno;
     thread_resume(cpu);
-    t->futex_word = NULL;
+    t->futex_owner = NULL;
+    t->futex_key = NULL;
     if (t->futex_result)
         return t->futex_result == 1 ? 0 : t->futex_result;
     return rc < 0 ? -error : rc;
+}
+long thread_futex_wait(CPU *cpu, int *word, int expected, int op, const struct timespec *timeout) {
+    return thread_futex_wait_key(cpu, NULL, word, word, expected, op, timeout);
 }
 static void account_cpu(void) {
     u64 elapsed = current->cpu.icount - current->accounted;
@@ -194,6 +213,7 @@ long process_wait(CPU *c) {
         return -ENOTSUP;
     }
     for (;;) {
+        int snap = __atomic_load_n(&proc_event_epoch, __ATOMIC_ACQUIRE);
         int children = 0;
         for (struct guest_process *p = processes; p; p = p->next) {
             int visible = namespace_pid(&guest_process->pids, &p->pids, p->pid);
@@ -235,9 +255,8 @@ long process_wait(CPU *c) {
             }
             return 0;
         }
-        thread_pause();
-        lx_schedule();
-        thread_resume(c);
+        if (thread_futex_wait(c, &proc_event_epoch, snap, 0, NULL) == -EINTR)
+            return -EINTR;
     }
 }
 
@@ -362,14 +381,13 @@ static long fork_guest(CPU *parent) {
         memcpy(parent_tid, &p->pid, sizeof(int));
     int child = p->pid;
     while (shared_vm) {
+        int snap = __atomic_load_n(&proc_event_epoch, __ATOMIC_ACQUIRE);
         struct guest_process *live = processes;
         while (live && live->pid != child)
             live = live->next;
         if (!live || !live->threads || !live->vfork_active)
             break;
-        thread_pause();
-        lx_schedule();
-        thread_resume(parent);
+        thread_futex_wait(parent, &proc_event_epoch, snap, 0, NULL);
     }
     return child;
 }
@@ -626,11 +644,14 @@ _Noreturn void thread_exit(int code) {
     if (self->clear_tid && !(self->clear_tid % 4)) {
         int *word = guest_ptr(self->clear_tid, 4, PROT_WRITE);
         if (word) {
+            struct guest_memory *fowner = NULL;
+            void *fkey = guest_futex_key(self->clear_tid, &fowner);
             __atomic_store_n(word, 0, __ATOMIC_RELEASE);
-            thread_futex_wake(word, 1);
+            thread_futex_wake_key(fowner, fkey, 1);
         }
     }
     if (!--guest_process->threads) {
+        wake_proc_waiters();
         if (!guest_process->exiting)
             guest_process->status = code;
         for (struct guest_process *p = processes, *next; p; p = next) {

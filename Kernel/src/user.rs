@@ -206,12 +206,25 @@ extern "C" fn vm_memory_low() -> i32 {
 }
 #[unsafe(no_mangle)]
 extern "C" fn vm_allocate(bytes: usize) -> *mut u8 {
-    unsafe { alloc::alloc::alloc(core::alloc::Layout::from_size_align(bytes, 4096).unwrap()) }
+    let align = if bytes == BLOCK { BLOCK } else { 4096 };
+    unsafe { alloc::alloc::alloc(core::alloc::Layout::from_size_align(bytes, align).unwrap()) }
 }
 #[unsafe(no_mangle)]
 unsafe extern "C" fn vm_release(ptr: *mut u8, bytes: usize) {
-    unsafe { alloc::alloc::dealloc(ptr, core::alloc::Layout::from_size_align(bytes, 4096).unwrap()); }
+    let align = if bytes == BLOCK { BLOCK } else { 4096 };
+    unsafe { alloc::alloc::dealloc(ptr, core::alloc::Layout::from_size_align(bytes, align).unwrap()); }
 }
+#[unsafe(no_mangle)]
+unsafe extern "C" fn guest_publish_l1(bank: u32, slot: u32, entry: u64) {
+    unsafe {
+        let t = tables(bank as usize);
+        if !t.is_null() && (slot as usize) < 512 {
+            (*t).root.0[slot as usize] = entry;
+        }
+    }
+}
+#[unsafe(no_mangle)]
+unsafe extern "C" fn guest_publish_cpu_l1(_cpu: u32, _slot: u32, _entry: u64) {}
 #[unsafe(no_mangle)]
 unsafe extern "C" fn vm_publish(bank: u32, space: *const VmSpace) {
     unsafe {
@@ -307,10 +320,11 @@ pub fn init() {
     unsafe {
         asm!("msr vbar_el1, {vectors}", "msr mair_el1, {attr}", "msr tcr_el1, {tcr}",
             "msr ttbr0_el1, {table}", "dsb sy","isb","tlbi vmalle1is","dsb sy","isb",
-            "mrs x9, sctlr_el1","orr x9,x9,#1","orr x9,x9,#4","orr x9,x9,#0x1000","msr sctlr_el1,x9","isb",
+            "mrs x9, sctlr_el1","orr x9,x9,#1","orr x9,x9,#4","orr x9,x9,#0x1000",
+            "orr x9,x9,#0x4000","orr x9,x9,#0x04000000","msr sctlr_el1,x9","isb",
             "mrs x9,cpacr_el1","orr x9,x9,#(3<<20)","msr cpacr_el1,x9","isb",
             vectors=in(reg)user_vectors as *const () as usize,attr=in(reg)0xffu64,
-            tcr=in(reg)(25u64|(1<<23)|(3<<12)|((crate::high_heap_end().is_some() as u64)<<32)),table=in(reg)addr_of_mut!((*tables(0)).root),out("x9") _);
+            tcr=in(reg)(25u64|(1<<8)|(1<<10)|(1<<23)|(3<<12)|((crate::high_heap_end().is_some() as u64)<<32)),table=in(reg)addr_of_mut!((*tables(0)).root),out("x9") _);
     }
 }
 // Reserved by User/user.ld immediately below the user stack.

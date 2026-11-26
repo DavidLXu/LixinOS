@@ -4,7 +4,7 @@
 #include "kthread.h"
 extern void smp_native_root(void);
 
-enum { FREE, READY, WAITING, EXITED, PAUSED, CHANNEL, FUTEX, IDLE };
+enum { FREE, READY, WAITING, EXITED, PAUSED, CHANNEL, FUTEX, SLEEPING, IDLE };
 struct task {
     u64 stack, pid, parent, waiting, cpu, console_deadline;
     int state, detached, job, watching, stop;
@@ -29,6 +29,7 @@ long task_list(char *out) {
         *p++ = ' ';
         p = add_number(p, t->parent);
         p = add_text(p, (t->state == FUTEX || t->state == WAITING || t->state == CHANNEL) ? " waiting "
+                        : t->state == SLEEPING ? " sleeping "
                         : t->state == EXITED ? " exited "
                         : i == running[t->core] ? " running "
                                              : " ready ");
@@ -91,15 +92,24 @@ unsigned cpu_percent(void) {
 static int runnable(unsigned slot, unsigned cpu, u64 now) {
     const struct task *t = &tasks[slot];
     return t->core == cpu && (t->state == READY ||
-           ((t->state == WAITING || t->state == FUTEX) && t->console_deadline && now >= t->console_deadline));
+           ((t->state == WAITING || t->state == FUTEX || t->state == SLEEPING) &&
+            t->console_deadline && now >= t->console_deadline));
+}
+void task_sleep_ms(u64 ms) {
+    if (current < KT_TASK_SLOTS) display_status();
+    if (!tasks[0].state || current >= KT_TASK_SLOTS) {
+        smp_idle_wait(clock_hz() / 1000);
+        return;
+    }
+    if (!ms) { schedule(); return; }
+    u64 ticks = clock_hz() / 1000 * ms;
+    tasks[current].console_deadline = clock_ticks() + (ticks ? ticks : 1);
+    tasks[current].state = SLEEPING;
+    schedule();
+    tasks[current].console_deadline = 0;
 }
 void idle_slice(void) {
-    if (current < KT_TASK_SLOTS) display_status();
-    unsigned cpu = smp_cpu();
-    u64 now = clock_ticks();
-    for (unsigned i=0; i<KT_TASK_SLOTS; i++)
-        if (i!=current && runnable(i, cpu, now)) { schedule(); return; }
-    smp_idle_wait(clock_hz()/4000);
+    task_sleep_ms(1);
 }
 static unsigned choose_core(void) {
     if (smp_cpus()==1) return 0;
@@ -158,11 +168,11 @@ void kt_stop(unsigned i) {
     struct task *t=&tasks[i];
     if (running[t->core]==i) smp_revoke_clock(t->core);
     t->stop=137;
-    if (t->state==FUTEX || t->state==CHANNEL || t->state==PAUSED || t->state==WAITING) t->state=READY;
+    if (t->state==FUTEX || t->state==SLEEPING || t->state==CHANNEL || t->state==PAUSED || t->state==WAITING) t->state=READY;
 }
 void kt_sleep(unsigned ms) {
-    u64 start=clock_ticks(),delay=clock_hz()/1000*ms;
-    do { if (ms) idle_slice(); else schedule(); } while(clock_ticks()-start<delay);
+    if (ms) task_sleep_ms(ms);
+    else schedule();
 }
 unsigned task_active(void) { return kt_owner(current); }
 u64 task_pid(void) { return tasks[kt_owner(current)].pid; }
@@ -187,7 +197,7 @@ long task_resources(u64 *out) {
         out[n]=t->pid; out[n+1]=t->parent;
         out[n+2]=t->cpu+(i==running[t->core] ? now-smp_idle_ticks(t->core)-busy_starts[t->core] : 0);
         out[n+3]=process_private_bytes(i);
-        out[n+4]=t->state==EXITED?5:t->state==WAITING||t->state==PAUSED||t->state==CHANNEL||t->state==FUTEX?4:(i==running[t->core])?1:2;
+        out[n+4]=t->state==EXITED?5:t->state==SLEEPING?3:t->state==WAITING||t->state==PAUSED||t->state==CHANNEL||t->state==FUTEX?4:(i==running[t->core])?1:2;
         out[n+5]=t->detached;
         const char *path=process_task_name(i), *name=path;
         for(;*path;path++) if(*path=='/') name=path+1;
@@ -200,6 +210,7 @@ long task_resources(u64 *out) {
 }
 void schedule(void) {
     unsigned cpu=smp_cpu(), old=current, id=KT_TASK_SLOTS+cpu;
+    if (old < KT_TASK_SLOTS && tasks[old].state == READY) smp_kernel_yield();
     u64 now = clock_ticks();
     for (unsigned k=1; k<=KT_TASK_SLOTS; k++) {
         unsigned candidate=(old+k)%KT_TASK_SLOTS;
@@ -210,14 +221,16 @@ void schedule(void) {
     }
     if (id>=KT_TASK_SLOTS && (old==id || tasks[old].state==READY)) {
         if (old==id) smp_idle_wait(clock_hz()/1000);
-        else smp_kernel_yield();
         return;
     }
     u64 busy=clock_ticks()-smp_idle_ticks(cpu);
     tasks[old].cpu+=busy-busy_start;
     busy_start=busy;
-    if (tasks[id].state == WAITING || tasks[id].state == FUTEX) tasks[id].state = READY;
+    if (tasks[id].state == WAITING || tasks[id].state == FUTEX || tasks[id].state == SLEEPING)
+        tasks[id].state = READY;
     current=id;
+    extern void guest_schedule_switch(unsigned cpu, unsigned slot);
+    guest_schedule_switch(cpu, id);
     select_bank(kt_owner(id));
     swap_task(&tasks[old].stack,tasks[id].stack,(u64)&stacks[id][sizeof(stacks[id])]);
 }
@@ -255,7 +268,7 @@ static void stop_tree(unsigned slot, int status) {
     if (t->state == FREE || t->state == EXITED) return;
     if (running[t->core]==slot) smp_revoke_clock(t->core);
     t->stop = status;
-    if (t->state == FUTEX || t->state == PAUSED || t->state == CHANNEL) t->state = READY;
+    if (t->state == FUTEX || t->state == SLEEPING || t->state == PAUSED || t->state == CHANNEL) t->state = READY;
     for (unsigned i = 1; i < KT_TASK_SLOTS; i++)
         if (tasks[i].parent == t->pid && !tasks[i].detached) stop_tree(i, status);
 }

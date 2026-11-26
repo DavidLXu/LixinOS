@@ -5,6 +5,7 @@
 #include "smp.h"
 #include "kthread.h"
 #include "vm.h"
+#include "guest.h"
 #include "version.h"
 #include "build-memory.h"
 
@@ -90,6 +91,14 @@ static void vm_bind_cpu(unsigned cpu, const struct vm_space *space) {
 void vm_publish(unsigned owner, const struct vm_space *space) {
     for (unsigned cpu = 0; cpu < 2; ++cpu)
         if (mapped_owner[cpu] == owner) vm_bind_cpu(cpu, space);
+}
+void guest_publish_l1(unsigned owner, unsigned slot, unsigned long entry) {
+    if (slot >= 512) return;
+    for (unsigned cpu = 0; cpu < 2; ++cpu)
+        if (mapped_owner[cpu] == owner) cpu_tables[cpu].root[slot] = entry;
+}
+void guest_publish_cpu_l1(unsigned cpu, unsigned slot, unsigned long entry) {
+    if (cpu < 2 && slot < 512) cpu_tables[cpu].root[slot] = entry;
 }
 int vm_memory_low(void) {
     unsigned free = 0;
@@ -183,6 +192,7 @@ void select_bank(unsigned id) {
     map_heap_cpu(smp_cpu(),id);
     shared_switch(id);
     vm_bind_cpu(smp_cpu(), &vm_spaces[id]);
+    guest_rebind_cpu(smp_cpu(), id);
     u64 pa = (u64)physical();
     cpu_tables[smp_cpu()].ram[32] = pa | NORMAL | EL0 | RO | PXN;
     cpu_tables[smp_cpu()].ram[33] = (pa + BLOCK) | NORMAL | EL0 | PXN | UXN;
@@ -237,7 +247,7 @@ struct process {
         struct pipe *pipe;
         struct local_socket *local;
         struct shared_file *shared;
-        int writer;
+        int writer, borrowed;
         char path[513];
     } handles[HANDLE_COUNT];
 };
@@ -454,16 +464,27 @@ static long process_request(struct process *p, unsigned op, unsigned index) {
 #define CHUNKS (build_volume ? GIB / CHUNK : NATIVE_FILE_POOL / CHUNK)
 #define FILE_POOL_BASE (build_volume ? BUILD_BUFFERS : 0x5a000000UL)
 static u8 chunks_used[GIB / CHUNK];
+static unsigned chunk_hint;
 u8 *file_buffer(u32 size) {
-    unsigned need = (size + CHUNK - 1) / CHUNK, run = 0;
+    unsigned need = (size + CHUNK - 1) / CHUNK;
     if (!need)
         need = 1;
-    for (unsigned i = 0; i < CHUNKS; i++) {
-        run = chunks_used[i] ? 0 : run + 1;
-        if (run == need) {
-            unsigned first = i + 1 - need;
-            memset(chunks_used + first, 1, need);
-            return (u8 *)(FILE_POOL_BASE + first * CHUNK);
+    if (need > CHUNKS)
+        return 0;
+    for (unsigned pass = 0; pass < 2; pass++) {
+        unsigned start = pass ? 0 : chunk_hint;
+        unsigned end = pass ? chunk_hint + need - 1 : CHUNKS;
+        if (end > CHUNKS)
+            end = CHUNKS;
+        unsigned run = 0;
+        for (unsigned i = start; i < end; i++) {
+            run = chunks_used[i] ? 0 : run + 1;
+            if (run == need) {
+                unsigned first = i + 1 - need;
+                memset(chunks_used + first, 1, need);
+                chunk_hint = i + 1 < CHUNKS ? i + 1 : 0;
+                return (u8 *)(FILE_POOL_BASE + first * CHUNK);
+            }
         }
     }
     return 0;
@@ -646,8 +667,28 @@ static void close_handle(struct process *p, unsigned i) {
     p->handles[i].path[0] = 0;
     if (!f->data)
         return;
-    release_buffer(f->data, f->size);
+    if (!p->handles[i].borrowed)
+        release_buffer(f->data, f->size);
+    p->handles[i].borrowed = 0;
     f->data = 0;
+}
+void detach_open_files(const char *path) {
+    for (unsigned b = 0; b < BANKS; b++) {
+        struct process *p = &processes[b];
+        for (unsigned i = 0; i < HANDLE_COUNT; i++) {
+            if (!p->handles[i].borrowed || !p->handles[i].file.data)
+                continue;
+            if (path && !equal(p->handles[i].path, path))
+                continue;
+            u32 sz = p->handles[i].file.size;
+            u8 *copy = file_buffer(sz);
+            if (copy) {
+                memcpy(copy, p->handles[i].file.data, sz);
+                p->handles[i].file.data = copy;
+                p->handles[i].borrowed = 0;
+            }
+        }
+    }
 }
 int uses_terminal_pointer(void) {
     if (processes[bank].background || processes[bank].canvas) return 0;
@@ -973,7 +1014,7 @@ static long syscall_service(u64 value, u64 op) {
     unsigned fd = value >> 32, n = (u32)value;
     struct file f;
     if (p->agent_child && equal(p->executable,"/bin/agent-run") && op != 12) return -1;
-    if (p->scope[0] && ((op>=19 && op<=21) || (op>=25 && op<=28) || op==48 || op==58 || op==59 || op==60 || op==63 ||
+    if (p->scope[0] && ((op>=19 && op<=21) || (op>=25 && op<=28) || op==48 || op==58 || op==59 || op==60 || op==63 || op==66 ||
         op==33 || op==34 || op==35 || (op==18 && ((u32)value==3 || (u32)value==16 ||
         (u32)value==17 || ((u32)value==18 && ((value>>32)&4)))))) return -1;
     if (p->test.deadline) {
@@ -993,6 +1034,22 @@ static long syscall_service(u64 value, u64 op) {
         }
     }
     switch (op) {
+    case 66: {
+        unsigned long req[8];
+        if (!guest_read_req(value, req)) return -14;
+        struct file source = {0};
+        if (req[0] == LX_GUEST_MAP_FILE) {
+            if (req[5] < 3 || req[5] >= FD_LIMIT) return -9;
+            unsigned index = req[5] - 3;
+            if (p->handles[index].path[0] && !p->handles[index].file.data) {
+                if (!vfs_lookup(p->handles[index].path, &source) || source.size == 0xffffffff) return -9;
+            } else {
+                source = p->handles[index].file;
+                if (!source.data) return -9;
+            }
+        }
+        return guest_call(bank, req, source.data, source.size);
+    }
     case 65: {
         if (value == LX_LOCK_PROBE) return LX_LOCK_VERSION;
         if (fd < 3 || fd >= FD_LIMIT || !p->handles[fd-3].path[0]) return -9;
@@ -1212,7 +1269,7 @@ static long syscall_service(u64 value, u64 op) {
                 return -1;
             if (task_stopped() || (ready & mask) || ((u32)value != 0xffffffff && clock_ticks() - start >= duration))
                 return ready & mask;
-            schedule();
+            idle_slice();
         }
     }
     case 39:
@@ -1227,7 +1284,7 @@ static long syscall_service(u64 value, u64 op) {
         if (p->handles[fd - 3].socket) {
             long sent;
             while ((sent = socket_io(p->handles[fd - 3].socket - 1, SOCKET_WRITE, (u8 *)mail, n)) == -2 && !task_stopped())
-                schedule();
+                idle_slice();
             return sent;
         }
         fd -= 3;
@@ -1280,11 +1337,17 @@ static long syscall_service(u64 value, u64 op) {
             return -1;
         for (unsigned i = 0; i < HANDLE_COUNT; i++)
             if (!handle_used(p, i)) {
-                u8 *bytes = file_buffer(f.size);
-                if (!bytes)
-                    return -1;
-                memcpy(bytes, f.data, f.size);
-                p->handles[i].file = (struct file){bytes, f.size};
+                if (build_volume && !proc_path(path)) {
+                    p->handles[i].file = f;
+                    p->handles[i].borrowed = 1;
+                } else {
+                    u8 *bytes = file_buffer(f.size);
+                    if (!bytes)
+                        return -1;
+                    memcpy(bytes, f.data, f.size);
+                    p->handles[i].file = (struct file){bytes, f.size};
+                    p->handles[i].borrowed = 0;
+                }
                 memcpy(p->handles[i].path, path, length(path, 513) + 1);
                 p->handles[i].pos = 0;
                 return i + 3;
@@ -1300,7 +1363,7 @@ static long syscall_service(u64 value, u64 op) {
         if (fd >= 3 && fd < FD_LIMIT && n <= 4096 && p->handles[fd - 3].socket) {
             long got;
             while ((got = socket_io(p->handles[fd - 3].socket - 1, SOCKET_READ, (u8 *)mail, n)) == -2 && !task_stopped())
-                schedule();
+                idle_slice();
             return got;
         }
         if (n <= 4096 && fd >= 3 && fd < FD_LIMIT && p->handles[fd - 3].path[0] && !p->handles[fd - 3].file.data) {
@@ -1394,9 +1457,8 @@ static long syscall_service(u64 value, u64 op) {
     case 43: {
         if (value > 3600000)
             return -1;
-        u64 start = clock_ticks(), wait = clock_hz() * value / 1000;
-        while (!task_stopped() && clock_ticks() - start < wait)
-            idle_slice();
+        if (!task_stopped())
+            task_sleep_ms(value);
         return 0;
     }
     case 18:
@@ -2087,6 +2149,7 @@ long run_task(unsigned slot) {
     gpu_close(&p->gpu_context);
     audio_close(&p->audio_stream);
     shared_clear(slot);
+    guest_cleanup_bank(slot);
     vm_publish(slot, 0);
     vm_sync();
     vm_destroy(&vm_spaces[slot]);

@@ -155,7 +155,7 @@ impl BlockStore {
 pub struct FileData {
     store: Option<Rc<RefCell<BlockStore>>>,
     loc: Cell<Option<DiskLoc>>,
-    data: OnceCell<Vec<u8>>,
+    data: OnceCell<Rc<Vec<u8>>>,
 }
 
 impl FileData {
@@ -163,7 +163,7 @@ impl FileData {
         Self {
             store: None,
             loc: Cell::new(None),
-            data: OnceCell::from(bytes),
+            data: OnceCell::from(Rc::new(bytes)),
         }
     }
 
@@ -192,6 +192,17 @@ impl FileData {
         }
     }
 
+    pub fn try_as_rc(&self) -> Result<Rc<Vec<u8>>> {
+        if let Some(v) = self.data.get() {
+            return Ok(v.clone());
+        }
+        let loc = self.loc.get().ok_or("missing file backing")?;
+        let store = self.store.as_ref().ok_or("missing disk backing")?;
+        let bytes = store.borrow_mut().read_body(loc)?;
+        let _ = self.data.set(Rc::new(bytes));
+        Ok(self.data.get().unwrap().clone())
+    }
+
     pub fn try_as_slice(&self) -> Result<&[u8]> {
         if let Some(v) = self.data.get() {
             return Ok(v.as_slice());
@@ -199,7 +210,7 @@ impl FileData {
         let loc = self.loc.get().ok_or("missing file backing")?;
         let store = self.store.as_ref().ok_or("missing disk backing")?;
         let bytes = store.borrow_mut().read_body(loc)?;
-        let _ = self.data.set(bytes);
+        let _ = self.data.set(Rc::new(bytes));
         Ok(self.data.get().unwrap().as_slice())
     }
 
@@ -214,11 +225,11 @@ impl FileData {
     pub(crate) fn as_mut_vec(&mut self) -> Result<&mut Vec<u8>> {
         let _ = self.try_as_slice()?;
         self.loc.set(None);
-        Ok(self.data.get_mut().unwrap())
+        Ok(Rc::make_mut(self.data.get_mut().unwrap()))
     }
 
     pub(crate) fn loaded(&self) -> Option<&[u8]> {
-        self.data.get().map(Vec::as_slice)
+        self.data.get().map(|v| v.as_slice())
     }
 
     pub(crate) fn disk_loc(&self) -> Option<DiskLoc> {

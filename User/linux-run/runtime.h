@@ -6,12 +6,13 @@
 #include <time.h>
 
 #define PAGE 4096u
-#define ARENA (768u << 20)
-#define MAIN_BASE 0x10000u
-#define LD_BASE (192u << 20)
-#define BRK_BASE (194u << 20)
-#define MMAP_BASE (196u << 20)
-#define STACK_BASE (ARENA - (1u << 20))
+extern int native_el0;
+#define ARENA (native_el0 ? (1024ULL << 20) : (768ULL << 20))
+#define MAIN_BASE (native_el0 ? 0x0c000000ULL : 0x10000ULL)
+#define LD_BASE (native_el0 ? 0x1c000000ULL : (192ULL << 20))
+#define BRK_BASE (native_el0 ? 0x1c200000ULL : (194ULL << 20))
+#define MMAP_BASE (native_el0 ? 0x1c400000ULL : (196ULL << 20))
+#define STACK_BASE (ARENA - (1ULL << 20))
 #define INTERP "/lib/ld-linux-aarch64.so.1"
 struct proc_handle;
 struct guest_memory;
@@ -89,6 +90,18 @@ long discard_pages(u64 start, u64 length);
 void allow_program_path(const char *absolute, const char *executable);
 
 void fail(const char *why);
+void guest_vm_probe(void);
+u64 guest_space_id(void);
+void guest_ensure_bound(void);
+long guest_vm_map_anon(u64 space, u64 va, u64 len, int prot);
+long guest_vm_map_file(u64 space, u64 va, u64 len, int prot, int host_fd, u64 off, u64 file_bytes);
+long guest_vm_map_shared(u64 space, u64 va, u64 len, int prot, u64 shared_va);
+long guest_vm_protect(u64 space, u64 va, u64 len, int prot);
+long guest_vm_unmap(u64 space, u64 va, u64 len);
+long guest_vm_discard(u64 space, u64 va, u64 len);
+long guest_vm_run(u64 space, void *ctx, u64 slice_ticks);
+void *guest_futex_key(u64 addr, struct guest_memory **owner_out);
+void *high_shared_key(u64 addr);
 void mem_init(void);
 void files_init(void);
 void events_init(void);
@@ -110,6 +123,11 @@ CPU *start_threads(void);
 void thread_pause(void);
 long thread_futex_wait(CPU *cpu, int *word, int expected, int op, const struct timespec *timeout);
 int thread_futex_wake(int *word, int count);
+long thread_futex_wait_key(CPU *cpu, struct guest_memory *owner, void *key, int *word,
+                           int expected, int op, const struct timespec *timeout);
+int thread_futex_wake_key(struct guest_memory *owner, void *key, int count);
+u64 thread_preempt_ticks(void);
+void wake_proc_waiters(void);
 void thread_resume(CPU *cpu);
 void interpret(CPU *cpu);
 long clone_thread(CPU *cpu);

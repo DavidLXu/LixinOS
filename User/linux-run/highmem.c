@@ -5,9 +5,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
-#define HIGH_LOW (1ULL << 32)
-#define HIGH_LIMIT (1ULL << 47)
+extern int lx_is_shared_fd(int fd);
+extern int lx_kernel_fd(int fd);
+
+#define HIGH_LOW (native_el0 ? (128ULL << 30) : (1ULL << 32))
+#define HIGH_LIMIT (native_el0 ? (512ULL << 30) : (1ULL << 47))
 #define BLOCK (2ULL << 20)
 
 struct storage {
@@ -18,6 +22,7 @@ struct storage {
 struct extent {
     u64 lo, hi;
     int prot;
+    unsigned char mapped, file_backed, readonly;
     struct storage *storage;
     size_t off;
     struct extent *next;
@@ -103,9 +108,10 @@ long high_update(u64 addr, u64 length, int prot) {
     for (struct extent *e = *at(addr); e && e->lo < end; e = e->next) {
         if (data_prot(prot) && !data_prot(e->prot) && !shared(e))
             growth += overlap(e, addr, end);
-        if (prot >= 0 && (prot & PROT_WRITE) && e->storage && e->storage->readonly)
+        if (prot >= 0 && (prot & PROT_WRITE) &&
+            (e->readonly || (e->storage && e->storage->readonly)))
             return -EACCES;
-        if (prot == -2 && e->storage && e->storage->file)
+        if (prot == -2 && (e->file_backed || (e->storage && e->storage->file)))
             return -ENOTSUP;
     }
     if (!data_limit_allows(growth))
@@ -117,21 +123,44 @@ long high_update(u64 addr, u64 length, int prot) {
     while (*link && (*link)->lo < end) {
         struct extent *e = *link;
         if (prot == -1) {
+            if (native_el0 && e->mapped)
+                guest_vm_unmap(guest_space_id(), e->lo, e->hi - e->lo);
             *link = e->next;
             drop_storage(e);
             free(e);
-        } else {
-            if (prot == -2)
+        } else if (prot == -2) {
+            if (native_el0) {
+                if (e->mapped) {
+                    long rc = guest_vm_discard(guest_space_id(), e->lo, e->hi - e->lo);
+                    if (rc < 0) return rc;
+                }
+            } else {
                 drop_storage(e); // MADV_DONTNEED for private anonymous pages
-            else
-                e->prot = prot;
+            }
+            link = &e->next;
+        } else {
+            if (native_el0) {
+                u64 space = guest_space_id();
+                if (!e->mapped && prot) {
+                    long rc = (e->storage && e->storage->shared)
+                                  ? guest_vm_map_shared(space, e->lo, e->hi - e->lo, prot,
+                                                        (u64)(uintptr_t)(e->storage->data + e->off))
+                                  : guest_vm_map_anon(space, e->lo, e->hi - e->lo, prot);
+                    if (rc < 0) return rc;
+                    e->mapped = 1;
+                } else if (e->mapped) {
+                    long rc = guest_vm_protect(space, e->lo, e->hi - e->lo, prot);
+                    if (rc < 0) return rc;
+                }
+            }
+            e->prot = prot;
             link = &e->next;
         }
     }
     return 0;
 }
 
-static long reserve(u64 hint, u64 length, unsigned prot, unsigned flags, int share) {
+static long reserve(u64 hint, u64 length, unsigned prot, unsigned flags, int share, int map_hw) {
     if (!length || length > HIGH_LIMIT - HIGH_LOW || (prot & ~7u) ||
         (flags & MAP_TYPE) != MAP_PRIVATE || !(flags & MAP_ANONYMOUS))
         return -EINVAL;
@@ -163,15 +192,37 @@ static long reserve(u64 hint, u64 length, unsigned prot, unsigned flags, int sha
         return -ENOMEM;
     if (fixed)
         high_update(addr, size, -1);
+    if (native_el0 && map_hw && prot) {
+        long rc = guest_vm_map_anon(guest_space_id(), addr, size, (int)prot);
+        if (rc < 0) {
+            free(e);
+            return rc;
+        }
+        e->mapped = 1;
+    }
     link = at(addr);
-    *e = (struct extent){.lo = addr, .hi = addr + size, .prot = prot, .next = *link};
+    e->lo = addr;
+    e->hi = addr + size;
+    e->prot = (int)prot;
+    e->next = *link;
     *link = e;
     recent = e;
     return addr;
 }
 
 long high_map(u64 hint, u64 length, unsigned prot, unsigned flags) {
-    return reserve(hint, length, prot, flags, 0);
+    return reserve(hint, length, prot, flags, 0, 1);
+}
+
+void *high_shared_key(u64 addr) {
+    if (addr < HIGH_LOW || addr >= HIGH_LIMIT)
+        return NULL;
+    struct extent *e = recent;
+    if (!e || e->lo > addr || e->hi <= addr)
+        e = *at(addr);
+    if (!e || addr < e->lo || !e->storage || !e->storage->shared)
+        return NULL;
+    return e->storage->data + e->off + (addr - e->lo);
 }
 
 void *high_ptr(u64 addr, u64 len, int access) {
@@ -183,6 +234,20 @@ void *high_ptr(u64 addr, u64 len, int access) {
     if (!e || addr < e->lo || (e->prot & access) != access)
         return NULL;
     u64 end = addr + len;
+    if (native_el0) {
+        if (end > e->hi) {
+            struct extent *prev = e;
+            while (prev->hi < end) {
+                struct extent *next = prev->next;
+                if (!next || next->lo != prev->hi || (next->prot & access) != access)
+                    return NULL;
+                prev = next;
+            }
+        }
+        recent = e;
+        guest_ensure_bound();
+        return (void *)(uintptr_t)addr;
+    }
     if (!e->storage) {
         u64 lo = addr & ~(BLOCK - 1), hi = (end + BLOCK - 1) & ~(BLOCK - 1);
         if (lo < e->lo)
@@ -230,10 +295,99 @@ long high_file(u64 hint, u64 bytes, unsigned prot, unsigned flags, int fd, u64 o
         return -EINVAL;
     if ((flags & MAP_FIXED) && hint < HIGH_LOW)
         return -ENOTSUP;
+    size_t rounded = (bytes + PAGE - 1) & ~(u64)(PAGE - 1);
+    if (native_el0) {
+        u64 space = guest_space_id();
+        if (lx_is_shared_fd(fd)) {
+            int rights = (type == MAP_SHARED && (prot & PROT_WRITE)) ? (PROT_READ | PROT_WRITE) : PROT_READ;
+            void *data = mmap(NULL, bytes, rights, MAP_SHARED, fd, offset);
+            if (data == MAP_FAILED)
+                return -errno;
+            if (type == MAP_SHARED) {
+                struct storage *s = malloc(sizeof *s);
+                if (!s) {
+                    munmap(data, bytes);
+                    return -ENOMEM;
+                }
+                long va = reserve(hint, rounded, prot,
+                                  (flags & ~MAP_TYPE) | MAP_PRIVATE | MAP_ANONYMOUS, 1, 0);
+                if (va < 0) {
+                    free(s);
+                    munmap(data, bytes);
+                    return va;
+                }
+                long rc = guest_vm_map_shared(space, (u64)va, rounded, (int)prot, (u64)(uintptr_t)data);
+                if (rc < 0) {
+                    high_update((u64)va, rounded, -1);
+                    free(s);
+                    munmap(data, bytes);
+                    return rc;
+                }
+                *s = (struct storage){.data = data,
+                                      .bytes = bytes,
+                                      .refs = 1,
+                                      .readonly = !(rights & PROT_WRITE),
+                                      .file = 1,
+                                      .shared = 1};
+                struct extent *e = *at((u64)va);
+                e->storage = s;
+                e->mapped = 1;
+                e->file_backed = 1;
+                e->readonly = (unsigned char)s->readonly;
+                return va;
+            }
+            /* MAP_PRIVATE of a shared memfd: copy into private guest pages. */
+            long va = reserve(hint, rounded, prot,
+                              (flags & ~MAP_TYPE) | MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+            if (va < 0) {
+                munmap(data, bytes);
+                return va;
+            }
+            long rc = guest_vm_map_anon(space, (u64)va, rounded, PROT_READ | PROT_WRITE);
+            if (rc >= 0) {
+                guest_ensure_bound();
+                memcpy((void *)(uintptr_t)va, data, bytes);
+                if (prot != (PROT_READ | PROT_WRITE))
+                    rc = guest_vm_protect(space, (u64)va, rounded, (int)prot);
+            }
+            munmap(data, bytes);
+            if (rc < 0) {
+                high_update((u64)va, rounded, -1);
+                return rc;
+            }
+            struct extent *e = *at((u64)va);
+            e->mapped = 1;
+            e->file_backed = 1;
+            return va;
+        }
+        /* Regular host file in high space. */
+        if (type == MAP_SHARED && (prot & PROT_WRITE))
+            return -ENOTSUP;
+        if (lx_kernel_fd(fd) < 0)
+            return -ENODEV;
+        struct stat st;
+        if (fstat(fd, &st) < 0)
+            return -errno;
+        u64 fsz = st.st_size > 0 ? (u64)st.st_size : 0;
+        u64 fbytes = offset < fsz ? (bytes < fsz - offset ? bytes : fsz - offset) : 0;
+        long va = reserve(hint, rounded, prot,
+                          (flags & ~MAP_TYPE) | MAP_PRIVATE | MAP_ANONYMOUS, type == MAP_SHARED, 0);
+        if (va < 0)
+            return va;
+        long rc = guest_vm_map_file(space, (u64)va, rounded, (int)prot, fd, offset, fbytes);
+        if (rc < 0) {
+            high_update((u64)va, rounded, -1);
+            return rc;
+        }
+        struct extent *e = *at((u64)va);
+        e->mapped = 1;
+        e->file_backed = 1;
+        e->readonly = (type == MAP_SHARED);
+        return va;
+    }
     int rights = PROT_READ | PROT_WRITE;
     if (type == MAP_SHARED && !(prot & PROT_WRITE))
         rights = PROT_READ;
-    size_t rounded = (bytes + PAGE - 1) & ~(u64)(PAGE - 1);
     void *data = mmap(NULL, bytes, rights, type, fd, offset);
     if (data == MAP_FAILED)
         return -errno;
@@ -243,7 +397,7 @@ long high_file(u64 hint, u64 bytes, unsigned prot, unsigned flags, int fd, u64 o
         return -ENOMEM;
     }
     long va = reserve(hint, rounded, prot, (flags & ~MAP_TYPE) | MAP_PRIVATE | MAP_ANONYMOUS,
-                      type == MAP_SHARED);
+                      type == MAP_SHARED, 0);
     if (va < 0) {
         free(s);
         munmap(data, bytes);
@@ -305,7 +459,7 @@ int upper_clone(struct guest_process *child) {
         link = &copy->next;
         if (!e->storage)
             continue;
-        if (e->storage->shared) {
+        if (native_el0 || e->storage->shared) {
             copy->storage = e->storage;
             ++copy->storage->refs;
             continue;

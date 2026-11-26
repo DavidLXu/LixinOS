@@ -3,6 +3,8 @@
 #include "runtime.h"
 #include "mmu.h"
 #include "predecode.h"
+#define LX_USER_GUEST_ONLY
+#include "../../Kernel/native/guest.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -10,6 +12,7 @@
 #include <string.h>
 #include <sys/random.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 int tracing, independent_processes;
@@ -135,6 +138,16 @@ static u64 push(u64 *sp, const void *data, size_t size) {
 }
 enum { MAX_VECTOR = 256, MAX_EXEC_BYTES = 128 * 1024 };
 static const char *initial_executable;
+static inline u64 host_cntvct(void) {
+    u64 v;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
+    return v;
+}
+static inline u64 host_cntfrq(void) {
+    u64 v;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(v));
+    return v;
+}
 static void load_program(CPU *cpu, const char *path, size_t argc, char *const argv[], size_t envc,
                          char *const env[]) {
     int direct = !strcmp(path, INTERP);
@@ -180,6 +193,8 @@ static void load_program(CPU *cpu, const char *path, size_t argc, char *const ar
     u64 ticks = cpu->icount;
     cpu_reset(cpu, ld.entry, 0);
     cpu->icount = ticks;
+    if (native_el0)
+        cpu->cntfrq = host_cntfrq();
     *cpu_cur_sp(cpu) = sp;
 }
 
@@ -250,6 +265,7 @@ long exec_guest(CPU *cpu, const char *path, u64 argv, u64 envp) {
     guest_process->memory = fresh.memory;
     guest_process->upper = fresh.upper;
     guest_process->vfork_active = 0;
+    wake_proc_waiters();
     guest_process->sigreturn_pc = 0;
     files_on_exec(cpu);
     thread_set_tid(0);
@@ -286,6 +302,7 @@ int main(int argc, char **argv) {
     int chromium = !strcmp(name, "chromium-shell") || !strcmp(name, "content_shell");
     if (state)
         state_init(state, chromium ? "/home/chromium" : "/home/wechat");
+    guest_vm_probe();
     files_init();
     events_init();
     upper_init();
@@ -312,6 +329,101 @@ int main(int argc, char **argv) {
     return 126;
 }
 void interpret(CPU *cpu) {
+    if (native_el0) {
+        struct lx_guest_ctx ctx __attribute__((aligned(16)));
+        ctx.fpcr = cpu->fpcr;
+        ctx.fpsr = cpu->fpsr;
+        memcpy(ctx.v, cpu->v, sizeof ctx.v);
+        for (;;) {
+            memcpy(ctx.x, cpu->x, sizeof ctx.x);
+            ctx.sp = *cpu_cur_sp(cpu);
+            ctx.pc = cpu->pc;
+            ctx.pstate = cpu->nzcv & 0xf0000000U;
+            ctx.tpidr = cpu->tpidr[0];
+            ctx.exit_reason = 0;
+            ctx.esr = 0;
+            ctx.far = 0;
+
+            u64 slice = thread_preempt_ticks();
+            u64 t0 = host_cntvct();
+            long reason = guest_vm_run(guest_space_id(), &ctx, slice);
+            u64 dt = host_cntvct() - t0;
+            cpu->icount += dt ? dt : 1;
+
+            memcpy(cpu->x, ctx.x, sizeof ctx.x);
+            *cpu_cur_sp(cpu) = ctx.sp;
+            cpu->pc = ctx.pc;
+            cpu->nzcv = (u32)(ctx.pstate & 0xf0000000U);
+            cpu->tpidr[0] = ctx.tpidr;
+
+            if (reason == LX_GUEST_EXIT_SVC) {
+                cpu->cur_insn_pc = cpu->pc - 4;
+                u64 nr = cpu->x[8];
+                if (nr == SYS_clone) {
+                    cpu->fpcr = (u32)ctx.fpcr;
+                    cpu->fpsr = (u32)ctx.fpsr;
+                    memcpy(cpu->v, ctx.v, sizeof ctx.v);
+                }
+                long r = service(cpu);
+                if (tracing && r < 0 && r >= -4095)
+                    fprintf(stderr, "linux-run: syscall %lu -> %ld\n",
+                            (unsigned long)nr, r);
+                cpu->x[0] = r;
+                if (nr == SYS_rt_sigreturn || (nr == SYS_execve && r == 0)) {
+                    ctx.fpcr = cpu->fpcr;
+                    ctx.fpsr = cpu->fpsr;
+                    memcpy(ctx.v, cpu->v, sizeof ctx.v);
+                }
+                if (signal_ready()) {
+                    cpu->fpcr = (u32)ctx.fpcr;
+                    cpu->fpsr = (u32)ctx.fpsr;
+                    memcpy(cpu->v, ctx.v, sizeof ctx.v);
+                    signal_checkpoint(cpu);
+                }
+            } else if (reason == LX_GUEST_EXIT_PREEMPT) {
+                cpu->cur_insn_pc = cpu->pc;
+                thread_slice(cpu);
+                if (signal_ready()) {
+                    cpu->fpcr = (u32)ctx.fpcr;
+                    cpu->fpsr = (u32)ctx.fpsr;
+                    memcpy(cpu->v, ctx.v, sizeof ctx.v);
+                    signal_checkpoint(cpu);
+                }
+            } else if (reason == LX_GUEST_EXIT_SYNC) {
+                unsigned ec = (unsigned)(ctx.esr >> 26);
+                cpu->cur_insn_pc = cpu->pc;
+                cpu->fpcr = (u32)ctx.fpcr;
+                cpu->fpsr = (u32)ctx.fpsr;
+                memcpy(cpu->v, ctx.v, sizeof ctx.v);
+                if (ec == 0x18 && (cpu->pc & 3) == 0) {
+                    u32 *p = guest_ptr(cpu->pc, 4, PROT_EXEC);
+                    if (p) {
+                        u32 insn = *p;
+                        cpu->pc += 4;
+                        exec_a64(cpu, insn);
+                        ctx.fpcr = cpu->fpcr;
+                        ctx.fpsr = cpu->fpsr;
+                        memcpy(ctx.v, cpu->v, sizeof ctx.v);
+                        continue;
+                    }
+                }
+                fprintf(stderr, "linux-run: guest sync trap ESR=%#lx FAR=%#lx PC=%#lx\n",
+                        ctx.esr, ctx.far, ctx.pc);
+                fail("guest sync trap");
+            } else if (reason == LX_GUEST_EXIT_FAULT) {
+                cpu->cur_insn_pc = cpu->pc;
+                fprintf(stderr, "linux-run: guest fault ESR=%#lx FAR=%#lx PC=%#lx SP=%#lx LR=%#lx\n",
+                        ctx.esr, ctx.far, ctx.pc, ctx.sp, ctx.x[30]);
+                fail("guest memory fault");
+            } else if (reason == LX_GUEST_EXIT_STOP) {
+                process_exit(130);
+            } else {
+                cpu->cur_insn_pc = cpu->pc;
+                fprintf(stderr, "linux-run: guest run error %ld\n", reason);
+                fail("guest run failed");
+            }
+        }
+    }
     for (;;) {
         // A syscall or another guest CPU may have replaced the code mapping.
         tlb_flush_all();

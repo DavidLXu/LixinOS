@@ -16,6 +16,7 @@ unsafe extern "C" {
     fn smp_idle_wait(delay: u64);
     fn smp_kernel_yield();
     fn smp_revoke_clock(cpu: u32);
+    fn guest_schedule_switch(cpu: u32, slot: u32);
     fn swap_stack(save: *mut usize, resume: usize, fresh_top: usize);
 }
 pub const CAPACITY: usize = 64;
@@ -598,6 +599,7 @@ pub fn schedule() {
             RETIRED = Some(old);
         }
         ACTIVE[cpu] = new;
+        guest_schedule_switch(cpu as u32, new as u32);
         smp_bind_kernel();
         crate::user::select_bank(if new < CAPACITY { kt_owner(new as u32) as usize } else { 0 });
         let stack = &task(new).stack;

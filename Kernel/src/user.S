@@ -82,6 +82,12 @@ user_sync:
     stp x30,xzr,[sp,#-16]!
     bl smp_enter_preserved
     ldp x30,xzr,[sp],#16
+    stp x0,x1,[sp,#-16]!
+    stp x2,x30,[sp,#-16]!
+    bl guest_current_ctx
+    cbnz x0,guest_trap_sync
+    ldp x2,x30,[sp],#16
+    ldp x0,x1,[sp],#16
     stp x9,x10,[sp,#-16]!
     mrs x9, esr_el1
     lsr x10, x9, #26
@@ -92,7 +98,7 @@ user_sync:
     b.eq resume_shell
     cmp x8, #32
     b.eq suspend_for_child
-    cmp x8, #65
+    cmp x8, #66
     b.hi unknown_call
     // The kernel uses the soft-float target (no SIMD registers). Preserve
     // the user integer context across the shared Rust console implementation.

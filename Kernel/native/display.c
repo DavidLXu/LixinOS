@@ -1236,12 +1236,14 @@ int present(const u64 *args, u64 arena, u64 bytes, u64 generation) {
     int redraw_pointer = hide_text_pointer();
     int redraw_menu = hide_edit_menu();
     damage(origin + 2 * x, BAR + 2 * y, 2 * w, 2 * h);
+    extern void pixel_double_pairs(u32 *dst, const u32 *src, u64 pairs);
     for (unsigned j = 0; j < h; j++) {
         const u32 *src = (const u32 *)p + j * stride;
         u32 *dst = &frame[BAR + 2 * (y + j)][origin + 2 * x];
-        for (unsigned i = 0; i < w; i++) {
-            dst[2 * i] = dst[2 * i + 1] = *src++;
-        }
+        if (w >= 2)
+            pixel_double_pairs(dst, src, w >> 1);
+        if (w & 1)
+            dst[2 * (w - 1)] = dst[2 * (w - 1) + 1] = src[w - 1];
         memcpy(dst + width, dst, w * 8);
     }
     if (redraw_menu) show_edit_menu();

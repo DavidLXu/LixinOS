@@ -23,7 +23,7 @@ enable_mmu:
     MSR(VBAR,1)
     mov x9,#0xff // Normal write-back RAM supports exclusive accesses.
     MSR(MAIR,9)
-    mov x9,#0x803019
+    mov x9,#0x803519 // T0SZ=25, IRGN0=WBWA, ORGN0=WBWA, SH0=IS, EPD1=1
     lsl x2,x2,#32
     orr x9,x9,x2
     MSR(TCR,9)
@@ -33,7 +33,8 @@ enable_mmu:
     dsb sy
     isb
     MRS(9,SCTLR)
-    mov x10,#0x1005 // MMU, data cache, and instruction cache
+    movz x10,#0x5005 // MMU, D-cache, I-cache, DZE (DC ZVA in EL0)
+    movk x10,#0x400,lsl #16 // UCI (CTR_EL0 / DC CVAU / IC IVAU in EL0)
     orr x9,x9,x10
     MSR(SCTLR,9)
     isb
@@ -144,6 +145,12 @@ user_sync:
     stp x30,xzr,[sp,#-16]!
     bl smp_enter_preserved
     ldp x30,xzr,[sp],#16
+    stp x0,x1,[sp,#-16]!
+    stp x2,x30,[sp,#-16]!
+    bl guest_current_ctx
+    cbnz x0,guest_trap_sync
+    ldp x2,x30,[sp],#16
+    ldp x0,x1,[sp],#16
     // Stash scratch and the user return address before examining ESR.
     stp x9,x30,[sp,#-16]!
     MRS(9,ESR)

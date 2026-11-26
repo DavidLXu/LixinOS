@@ -120,7 +120,7 @@ fn main() {
     let cc = fs::read_dir("target/user-build").unwrap().filter_map(Result::ok)
         .map(|entry| entry.path().join("bin/aarch64-none-elf-gcc"))
         .find(|cc| cc.is_file()).unwrap_or_else(|| "aarch64-none-elf-gcc".into());
-    for source in ["smp.c", "vm.c", "swap.c", "identity.c", "record-lock.c", "interp.c", "audio.c", "kthread.c", "smp-arch.S", "gpu.c", "boot-splash.c"] {
+    for source in ["smp.c", "vm.c", "swap.c", "identity.c", "record-lock.c", "interp.c", "audio.c", "kthread.c", "smp-arch.S", "guest.c", "guest-arch.S", "gpu.c", "boot-splash.c"] {
         if matches!(source, "gpu.c" | "boot-splash.c") && std::env::var_os("CARGO_FEATURE_RETINA").is_none() { continue; }
         let object = Path::new(&std::env::var_os("OUT_DIR").unwrap()).join(format!("{source}.o"));
         assert!(Command::new(&cc).args(["-c", "-O2", "-mgeneral-regs-only", "-ffreestanding",

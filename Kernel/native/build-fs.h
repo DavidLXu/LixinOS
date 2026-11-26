@@ -225,6 +225,9 @@ static long build_child(struct build_view *v, const char *path, u64 index, char 
 }
 /* Write payload before the alternate header, as on ordinary volumes. */
 static int build_pack(struct build_view *v, int write_disk) {
+#ifndef LIXINOS_BOOT_DISK
+    detach_open_files(0);
+#endif
     u8 *dst = (u8 *)((u64)arena == BUILD_FIRST ? BUILD_SECOND : BUILD_FIRST);
     u64 off = 4;
     store_word(dst, v->count);
@@ -417,6 +420,10 @@ static int build_set(const char *path, const struct file *f) {
         cursor += parent_record;
     }
     build_staged.bytes = build_staged.bytes - old + next;
+#ifndef LIXINOS_BOOT_DISK
+    if (exists)
+        detach_open_files(path);
+#endif
     dirty = 1;
     if (!scratch_name(path))
         needs_checkpoint = 1;
@@ -454,6 +461,9 @@ int scratch_write(const char *path, unsigned offset, const void *data, unsigned 
     unsigned size = end > old ? end : old;
     if (build_live.bytes + size - old > SLOT_BYTES - 512)
         return 0;
+#ifndef LIXINOS_BOOT_DISK
+    detach_open_files(path);
+#endif
     if (size > r->capacity) {
         unsigned cap = r->capacity < 4096 ? 4096 : r->capacity;
         while (cap < size)

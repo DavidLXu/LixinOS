@@ -59,6 +59,7 @@ void serial_text(const char *text);
 void power_off(void);
 u8 *file_buffer(u32 size);
 void release_buffer(const u8 *bytes, unsigned size);
+void detach_open_files(const char *path);
 int mount_disk(void), disk_full(void), build_memory_present(void);
 void early_mmu_init(int high);
 int lookup(const char *path, struct file *file);
@@ -145,7 +146,7 @@ void popup_mark_tab(unsigned slot), popup_tab_bar(unsigned active, unsigned coun
 int popup_tab_action(void), popup_tab_input(void), display_output_visible(void);
 void popup_position(unsigned slot, unsigned from), popup_tab_paste(void);
 void cycle_focus(void), display_select(unsigned pane);
-void display_status(void), display_idle_pointer(void), idle_slice(void);
+void display_status(void), display_idle_pointer(void), idle_slice(void), task_sleep_ms(u64 ms);
 unsigned cpu_percent(void);
 u64 idle_ticks(void), heap_bytes(void);
 int uses_terminal_pointer(void);

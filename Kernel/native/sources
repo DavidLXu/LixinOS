@@ -4,8 +4,11 @@
 /src/kernel/boot.S
 /src/kernel/el1.S
 /src/kernel/smp-arch.S
+/src/kernel/guest-arch.S
+/src/kernel/fastmem.S
 /src/kernel/smp.c
 /src/kernel/kthread.c
+/src/kernel/guest.c
 /src/kernel/vm.c
 /src/kernel/swap.c
 /src/kernel/identity.c

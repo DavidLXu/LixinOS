@@ -48,6 +48,7 @@ struct handle {
     int fd, flags;
     int kind;
     unsigned refs;
+    unsigned char flock_held, posix_locked;
     int local_bound;
     socklen_t local_length, peer_length;
     struct sockaddr_un local_address, local_peer;
@@ -61,24 +62,103 @@ static struct { struct handle *file; int flags; } descriptor_slots[HANDLE_COUNT]
 static struct handle *handle(long fd) {
     return fd >= 3 && fd < LX_DESCRIPTOR_LIMIT ? descriptor_slots[fd - 3].file : NULL;
 }
-/* linux-run can host several Linux process IDs in one native process. */
-long lx_record_lock(int fd, unsigned query, struct lx_record_request *request) {
+static long record_lock_locked(struct handle *h, unsigned query, struct lx_record_request *request) {
     static int supported;
-    int held = lx_runtime_lock();
     if (!supported)
         supported = console_call(65, LX_LOCK_PROBE) == LX_LOCK_VERSION ? 1 : -1;
-    struct handle *h = handle(fd);
-    long rc = -ENOSYS;
-    if (supported > 0) {
-        rc = -EBADF;
-        if (h && !h->kind && h->fd >= 3 && h->size != LX_DIR) {
-            memcpy(MAIL, request, sizeof *request);
-            rc = console_call(65, (unsigned long)h->fd << 32 | query);
-            if (!rc && query) memcpy(request, MAIL, sizeof *request);
-        }
-    }
+    if (supported < 0) return -ENOSYS;
+    if (!h || h->kind || h->fd < 3 || h->size == LX_DIR) return -EBADF;
+    memcpy(MAIL, request, sizeof *request);
+    long rc = console_call(65, (unsigned long)h->fd << 32 | query);
+    if (!rc && query) memcpy(request, MAIL, sizeof *request);
+    return rc;
+}
+/* linux-run can host several Linux process IDs in one native process. */
+long lx_record_lock(int fd, unsigned query, struct lx_record_request *request) {
+    int held = lx_runtime_lock();
+    long rc = record_lock_locked(handle(fd), query, request);
     lx_runtime_unlock(&held);
     return rc;
+}
+static long posix_flock(struct handle *h, long op) {
+    if (!h) return -EBADF;
+    if (h->kind || h->fd < 3 || h->size == LX_DIR) return -EINVAL;
+    int nonblock = (op & 4) != 0; /* LOCK_NB */
+    int kind = op & ~4;
+    unsigned type;
+    if (kind == 1) type = LX_LOCK_READ;        /* LOCK_SH */
+    else if (kind == 2) type = LX_LOCK_WRITE;  /* LOCK_EX */
+    else if (kind == 8) type = LX_LOCK_UNLOCK; /* LOCK_UN */
+    else return -EINVAL;
+    struct lx_record_request req = {
+        0, LX_LOCK_LAST, 0x80000000U | (unsigned)(h - descriptions), type
+    };
+    for (;;) {
+        long rc = record_lock_locked(h, 0, &req);
+        if (rc == -ENOSYS) return 0; /* Older kernel: single-process advisory lock fallback. */
+        if (rc == -EAGAIN && !nonblock) {
+            lx_delay(5);
+            if (lx_check_interrupt()) return -EINTR;
+            continue;
+        }
+        if (rc == -EAGAIN) return -EWOULDBLOCK;
+        if (!rc) h->flock_held = (type != LX_LOCK_UNLOCK);
+        return rc;
+    }
+}
+static long posix_fcntl_lock(struct handle *h, long cmd, struct flock *lock) {
+    if (!h) return -EBADF;
+    if (!lock) return -EFAULT;
+    if (h->kind || h->fd < 3 || h->size == LX_DIR) return -EBADF;
+    if (lock->l_type != F_RDLCK && lock->l_type != F_WRLCK && lock->l_type != F_UNLCK)
+        return -EINVAL;
+    int acc = h->flags & O_ACCMODE;
+    if (cmd != F_GETLK && ((lock->l_type == F_RDLCK && acc == O_WRONLY) ||
+                           (lock->l_type == F_WRLCK && acc == O_RDONLY)))
+        return -EBADF;
+    off_t base = 0, first, last = LX_LOCK_LAST;
+    if (lock->l_whence == SEEK_CUR) base = h->pos;
+    else if (lock->l_whence == SEEK_END) base = h->size;
+    else if (lock->l_whence != SEEK_SET) return -EINVAL;
+    if (__builtin_add_overflow(base, lock->l_start, &first)) return -EOVERFLOW;
+    if (first < 0) return -EINVAL;
+    if (lock->l_len < 0) {
+        last = first - 1;
+        if (lock->l_len < -first) return -EINVAL;
+        first += lock->l_len;
+    } else if (lock->l_len && __builtin_add_overflow(first, lock->l_len - 1, &last)) {
+        return -EOVERFLOW;
+    }
+    unsigned type = lock->l_type == F_RDLCK ? LX_LOCK_READ
+                  : lock->l_type == F_WRLCK ? LX_LOCK_WRITE : LX_LOCK_UNLOCK;
+    struct lx_record_request req = {(unsigned long)first, (unsigned long)last, 0, type};
+    for (;;) {
+        long rc = record_lock_locked(h, cmd == F_GETLK ? 1 : 0, &req);
+        if (rc == -ENOSYS) {
+            if (cmd == F_GETLK) lock->l_type = F_UNLCK;
+            return 0;
+        }
+        if (rc == -EAGAIN && cmd == F_SETLKW) {
+            lx_delay(5);
+            if (lx_check_interrupt()) return -EINTR;
+            continue;
+        }
+        if (rc) return rc;
+        if (cmd == F_GETLK) {
+            if (req.type == LX_LOCK_UNLOCK) {
+                lock->l_type = F_UNLCK;
+            } else {
+                lock->l_type = req.type == LX_LOCK_READ ? F_RDLCK : F_WRLCK;
+                lock->l_whence = SEEK_SET;
+                lock->l_start = req.first;
+                lock->l_len = req.last == LX_LOCK_LAST ? 0 : (off_t)(req.last - req.first + 1);
+                lock->l_pid = req.guest ? (pid_t)req.guest : 1;
+            }
+        } else if (type != LX_LOCK_UNLOCK) {
+            h->posix_locked = 1;
+        }
+        return 0;
+    }
 }
 static int free_slot(int start) {
     for (int i = start; i < HANDLE_COUNT; ++i)
@@ -102,6 +182,20 @@ static void release_slot(int fd) {
     descriptor_slots[fd - 3].flags = 0;
 }
 enum { TCP = 1, PIPE_FD, NULL_FD, LOCAL_FD, SHARED_FD };
+int lx_kernel_fd(int fd) {
+    int held = lx_runtime_lock();
+    struct handle *h = handle(fd);
+    int raw = (h && !h->kind && h->fd >= 3 && h->size != LX_DIR) ? h->fd : -1;
+    lx_runtime_unlock(&held);
+    return raw;
+}
+int lx_is_shared_fd(int fd) {
+    int held = lx_runtime_lock();
+    struct handle *h = handle(fd);
+    int shared = (h && h->kind == SHARED_FD);
+    lx_runtime_unlock(&held);
+    return shared;
+}
 enum { LOCAL_PAIR = 1, LOCAL_BIND, LOCAL_LISTEN, LOCAL_CONNECT, LOCAL_ACCEPT,
        LOCAL_READ, LOCAL_WRITE, LOCAL_SHUTDOWN, LOCAL_PEER, LOCAL_SENDMSG, LOCAL_RECVMSG,
        LOCAL_HAS_RIGHTS };
@@ -928,6 +1022,20 @@ static long posix_locked(long op, long a, long b, long c, long d, long e, long f
         if (!h)
             return -EBADF;
         error = 0;
+        if (!h->kind && h->fd >= 3 && h->size != LX_DIR) {
+            if (h->posix_locked) {
+                struct lx_record_request req = {0, LX_LOCK_LAST, 0, LX_LOCK_UNLOCK};
+                record_lock_locked(h, 0, &req);
+                h->posix_locked = 0;
+            }
+            if (h->flock_held && h->refs == 1) {
+                struct lx_record_request req = {
+                    0, LX_LOCK_LAST, 0x80000000U | (unsigned)(h - descriptions), LX_LOCK_UNLOCK
+                };
+                record_lock_locked(h, 0, &req);
+                h->flock_held = 0;
+            }
+        }
         if (h->fd >= 0 && h->refs == 1 && lx_close(h->fd) < 0) error = -EIO;
         release_slot(a);
         return error;
@@ -1107,9 +1215,13 @@ static long posix_locked(long op, long a, long b, long c, long d, long e, long f
     case SYS_fdatasync:
         if (!h) return -EBADF;
         return identity_available()?console_call(64,18):0;
+    case SYS_flock:
+        return posix_flock(h, b);
     case SYS_fcntl:
         if (!h && (a < 0 || a > 2))
             return -EBADF;
+        if (b == F_GETLK || b == F_SETLK || b == F_SETLKW)
+            return posix_fcntl_lock(h, b, (struct flock *)c);
         if ((b == F_DUPFD || b == F_DUPFD_CLOEXEC) && h && h->size == LX_DIR && c == 0)
             return port_openat(AT_FDCWD, h->path, O_DIRECTORY,0);
         if (b == F_DUPFD || b == F_DUPFD_CLOEXEC)

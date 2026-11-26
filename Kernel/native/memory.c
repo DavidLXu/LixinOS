@@ -1,19 +1,26 @@
 #include "native.h"
 
 int normal_ram;
+extern void fast_memcpy64(void *dst, const void *src, u64 blocks64);
+extern void fast_memset64(void *dst, u64 fill, u64 blocks64);
 typedef u64 unaligned_word __attribute__((aligned(1), may_alias));
 void *memcpy(void *out, const void *in, u64 n) {
     u8 *d = out;
     const u8 *s = in;
     if (normal_ram || !(((u64)d | (u64)s) & 7)) {
-        while (n >= 32) {
-            ((unaligned_word *)d)[0] = ((const unaligned_word *)s)[0];
-            ((unaligned_word *)d)[1] = ((const unaligned_word *)s)[1];
-            ((unaligned_word *)d)[2] = ((const unaligned_word *)s)[2];
-            ((unaligned_word *)d)[3] = ((const unaligned_word *)s)[3];
-            d += 32;
-            s += 32;
-            n -= 32;
+        if (n >= 64) {
+            u64 blocks = n >> 6;
+            fast_memcpy64(d, s, blocks);
+            u64 done = blocks << 6;
+            d += done;
+            s += done;
+            n -= done;
+        }
+        while (n >= 8) {
+            *(unaligned_word *)d = *(const unaligned_word *)s;
+            d += 8;
+            s += 8;
+            n -= 8;
         }
     }
     while (n--)
@@ -27,11 +34,17 @@ void *memset(void *out, int c, u64 n) {
         *d++ = c;
         n--;
     }
-    while (n >= 32) {
-        u64 *w = (u64 *)d;
-        w[0] = w[1] = w[2] = w[3] = fill;
-        d += 32;
-        n -= 32;
+    if (n >= 64) {
+        u64 blocks = n >> 6;
+        fast_memset64(d, fill, blocks);
+        u64 done = blocks << 6;
+        d += done;
+        n -= done;
+    }
+    while (n >= 8) {
+        *(u64 *)d = fill;
+        d += 8;
+        n -= 8;
     }
     while (n--)
         *d++ = c;
